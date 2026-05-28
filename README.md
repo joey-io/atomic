@@ -64,6 +64,8 @@ Domain models — `person`, `facility`, `invoice`, `task` — are implementation
 14. Creation is the record itself — mutation produces logs
 15. References point to atoms; indexes return sets of atoms
 16. Indexes define reusable access patterns and physical indexing intent
+17. API, web UI, MCP, and documentation share the same kernel routes
+18. Maintain the kernel and schema — not separate surfaces
 ```
 
 ---
@@ -528,6 +530,71 @@ All accelerators are derived. All are rebuildable. None are source-of-truth.
 
 ---
 
+## Kernel
+
+Atomic is one application with one kernel.
+
+The kernel is the only hand-maintained runtime layer. It does not know about invoices, people, officials, facilities, PACs, transactions, or any other domain concept in code.
+
+The kernel knows how to:
+
+- authenticate
+- resolve tenants and workspaces
+- load atoms
+- resolve refs
+- execute indexes
+- resolve models
+- validate attrs
+- apply permissions
+- deduplicate and merge
+- run hooks
+- write logs
+- broadcast changes
+- derive physical accelerators
+- render generated surfaces
+
+Everything else is schema.
+
+The schema is made of atoms:
+
+- models define shapes and behavior
+- traits define reusable field structures
+- indexes define access patterns and physical indexing intent
+- hooks define pipeline extensions
+- plugins bundle capability
+- configs define environment behavior
+
+Maintain the kernel. Maintain the schema. Do not maintain separate APIs, screens, MCP tools, or docs by hand.
+
+---
+
+## Generated Surfaces
+
+The same kernel routes power every surface.
+
+| Surface | Generated From | Uses |
+|---|---|---|
+| API | models, indexes, permissions | same kernel pipeline |
+| Web UI | models, indexes, display config | same kernel pipeline |
+| MCP | models, indexes, descriptions | same kernel pipeline |
+| Documentation | models, indexes, fields, examples | same kernel pipeline |
+| Imports / Exports | models, traits, permissions | same kernel pipeline |
+
+There is no separate API layer to maintain.
+There is no separate web app schema to maintain.
+There is no separate MCP tool registry to maintain.
+There is no separate documentation source to maintain.
+
+The app is the API.
+The API is the documentation.
+The documentation is generated from the same atoms that generate the UI and MCP surface.
+
+Change a model → forms, API docs, validation, MCP tools, exports, and generated routes update.
+
+Change an index → lists, dashboards, API endpoints, docs, MCP tools, and physical accelerators update.
+
+---
+
 ## Plugins
 
 Plugins bundle:
@@ -568,22 +635,37 @@ request
 
 This is the only way data enters or leaves Atomic.
 
+The same pipeline serves API calls, UI requests, MCP calls, generated documentation, imports, exports, webhooks, and internal jobs.
+
 ---
 
-## Surfaces
+## Routes
 
-Generated from models and indexes.
+Routes are generic.
 
-Never maintained separately.
+They are not created per model, per entity, or per feature.
 
-| Surface | Purpose |
-|---|---|
-| GraphQL | Generated schema and index fields |
-| SDK | Typed generated client |
-| MCP | Generated AI tool definitions |
-| Web App | Generated forms/tables/detail pages/dashboards |
+Examples:
 
-Change a model or index → all surfaces update.
+```txt
+/app
+/api/atoms
+/api/indexes/:id
+/api/docs
+/api/mcp
+```
+
+The route does not define the business capability. The atoms do.
+
+For example:
+
+```txt
+/api/indexes/index.invoices.byQuarter
+```
+
+is not a custom-coded invoice endpoint. It is the generic index execution route running the `index.invoices.byQuarter` atom.
+
+Likewise, a generated documentation page for that endpoint is derived from the same index atom, source model, parameters, returns shape, permission rules, and examples.
 
 ---
 
@@ -795,6 +877,8 @@ Models and indexes generate:
 - import pipelines
 - exports
 - dashboards
+- API documentation
+- MCP tool definitions
 
 Imports flow through the same interface pipeline.
 
