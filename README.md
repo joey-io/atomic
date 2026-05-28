@@ -73,15 +73,7 @@ Domain models — `person`, `facility`, `invoice`, `task` — are implementation
 {
   "guid": "7b8f2f0c-5f0f-4a3d-9f0d-2d6e2d4d1c11",
   "model": {
-    "$ref": {
-      "query": {
-        "model": "model",
-        "where": {
-          "key": "invoice"
-        },
-        "limit": 1
-      }
-    }
+    "$ref": "22222222-2222-4222-8222-222222222222"
   },
   "attr": {},
   "lifecycle": {}
@@ -147,20 +139,17 @@ A reference can be:
 }
 ```
 
-Meaning:
+Query refs are mainly used for:
 
-```txt
-Find the model atom whose key is invoice.
-```
+- imports
+- templates
+- config
+- portable manifests
+- human-authored definitions
 
 The interface resolves query refs into direct GUID refs before execution.
 
-This allows references to remain:
-
-- portable
-- human-readable
-- environment-independent
-- composable
+Most runtime operations use direct refs.
 
 Traversal paths resolve through refs and nested JSON:
 
@@ -188,15 +177,7 @@ A trait is a reusable field shape.
 {
   "guid": "11111111-1111-4111-8111-111111111111",
   "model": {
-    "$ref": {
-      "query": {
-        "model": "model",
-        "where": {
-          "key": "trait"
-        },
-        "limit": 1
-      }
-    }
+    "$ref": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
   },
   "attr": {
     "key": "address",
@@ -223,15 +204,7 @@ Models reference traits:
 ```json
 {
   "location": {
-    "$ref": {
-      "query": {
-        "model": "trait",
-        "where": {
-          "key": "address"
-        },
-        "limit": 1
-      }
-    }
+    "$ref": "11111111-1111-4111-8111-111111111111"
   }
 }
 ```
@@ -262,15 +235,7 @@ Example:
 {
   "guid": "22222222-2222-4222-8222-222222222222",
   "model": {
-    "$ref": {
-      "query": {
-        "model": "model",
-        "where": {
-          "key": "model"
-        },
-        "limit": 1
-      }
-    }
+    "$ref": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
   },
   "attr": {
     "key": "facility",
@@ -281,15 +246,7 @@ Example:
         "required": true
       },
       "location": {
-        "$ref": {
-          "query": {
-            "model": "trait",
-            "where": {
-              "key": "address"
-            },
-            "limit": 1
-          }
-        }
+        "$ref": "11111111-1111-4111-8111-111111111111"
       },
       "openedAt": {
         "kind": "datetime",
@@ -400,15 +357,7 @@ Example:
 {
   "guid": "33333333-3333-4333-8333-333333333333",
   "model": {
-    "$ref": {
-      "query": {
-        "model": "model",
-        "where": {
-          "key": "report"
-        },
-        "limit": 1
-      }
-    }
+    "$ref": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
   },
   "attr": {
     "key": "invoices.byQuarter",
