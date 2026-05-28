@@ -1,22 +1,44 @@
 # Atomic
 
-Everything is a record. One interface. One database engine. One person can hold the whole system in their head.
+A framework for building data systems. One shape. One interface.
 
-Atomic is a schema-driven workroom. Every operation is auditable, every mutation is traceable. Models define the data — the API and UI are generated from them.
+```
+{ id, type, attr, lifecycle }
+```
+
+Everything is an atom — models, traits, hooks, config, tokens, and domain data. `type` is classification. The model for that type defines attrs, behavior, and display.
+
+Reserved types:
+
+| Type | Purpose |
+|------|------|
+| `model` | Defines an atom type's fields, display, behavior |
+| `trait` | Reusable field shape (referenced by models) |
+| `report` | Derived view |
+| `plugin` | Bundles capabilities that activate per tenant |
+| `hook` | Runs at pipeline points |
+| `token` | Authenticates requests |
+| `config` | Cascading settings |
+| `file` | Pointer to object storage |
+| `log` | Append-only audit entry |
+
+Domain types — `person`, `facility`, `invoice`, `task` — are defined per implementation.
+
+**Atomic** is the framework. **atomic-crm** is a set of models, traits, and plugins that make it a CRM.
 
 ---
 
 ## Principles
 
 ```
-1. Everything is a record
+1. Everything is an atom
 2. Everything flows through one interface
 3. Everything is logged (same transaction, append-only)
 4. Models drive behavior — not code
 5. Surfaces are generated — not maintained
 6. Plugins bundle capability — toggle on/off
 7. Config cascades — workspace → tenant → system
-8. Immutable records use corrections, not edits
+8. Immutable atoms use corrections, not edits
 9. Postgres is the platform — no external services beyond storage and email
 10. Scale by adding instances — architecture unchanged
 11. Fields are nullable — no migrations, UI renders what exists
@@ -27,83 +49,114 @@ Atomic is a schema-driven workroom. Every operation is auditable, every mutation
 
 ## The Atom
 
-Every durable thing is a record:
-
 ```json
 {
   "id": "rec_123",
   "type": "invoice",
-  "meta": {},
-  "system": {}
+  "attr": {},
+  "lifecycle": {}
 }
 ```
 
 | Field | Purpose |
 |-------|---------|
 | `id` | Stable identity. No business meaning embedded. |
-| `type` | Model key — `person`, `invoice`, `task`, etc. |
-| `meta` | Domain data. Shaped by the model. All fields nullable unless `required`. |
-| `system` | Lifecycle — `createdAt`, `updatedAt`, `createdBy`, `updatedBy`, `version`, `status`, `source`. Managed by the interface only. |
+| `type` | Classification — which model defines this atom's attrs, behavior, and display. |
+| `attr` | Domain data. Shaped by the model. All fields nullable unless `required`. |
+| `lifecycle` | Managed by the interface only — `createdAt`, `updatedAt`, `createdBy`, `updatedBy`, `version`, `status`, `source`. |
 
-Real-world dates (`occurredAt`, `filedAt`, `effectiveAt`) belong in `meta`. `system` tracks the record's life inside Atomic.
-
-### Schema Evolution
-
-Models can add fields at any time. New fields are nullable by default — old records simply don't have them yet. The UI renders what's present and omits what's null. No migrations. No backfills.
+Real-world dates (`occurredAt`, `filedAt`, `effectiveAt`) belong in `attr`. `lifecycle` tracks the atom's life inside Atomic.
 
 ### References
 
-A ref is a meta value pointing to another record:
+A ref is a field value pointing to another atom:
 
 ```json
 { "$ref": "rec_person_123" }
 ```
 
-Models declare which fields are refs and what types they can target. The system resolves ref paths for traversal (e.g., `order.customer.region`).
+A ref is just a field with `kind: "ref"` in the model. The system resolves ref paths for traversal (e.g., `order.customer.region`).
+
+---
+
+## Traits
+
+A reusable field shape:
+
+```json
+{
+  "id": "trait_address",
+  "type": "trait",
+  "attr": {
+    "fields": {
+      "street": { "kind": "text" },
+      "city": { "kind": "text" },
+      "state": { "kind": "text" },
+      "zip": { "kind": "text" },
+      "country": { "kind": "text", "default": "US" }
+    }
+  }
+}
+```
+
+Models reference traits with a ref. The interface resolves and expands the fields:
+
+```json
+"headquarters": { "$ref": "trait_address" },
+"mailingAddress": { "$ref": "trait_address" }
+```
+
+Same shape, different field names, one definition. Change the trait → every model using it reflects the change.
 
 ---
 
 ## Models
 
-A model is a record that defines a record type. This is the most important record in the system — everything else derives from it:
+A model defines an atom type — its fields, display, and behavior:
 
 ```json
 {
-  "id": "model_invoice",
+  "id": "model_facility",
   "type": "model",
-  "meta": {
-    "appliesTo": "invoice",
-    "label": "Invoice",
+  "attr": {
+    "appliesTo": "facility",
+    "label": "Facility",
     "fields": {
-      "issuedAt": { "kind": "datetime", "required": true, "filterable": true, "sortable": true },
-      "amountCents": { "kind": "money", "required": true, "measure": true, "aggregations": ["sum", "avg", "min", "max"] },
-      "customer": { "kind": "ref", "to": ["person", "organization"], "required": true }
+      "name": { "$ref": "trait_profile" },
+      "location": { "$ref": "trait_address" },
+      "contact": { "$ref": "trait_contact" },
+      "capacity": { "kind": "integer" },
+      "openedAt": { "kind": "datetime", "filterable": true, "sortable": true }
     },
     "display": {
-      "row": ["issuedAt", "customer.name.display", "amountCents"],
-      "card": { "title": "{{amountCents | money}}", "subtitle": "{{customer.name.display}}" }
+      "row": ["name.display", "location.city", "capacity"],
+      "card": { "title": "{{name.display}}", "subtitle": "{{location.city}}, {{location.state}}" }
     },
-    "behavior": { "mutable": false, "correctionMode": "reversal" },
+    "behavior": { "mutable": true },
     "retention": { "archiveAfterDays": null, "deleteOnRequest": true }
   }
 }
 ```
 
-Adding a new record type = adding a model record. No code. No deployment.
+Adding a new type = adding a model atom. No code. No deployment.
 
 System models are always present. Tenant models extend fields, rename labels, override display. Plugin models activate/deactivate with the plugin.
+
+### Schema Evolution
+
+Models can add fields at any time. New fields are nullable by default — old atoms simply don't have them yet. The UI renders what's present and omits what's null. No migrations. No backfills.
 
 ---
 
 ## Reports
 
-A report is a record that derives a view:
+A derived view:
 
 ```json
 {
   "id": "report_invoices_by_quarter",
   "type": "report.pivot",
-  "meta": {
+  "attr": {
     "source": "invoice",
     "where": { "issuedAt": { "between": ["2025-01-01", "2026-12-31"] } },
     "groupBy": ["issuedAt.quarter"],
@@ -112,19 +165,19 @@ A report is a record that derives a view:
 }
 ```
 
-Reports run live by default. Expensive reports are materialized via background jobs — an execution detail, not a product concept.
+Reports run live by default. Expensive reports materialize via background jobs.
 
 ---
 
 ## Plugins
 
-A plugin bundles models, reports, hooks, and config requirements that activate per tenant:
+Bundles models, reports, hooks, and config that activate per tenant:
 
 ```json
 {
   "id": "plugin_invoicing",
   "type": "plugin",
-  "meta": {
+  "attr": {
     "name": "Invoicing",
     "provides": {
       "models": ["model_invoice", "model_payment"],
@@ -160,7 +213,7 @@ request (API, SDK, MCP, import, webhook, internal)
   → respond
 ```
 
-This is the only way data enters or leaves the system. Import, export, file upload, API calls — all pass through the same pipeline with the same hooks, permissions, and logging.
+This is the only way data enters or leaves the system.
 
 ### Surfaces
 
@@ -177,13 +230,13 @@ Add a model → all surfaces expose it. Change a field → all surfaces reflect 
 
 ### Hooks
 
-Hooks are records that run at defined points in the pipeline:
+Hooks are atoms that run at defined points in the pipeline:
 
 ```json
 {
   "id": "hook_validate_payment",
   "type": "hook",
-  "meta": {
+  "attr": {
     "on": "pre:save",
     "match": "payment",
     "action": "validate_payment_amount",
@@ -220,9 +273,9 @@ A solo user: one tenant, one workspace. An enterprise: one tenant, many workspac
 
 Data never moves between workspaces directly. Cross-workspace migration uses standard import/export templates. Tenant-level aggregate reporting is available in the admin hub, but workspaces remain isolated.
 
-The global catalog database holds: tenant registry, system models, plugin definitions, reference data, user records, and system-level config.
+The global catalog database holds: tenant registry, system models, plugin definitions, reference data, user atoms, and system-level config.
 
-**Provisioning:** Create database → seed schema → add to tenant record → grant plugins → done.
+**Provisioning:** Create database → seed schema → add to tenant → grant plugins → done.
 
 ---
 
@@ -234,7 +287,7 @@ Settings resolve bottom-up. First match wins:
 workspace config → tenant config → system config
 ```
 
-A config record specifies scope, key, and value. Plugins declare which config keys they need — the interface resolves through the cascade. Tenants can override system defaults (e.g., their own email provider credentials); workspaces can further override tenant settings.
+A config atom specifies scope, key, and value. Plugins declare which config keys they need — the interface resolves through the cascade. Tenants can override system defaults (e.g., their own email provider credentials); workspaces can further override tenant settings.
 
 ---
 
@@ -242,14 +295,14 @@ A config record specifies scope, key, and value. Plugins declare which config ke
 
 One flow: request arrives → hash token → lookup hash → load actor → merge roles → check permissions.
 
-A token is a record with a hashed secret, a ref to an actor, and a scope (tenant, workspace, permitted types, permitted operations, expiry).
+A token is an atom with a hashed secret, a ref to an actor, and a scope (tenant, workspace, permitted types, permitted operations, expiry).
 
 | Origin | Lifespan | Scope |
 |--------|----------|-------|
 | Magic link (humans) | Short (1h) | Full user permissions |
 | Generated key (machines) | Long (months) | Narrowed to tenant, workspace, types, operations |
 
-No passwords. No OAuth. No JWTs. Revocation = delete the token record. Leaked keys have contained blast radius (scoped to specific types in one workspace).
+No passwords. No OAuth. No JWTs. Revocation = delete the token atom. Leaked keys have contained blast radius (scoped to specific types in one workspace).
 
 ### Roles
 
@@ -264,9 +317,9 @@ Tenant role = ceiling. Workspace role = narrowing. Models further restrict field
 
 ---
 
-## Record Lifecycle
+## Lifecycle
 
-Records have three states:
+Atoms have three states:
 
 | Status | Visible | Queryable | Deletable |
 |--------|---------|-----------|-----------|
@@ -275,24 +328,24 @@ Records have three states:
 | `deleted` | No | No | N/A (gone) |
 
 **Archive:** Soft-remove for compliance/audit. Excluded from default queries.
-**Delete:** Hard-remove. Record and its log entries purged (CCPA, retention limits).
+**Delete:** Hard-remove. Atom and its log entries purged (CCPA, retention limits).
 
-Models control retention via `behavior.retention` (archive after N days, allow/forbid deletion). Plugins can override — compliance-regulated records may forbid deletion. A scheduled job runs the retention filter.
+Models control retention via `behavior.retention` (archive after N days, allow/forbid deletion). Plugins can override — compliance-regulated atoms may forbid deletion. A scheduled job runs the retention filter.
 
 ### Files
 
-Files live in encrypted object storage, isolated per tenant. A file is a record with a `storageKey` and an `attachedTo` ref. Access follows the parent record's permissions. Storage is encrypted at rest, keyed per tenant.
+Files live in encrypted object storage, isolated per tenant. A file is an atom with a `storageKey` and an `attachedTo` ref. Access follows the parent atom's permissions. Storage is encrypted at rest, keyed per tenant.
 
 ### Logs
 
-Every operation produces an append-only log entry (same transaction): record ID, action, before/after snapshots, actor, timestamp, source.
+Every operation produces an append-only log entry (same transaction): atom ID, action, before/after snapshots, actor, timestamp, source.
 
 - **Append-only.** Never updated. Deleted only during hard-delete (retention).
 - **Time-partitioned.** Monthly partitions for archival.
 
 ### Corrections
 
-Immutable records are never edited. Corrections use reversals:
+Immutable atoms are never edited. Corrections use reversals:
 
 ```
 rec_1 → original ($2500, status: reversed)
@@ -304,15 +357,15 @@ rec_3 → correction ($2000, corrects: rec_1)
 
 ## Database
 
-Two tables per workspace: `records` and `logs`.
+Two tables per workspace: `atoms` and `logs`.
 
-**Records:** `id`, `type`, `meta` (JSONB), `system` (JSONB), timestamps. Indexed on type and meta (GIN).
+**Atoms:** `id`, `type`, `attr` (JSONB), `lifecycle` (JSONB), timestamps. Indexed on type and attr (GIN).
 
-**Logs:** `id`, `record_id`, `action`, `before`/`after` (JSONB), `actor`, `occurred_at`, `source`. Partitioned by `occurred_at`. No UPDATE or DELETE grants (hard-delete uses a privileged system role).
+**Logs:** `id`, `atom_id`, `action`, `before`/`after` (JSONB), `actor`, `occurred_at`, `source`. Partitioned by `occurred_at`. No UPDATE or DELETE grants (hard-delete uses a privileged system role).
 
 No `tenant_id` column. Isolation is physical — each workspace is its own database.
 
-Accelerators added when needed (ref graph, materialized reports, trigram search, generated columns for hot paths). All derived. All rebuildable. Never the source of truth.
+Accelerators added when needed (ref graph, materialized reports, trigram search, generated columns for hot attr paths). All derived. All rebuildable. Never the source of truth.
 
 ---
 
@@ -331,7 +384,7 @@ Postgres handles job queues, real-time subscriptions, full-text search, and sche
 
 The architecture scales horizontally without changes to the interface:
 
-- **Vertical:** One process, one Postgres instance handles hundreds of tenants / millions of records.
+- **Vertical:** One process, one Postgres instance handles hundreds of tenants / millions of atoms.
 - **Horizontal:** Stateless processes behind a load balancer; connection pooling; workers in any process.
 - **Read replicas:** Reports and reads hit replicas; writes hit primary.
 - **Sharding:** Hot workspaces move to dedicated instances. The catalog maps workspace → connection string. Application code unchanged.
