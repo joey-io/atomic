@@ -6,17 +6,21 @@ Atomic is a schema-driven workroom. Every operation is auditable, every mutation
 
 ---
 
-## Core Concepts
+## Principles
 
 ```
-Record    = atom (the universal data shape)
-Model     = meaning (defines a record type's fields, rules, display)
-Ref       = connection (a meta value pointing to another record)
-Report    = view (derived from the corpus)
-Plugin    = capability (bundle of models, hooks, config — toggle on/off)
-Interface = the single pipeline all operations flow through
-Log       = proof (append-only, immutable, every operation)
-Config    = cascading settings (workspace → tenant → system)
+1. Everything is a record
+2. Everything flows through one interface
+3. Everything is logged (same transaction, append-only)
+4. Models drive behavior — not code
+5. Surfaces are generated — not maintained
+6. Plugins bundle capability — toggle on/off
+7. Config cascades — workspace → tenant → system
+8. Immutable records use corrections, not edits
+9. Postgres is the platform — no external services beyond storage and email
+10. Scale by adding instances — architecture unchanged
+11. Fields are nullable — no migrations, UI renders what exists
+12. Data is real-time — changes broadcast, clients subscribe
 ```
 
 ---
@@ -28,7 +32,7 @@ Every durable thing is a record:
 ```json
 {
   "id": "rec_123",
-  "type": "person",
+  "type": "invoice",
   "meta": {},
   "system": {}
 }
@@ -37,7 +41,7 @@ Every durable thing is a record:
 | Field | Purpose |
 |-------|---------|
 | `id` | Stable identity. No business meaning embedded. |
-| `type` | Model key — `person`, `transaction.contribution`, `filing.fec`, etc. |
+| `type` | Model key — `person`, `invoice`, `task`, etc. |
 | `meta` | Domain data. Shaped by the model. All fields nullable unless `required`. |
 | `system` | Lifecycle — `createdAt`, `updatedAt`, `createdBy`, `updatedBy`, `version`, `status`, `source`. Managed by the interface only. |
 
@@ -45,7 +49,7 @@ Real-world dates (`occurredAt`, `filedAt`, `effectiveAt`) belong in `meta`. `sys
 
 ### Schema Evolution
 
-Models can add fields at any time. New fields are nullable by default — old records simply don't have them yet and can be written to later when data is available. The UI is schema-driven: it renders what's present and omits what's null. No migrations. No backfills. No versioning.
+Models can add fields at any time. New fields are nullable by default — old records simply don't have them yet. The UI renders what's present and omits what's null. No migrations. No backfills.
 
 ### References
 
@@ -55,34 +59,29 @@ A ref is a meta value pointing to another record:
 { "$ref": "rec_person_123" }
 ```
 
-Models declare which fields are refs and what types they can target. The system resolves paths:
-
-```
-contributor.employer.industry
-payee.homeDistrict.representative
-```
+Models declare which fields are refs and what types they can target. The system resolves ref paths for traversal (e.g., `order.customer.region`).
 
 ---
 
 ## Models
 
-A model is a record that defines a record type:
+A model is a record that defines a record type. This is the most important record in the system — everything else derives from it:
 
 ```json
 {
-  "id": "model_transaction_contribution",
+  "id": "model_invoice",
   "type": "model",
   "meta": {
-    "appliesTo": "transaction.contribution",
-    "label": "Contribution",
+    "appliesTo": "invoice",
+    "label": "Invoice",
     "fields": {
-      "occurredAt": { "kind": "datetime", "required": true, "filterable": true, "sortable": true },
+      "issuedAt": { "kind": "datetime", "required": true, "filterable": true, "sortable": true },
       "amountCents": { "kind": "money", "required": true, "measure": true, "aggregations": ["sum", "avg", "min", "max"] },
-      "contributor": { "kind": "ref", "to": ["person", "organization", "committee"], "required": true }
+      "customer": { "kind": "ref", "to": ["person", "organization"], "required": true }
     },
     "display": {
-      "row": ["occurredAt", "contributor.name.display", "amountCents"],
-      "card": { "title": "{{amountCents | money}}", "subtitle": "{{contributor.name.display}}" }
+      "row": ["issuedAt", "customer.name.display", "amountCents"],
+      "card": { "title": "{{amountCents | money}}", "subtitle": "{{customer.name.display}}" }
     },
     "behavior": { "mutable": false, "correctionMode": "reversal" },
     "retention": { "archiveAfterDays": null, "deleteOnRequest": true }
@@ -102,12 +101,12 @@ A report is a record that derives a view:
 
 ```json
 {
-  "id": "report_contributions_by_cycle",
+  "id": "report_invoices_by_quarter",
   "type": "report.pivot",
   "meta": {
-    "source": "transaction.contribution",
-    "where": { "occurredAt": { "between": ["2025-01-01", "2026-12-31"] } },
-    "groupBy": ["contributor.homeDistrict.representative.election.cycle"],
+    "source": "invoice",
+    "where": { "issuedAt": { "between": ["2025-01-01", "2026-12-31"] } },
+    "groupBy": ["issuedAt.quarter"],
     "measures": [{ "field": "amountCents", "op": "sum", "as": "totalCents" }]
   }
 }
@@ -123,27 +122,27 @@ A plugin bundles models, reports, hooks, and config requirements that activate p
 
 ```json
 {
-  "id": "plugin_fec_compliance",
+  "id": "plugin_invoicing",
   "type": "plugin",
   "meta": {
-    "name": "FEC Compliance",
+    "name": "Invoicing",
     "provides": {
-      "models": ["model_transaction_contribution", "model_filing_fec"],
-      "reports": ["report_contributions_by_cycle", "report_limit_check"],
-      "hooks": ["hook_contribution_limit_check", "hook_filing_freeze"]
+      "models": ["model_invoice", "model_payment"],
+      "reports": ["report_invoices_by_quarter", "report_aging"],
+      "hooks": ["hook_payment_reconciliation"]
     },
     "requires": ["plugin_base_finance"]
   }
 }
 ```
 
-Activate = its capabilities appear. Deactivate = they disappear. Data stays. No migration.
+Activate = its capabilities appear. Deactivate = they disappear. Data stays.
 
 ---
 
 ## The Interface
 
-Every operation flows through one pipeline. No exceptions.
+Every operation flows through one pipeline:
 
 ```
 request (API, SDK, MCP, import, webhook, internal)
@@ -161,38 +160,33 @@ request (API, SDK, MCP, import, webhook, internal)
   → respond
 ```
 
+This is the only way data enters or leaves the system. Import, export, file upload, API calls — all pass through the same pipeline with the same hooks, permissions, and logging.
+
 ### Surfaces
 
 Generated from models. Not maintained separately.
 
-```
-GraphQL API        → single endpoint, schema from models + subscriptions
-SDK                → typed client, generated from models
-MCP                → tool definitions for AI agents, generated from models
-```
+| Surface | Transport |
+|---------|-----------|
+| GraphQL API | Single endpoint, schema from models, subscriptions via WebSocket |
+| SDK | Typed client generated from models |
+| MCP | Tool definitions for AI agents generated from models |
+| Web App | Tables, forms, detail pages, filters, charts — all from model `display` config |
 
 Add a model → all surfaces expose it. Change a field → all surfaces reflect it.
 
-### Real-Time
-
-Writes trigger `NOTIFY` on a per-type channel. The API exposes GraphQL subscriptions backed by `LISTEN`. Clients subscribe to record types they're viewing — changes appear instantly without polling or refresh.
-
-```graphql
-subscription { recordChanged(type: "transaction.contribution") { id action record { id meta } } }
-```
-
 ### Hooks
 
-Hooks are records. They run at defined points in the pipeline:
+Hooks are records that run at defined points in the pipeline:
 
 ```json
 {
-  "id": "hook_contribution_limit_check",
+  "id": "hook_validate_payment",
   "type": "hook",
   "meta": {
     "on": "pre:save",
-    "match": "transaction.contribution",
-    "action": "validate_contribution_limit",
+    "match": "payment",
+    "action": "validate_payment_amount",
     "mode": "sync"
   }
 }
@@ -205,37 +199,28 @@ Hooks are records. They run at defined points in the pipeline:
 | `post:save` | async | Denormalize, notify, webhook delivery, workflows |
 | `post:read` | sync | Redact fields, compute derived values |
 
-Async post-hooks enqueue in the same transaction as the write. They execute via background workers with retry and backoff. Failed hooks retry 3× with exponential backoff, then dead-letter. Dead-letter entries surface in the admin workroom for manual resolution.
+Async post-hooks enqueue in the same transaction as the write. They execute via background workers with retry (3× exponential backoff → dead-letter → admin workroom).
 
 ---
 
-## Hierarchy & Catalog
+## Hierarchy
 
 ```
 System (global catalog database)
   └─ Tenant (organization)
-       ├─ Workspace: "Walmart PAC"       → database: atomic_walmart_pac
-       ├─ Workspace: "Walmart Advocacy"   → database: atomic_walmart_advocacy
+       ├─ Workspace A  → database: atomic_tenant_ws_a
+       ├─ Workspace B  → database: atomic_tenant_ws_b
        └─ Config overrides, plugin grants, file storage bucket
 ```
 
 **Tenant** = the organization. Owns users, billing, config, plugin grants.
 **Workspace** = the data boundary. One database. One isolated corpus.
 
-A small campaign: one tenant, one workspace. Walmart: one tenant, multiple workspaces.
+A solo user: one tenant, one workspace. An enterprise: one tenant, many workspaces.
 
-Data never moves between workspaces directly. Migration out uses standard export templates. Migration in uses standard import templates (same interface pipeline). Cross-workspace aggregate reporting is available in the admin hub for tenant-level views, but workspaces remain isolated corpora.
+Data never moves between workspaces directly. Cross-workspace migration uses standard import/export templates. Tenant-level aggregate reporting is available in the admin hub, but workspaces remain isolated.
 
-The global catalog database holds:
-
-```
-tenant registry       — tenant → workspaces → connection strings
-system models         — always present
-plugin definitions    — what's available
-reference data        — states, districts, committees, elected officials
-user records          — identity + tenant/workspace roles
-config records        — system-level defaults
-```
+The global catalog database holds: tenant registry, system models, plugin definitions, reference data, user records, and system-level config.
 
 **Provisioning:** Create database → seed schema → add to tenant record → grant plugins → done.
 
@@ -243,26 +228,13 @@ config records        — system-level defaults
 
 ## Config
 
-Credentials and settings resolve bottom-up. First match wins:
+Settings resolve bottom-up. First match wins:
 
 ```
 workspace config → tenant config → system config
 ```
 
-```json
-{
-  "id": "config_tenant_walmart_sendgrid",
-  "type": "config",
-  "meta": {
-    "scope": "tenant",
-    "scopeRef": { "$ref": "tenant_walmart" },
-    "key": "sendgrid",
-    "value": { "apiKey": "SG_walmart_...", "from": "pac@walmart.org" }
-  }
-}
-```
-
-Walmart sends from their own SendGrid account. Small tenants use the system default. Plugins declare which config keys they need — the interface resolves through the cascade.
+A config record specifies scope, key, and value. Plugins declare which config keys they need — the interface resolves through the cascade. Tenants can override system defaults (e.g., their own email provider credentials); workspaces can further override tenant settings.
 
 ---
 
@@ -270,33 +242,14 @@ Walmart sends from their own SendGrid account. Small tenants use the system defa
 
 One flow: request arrives → hash token → lookup hash → load actor → merge roles → check permissions.
 
-A token is a record:
-
-```json
-{
-  "id": "token_abc",
-  "type": "token",
-  "meta": {
-    "hash": "sha256:...",
-    "actor": { "$ref": "rec_user_joey" },
-    "scope": {
-      "tenant": "tenant_walmart",
-      "workspace": "ws_walmart_pac",
-      "permissions": ["records:read", "records:write"],
-      "types": ["transaction.contribution", "person"]
-    },
-    "expiresAt": "2026-06-28T00:00:00Z",
-    "source": "magic_link"
-  }
-}
-```
+A token is a record with a hashed secret, a ref to an actor, and a scope (tenant, workspace, permitted types, permitted operations, expiry).
 
 | Origin | Lifespan | Scope |
 |--------|----------|-------|
 | Magic link (humans) | Short (1h) | Full user permissions |
 | Generated key (machines) | Long (months) | Narrowed to tenant, workspace, types, operations |
 
-No passwords. No OAuth. No JWTs. Revocation = delete the token record. Key leaks have contained blast radius (scoped to specific types in one workspace).
+No passwords. No OAuth. No JWTs. Revocation = delete the token record. Leaked keys have contained blast radius (scoped to specific types in one workspace).
 
 ### Roles
 
@@ -311,9 +264,9 @@ Tenant role = ceiling. Workspace role = narrowing. Models further restrict field
 
 ---
 
-## Retention & Deletion
+## Record Lifecycle
 
-Records have three lifecycle states:
+Records have three states:
 
 | Status | Visible | Queryable | Deletable |
 |--------|---------|-----------|-----------|
@@ -321,117 +274,67 @@ Records have three lifecycle states:
 | `archived` | No (unless filtered) | Yes (explicit filter) | Yes |
 | `deleted` | No | No | N/A (gone) |
 
-**Archive:** Soft-remove. Record still exists for compliance/audit. Excluded from default queries and UI.
+**Archive:** Soft-remove for compliance/audit. Excluded from default queries.
+**Delete:** Hard-remove. Record and its log entries purged (CCPA, retention limits).
 
-**Delete:** Hard-remove. Record and its log entries are purged. Used for CCPA requests, departed employees, or data past retention limits.
+Models control retention via `behavior.retention` (archive after N days, allow/forbid deletion). Plugins can override — compliance-regulated records may forbid deletion. A scheduled job runs the retention filter.
 
-Models control retention via `behavior.retention`:
+### Files
 
-```json
-"retention": { "archiveAfterDays": 365, "deleteOnRequest": true }
-```
+Files live in encrypted object storage, isolated per tenant. A file is a record with a `storageKey` and an `attachedTo` ref. Access follows the parent record's permissions. Storage is encrypted at rest, keyed per tenant.
 
-Plugins can override: financial records may forbid deletion regardless of requests (compliance trumps CCPA in regulated contexts — legal determines which wins). A scheduled job ("garbage day") runs the retention filter: archive records past their threshold, surface deletion candidates for review.
+### Logs
 
----
+Every operation produces an append-only log entry (same transaction): record ID, action, before/after snapshots, actor, timestamp, source.
 
-## Files
+- **Append-only.** Never updated. Deleted only during hard-delete (retention).
+- **Time-partitioned.** Monthly partitions for archival.
 
-Files live in encrypted object storage (S3), isolated per tenant. A file is a record:
+### Corrections
 
-```json
-{
-  "id": "file_receipt_001",
-  "type": "file",
-  "meta": {
-    "name": "contribution_receipt.pdf",
-    "mimeType": "application/pdf",
-    "sizeBytes": 84210,
-    "storageKey": "tenant_walmart/ws_pac/file_receipt_001",
-    "attachedTo": { "$ref": "rec_tx_123" }
-  }
-}
-```
-
-Access follows the same permission model as any record — if you can access the record a file is attached to, you can access the file. Upload and download flow through the interface (permissions, logging). Storage is encrypted at rest, keyed per tenant.
-
----
-
-## Logs
-
-Every operation produces an append-only log entry in the same transaction:
-
-```json
-{
-  "id": "log_abc123",
-  "record_id": "rec_tx_1",
-  "action": "create",
-  "before": null,
-  "after": { "type": "transaction.contribution", "meta": {} },
-  "actor": "rec_user_1",
-  "occurred_at": "2026-05-28T12:00:00Z",
-  "source": "api:pat_sms_platform"
-}
-```
-
-1. **Append-only.** Never updated. Deleted only during hard-delete (retention).
-2. **Interface-written only.** No user, hook, or surface writes to logs.
-3. **Time-partitioned.** Monthly partitions for retention and archival.
-
-Financial corrections use reversals:
+Immutable records are never edited. Corrections use reversals:
 
 ```
-rec_tx_1 → original ($2500, status: reversed)
-rec_tx_2 → reversal (-$2500, reverses: rec_tx_1)
-rec_tx_3 → correction ($2000, corrects: rec_tx_1)
+rec_1 → original ($2500, status: reversed)
+rec_2 → reversal (-$2500, reverses: rec_1)
+rec_3 → correction ($2000, corrects: rec_1)
 ```
 
 ---
 
 ## Database
 
-Each workspace database:
+Two tables per workspace: `records` and `logs`.
 
-```sql
-CREATE TABLE records (
-  id TEXT PRIMARY KEY,
-  type TEXT NOT NULL,
-  meta JSONB NOT NULL DEFAULT '{}',
-  system JSONB NOT NULL DEFAULT '{}',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+**Records:** `id`, `type`, `meta` (JSONB), `system` (JSONB), timestamps. Indexed on type and meta (GIN).
 
-CREATE TABLE logs (
-  id TEXT PRIMARY KEY,
-  record_id TEXT,
-  action TEXT NOT NULL,
-  before JSONB,
-  after JSONB,
-  actor TEXT NOT NULL,
-  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  source TEXT NOT NULL,
-  context JSONB NOT NULL DEFAULT '{}'
-) PARTITION BY RANGE (occurred_at);
+**Logs:** `id`, `record_id`, `action`, `before`/`after` (JSONB), `actor`, `occurred_at`, `source`. Partitioned by `occurred_at`. No UPDATE or DELETE grants (hard-delete uses a privileged system role).
 
-CREATE INDEX records_type_idx ON records (type);
-CREATE INDEX records_meta_gin ON records USING GIN (meta);
-CREATE INDEX logs_record_idx ON logs (record_id, occurred_at);
-CREATE INDEX logs_actor_idx ON logs (actor, occurred_at);
-```
+No `tenant_id` column. Isolation is physical — each workspace is its own database.
 
-No `tenant_id` column. Isolation is physical. Logs have no UPDATE or DELETE grants (hard-delete uses a privileged system role).
+Accelerators added when needed (ref graph, materialized reports, trigram search, generated columns for hot paths). All derived. All rebuildable. Never the source of truth.
 
-Accelerators added when needed:
+---
 
-```
-ref index       → precomputed reference graph
-report cache    → materialized report results
-search index    → pg_trgm + tsvector across meta
-generated cols  → hot meta paths promoted to indexed columns
-```
+## Stack
 
-All derived. All rebuildable. Never the source of truth.
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Database | Postgres | Data, jobs (SKIP LOCKED), events (LISTEN/NOTIFY), search (tsvector + GIN), partitioned logs |
+| Application | Node.js + Next.js | API + workroom in one deployment |
+| File storage | S3-compatible | Encrypted, tenant-isolated |
+| Email | Transactional provider | Magic links, notifications |
+
+Postgres handles job queues, real-time subscriptions, full-text search, and scheduling. No Redis. No Kafka. No external queue.
+
+### Scaling
+
+The architecture scales horizontally without changes to the interface:
+
+- **Vertical:** One process, one Postgres instance handles hundreds of tenants / millions of records.
+- **Horizontal:** Stateless processes behind a load balancer; connection pooling; workers in any process.
+- **Read replicas:** Reports and reads hit replicas; writes hit primary.
+- **Sharding:** Hot workspaces move to dedicated instances. The catalog maps workspace → connection string. Application code unchanged.
 
 ---
 
@@ -439,119 +342,8 @@ All derived. All rebuildable. Never the source of truth.
 
 Schema-driven. Models define fields → system generates templates.
 
-**Import:** User picks type → downloads template → fills → uploads → preview → validates against model → each row enters through the interface (same hooks, permissions, logging). No bulk backdoor.
+**Import:** Pick type → download template → fill → upload → preview → validate → each row enters through the interface pipeline.
 
-**Export:** Each row goes through the interface (permissions, redaction). If a user can't see a field, they can't export it. Every export is logged.
+**Export:** Each row passes through the interface. If a user can't see a field, they can't export it.
 
-Cross-workspace migration uses the same import/export templates. Standard egress format out, standard ingress template in.
-
----
-
-## Stack
-
-```
-Postgres          — data, jobs, events, search, subscriptions, partitioned logs
-Node.js + Next.js — API + workroom in one deployment
-S3                — encrypted file storage (tenant-isolated)
-SendGrid          — email (magic links, notifications) + SMS
-```
-
-### Packages
-
-```
-pg                — driver + connection pool
-casl              — permission engine (abilities from model records)
-dataloader        — batched ref resolution (N+1 prevention)
-pothos + yoga     — GraphQL schema builder + server + subscriptions
-pg-boss           — job queue (Postgres-native, transactional enqueue)
-pino              — structured logging
-lru-cache         — in-memory cache (models, permissions, config)
-graphql-ws        — WebSocket transport for subscriptions
-```
-
-### Postgres as Platform
-
-| Capability | Mechanism |
-|-----------|-----------|
-| Job queue | pg-boss (SKIP LOCKED, transactional) |
-| Real-time | LISTEN / NOTIFY → GraphQL subscriptions |
-| Search | tsvector + pg_trgm + GIN |
-| Log partitioning | PARTITION BY RANGE (occurred_at) |
-| Connection pooling | PgBouncer (transaction mode) |
-| Scheduling | pg-boss cron (retention jobs, report materialization) |
-
-No Redis. No Kafka. No external queue.
-
-### Scaling Ladder
-
-```
-Phase 1: One process, one Postgres instance
-         → hundreds of tenants, millions of records
-
-Phase 2: Multiple stateless processes + load balancer
-         → pg-boss workers in any process, PgBouncer manages connections
-
-Phase 3: Read replicas
-         → reports/reads hit replica, writes hit primary
-
-Phase 4: Workspace sharding
-         → hot workspaces move to dedicated instances
-         → global catalog maps workspace → connection string
-         → application code unchanged
-```
-
-Each phase is operational. The interface never changes.
-
----
-
-## API
-
-One endpoint. Schema-driven.
-
-```
-POST /api/graphql
-WS   /api/graphql (subscriptions)
-```
-
-```graphql
-query { record(id: "rec_123") { id type meta system } }
-mutation { saveRecord(input: { type: "person", meta: { ... } }) { id } }
-query { records(type: "transaction.contribution", where: { ... }, first: 50, after: "cursor") { edges { node { id meta } } } }
-subscription { recordChanged(type: "person") { id action record { id meta } } }
-```
-
-Cursor-based pagination. Depth and complexity limits enforced.
-
----
-
-## Web App
-
-Schema-driven workroom. Models generate:
-
-```
-tables, detail pages, forms, reference pickers
-filters, groups, pivots, charts, exports
-```
-
-Nothing hand-built per type. The model is the UI contract. Null fields are omitted from display — the UI renders what exists.
-
-Real-time: subscriptions push changes to open views. Data appears as it arrives.
-
----
-
-## Principles
-
-```
-1. Everything is a record
-2. Everything flows through one interface
-3. Everything is logged (same transaction, append-only)
-4. Models drive behavior — not code
-5. Surfaces are generated — not maintained
-6. Plugins bundle capability — toggle on/off
-7. Config cascades — workspace → tenant → system
-8. Financial records are immutable — corrections only
-9. Postgres is the platform — no external services beyond storage and email/SMS
-10. Scale by adding instances — architecture unchanged
-11. Fields are nullable — no migrations, UI renders what exists
-12. Data is real-time — changes broadcast, clients subscribe
-```
+Cross-workspace migration uses the same templates.
