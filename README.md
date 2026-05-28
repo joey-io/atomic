@@ -43,6 +43,8 @@ Domain types — `person`, `facility`, `invoice`, `task` — are defined per imp
 10. Scale by adding instances — architecture unchanged
 11. Fields are nullable — no migrations, UI renders what exists
 12. Data is real-time — changes broadcast, clients subscribe
+13. Identity is model-defined — not inferred from IDs
+14. Creation is the record itself — mutation produces logs
 ```
 
 ---
@@ -79,6 +81,14 @@ A ref is a field value pointing to another atom by GUID:
 
 A ref is just a field with `kind: "ref"` in the model. The system resolves ref paths for traversal (e.g., `order.customer.region`).
 
+Traversal paths resolve through refs and nested JSON:
+
+```txt
+contribution.committee.treasurer.address.state
+```
+
+The same traversal language works across filters, reports, permissions, GraphQL, exports, hooks, and generated UI.
+
 ---
 
 ## Traits
@@ -102,6 +112,8 @@ A reusable field shape:
 }
 ```
 
+Traits are reusable schema includes — not separate records in the domain graph. An address is usually embedded JSON inside an atom, not its own atom.
+
 Models reference traits by GUID or by a resolved catalog key. The interface resolves and expands the fields:
 
 ```json
@@ -115,7 +127,7 @@ Same shape, different field names, one definition. Change the trait → every mo
 
 ## Models
 
-A model defines an atom type — its fields, display, and behavior:
+A model defines an atom type — its fields, display, identity rules, and behavior:
 
 ```json
 {
@@ -132,19 +144,102 @@ A model defines an atom type — its fields, display, and behavior:
       "capacity": { "kind": "integer" },
       "openedAt": { "kind": "datetime", "filterable": true, "sortable": true }
     },
+    "identity": {
+      "keys": [
+        ["externalIds.fec"],
+        ["name", "location.city", "location.state"]
+      ]
+    },
     "display": {
       "row": ["name.display", "location.city", "capacity"],
-      "card": { "title": "{{name.display}}", "subtitle": "{{location.city}}, {{location.state}}" }
+      "card": {
+        "title": "{{name.display}}",
+        "subtitle": "{{location.city}}, {{location.state}}"
+      }
     },
-    "behavior": { "mutable": true },
-    "retention": { "archiveAfterDays": null, "deleteOnRequest": true }
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "model-defined"
+    },
+    "retention": {
+      "archiveAfterDays": null,
+      "deleteOnRequest": true
+    }
   }
 }
 ```
 
+Models define:
+
+- allowed fields
+- validation
+- display
+- permissions
+- indexes
+- retention
+- identity rules
+- merge behavior
+
 Adding a new type = adding a model atom. No code. No deployment.
 
 System models are always present. Tenant models extend fields, rename labels, override display. Plugin models activate/deactivate with the plugin.
+
+### Identity & Deduplication
+
+Identity is model-defined.
+
+Atomic does not infer sameness from GUIDs. GUIDs are only internal identity.
+
+Models define one or more identity key sets:
+
+```json
+"identity": {
+  "keys": [
+    ["externalIds.fec"],
+    ["email"],
+    ["name", "birthDate"]
+  ]
+}
+```
+
+When an atom is created or imported, the interface checks for existing atoms matching any identity key set.
+
+Possible outcomes:
+
+| Result | Behavior |
+|---|---|
+| no match | create atom |
+| single confident match | update or merge existing atom |
+| ambiguous matches | create review task or require human resolution |
+
+Identity logic is deterministic and model-driven.
+
+### Merging
+
+Merging is a first-class operation.
+
+When two atoms are determined to represent the same entity:
+
+- one atom becomes canonical
+- refs are rewired
+- merged fields are resolved using model-defined merge rules
+- prior GUIDs remain traceable
+- the merge operation produces log atoms
+
+Example:
+
+```txt
+A + B → A
+```
+
+Where:
+
+- `A` remains canonical
+- `B` becomes merged/replaced
+- all references to `B` resolve to `A`
+- history remains intact
+
+The merge itself is append-only and auditable.
 
 ### Schema Evolution
 
@@ -164,9 +259,19 @@ A derived view:
     "key": "invoices.byQuarter",
     "kind": "pivot",
     "source": "invoice",
-    "where": { "issuedAt": { "between": ["2025-01-01", "2026-12-31"] } },
+    "where": {
+      "issuedAt": {
+        "between": ["2025-01-01", "2026-12-31"]
+      }
+    },
     "groupBy": ["issuedAt.quarter"],
-    "measures": [{ "field": "amountCents", "op": "sum", "as": "totalCents" }]
+    "measures": [
+      {
+        "field": "amountCents",
+        "op": "sum",
+        "as": "totalCents"
+      }
+    ]
   }
 }
 ```
@@ -212,6 +317,8 @@ request (API, SDK, MCP, import, webhook, internal)
   → resolve config (cascade: workspace → tenant → system)
   → resolve model (from type + active plugins)
   → validate against schema
+  → resolve identity
+  → deduplicate / merge if needed
   → run sync pre-hooks
   → execute (read, write, report, ref resolution)
   → write log (same transaction)
@@ -346,10 +453,56 @@ Files live in encrypted object storage, isolated per tenant. A file is an atom w
 
 ### Logs
 
-Every operation produces an append-only log entry (same transaction): atom GUID, action, before/after snapshots, actor, timestamp, source.
+Every mutation produces append-only log atoms in the same transaction.
 
-- **Append-only.** Never updated. Deleted only during hard-delete (retention).
-- **Time-partitioned.** Monthly partitions for archival.
+Creation is represented by the atom itself.
+
+Mutations produce log atoms describing the transition:
+
+```txt
+create atom → atom exists
+update atom → log atom
+merge atoms → log atom
+archive atom → log atom
+restore atom → log atom
+```
+
+A log atom contains:
+
+- affected atom GUID
+- action
+- before snapshot
+- after snapshot
+- actor
+- timestamp
+- source
+- merge metadata (if applicable)
+
+Example:
+
+```json
+{
+  "guid": "66666666-6666-4666-8666-666666666666",
+  "type": "log",
+  "attr": {
+    "action": "merge",
+    "target": "7b8f2f0c-5f0f-4a3d-9f0d-2d6e2d4d1c11",
+    "merged": "9d3c88d1-4f33-4f7f-a0f1-3e0f6d0e8f3a",
+    "before": {},
+    "after": {},
+    "actor": "system.identity",
+    "occurredAt": "2026-05-28T18:00:00Z"
+  }
+}
+```
+
+Logs are:
+
+- append-only
+- time-partitioned
+- rebuildable into timelines
+- queryable like any other atom
+- removable only through privileged retention deletion
 
 ### Corrections
 
@@ -373,7 +526,16 @@ Two tables per workspace: `atoms` and `logs`.
 
 No `tenant_id` column. Isolation is physical — each workspace is its own database.
 
-Accelerators added when needed (ref graph, materialized reports, trigram search, generated columns for hot attr paths). All derived. All rebuildable. Never the source of truth.
+Accelerators added when needed:
+
+- ref graph
+- materialized reports
+- trigram search
+- generated columns for hot attr paths
+- identity indexes
+- merge lookup tables
+
+All derived. All rebuildable. Never the source of truth.
 
 ---
 
