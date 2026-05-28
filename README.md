@@ -188,6 +188,15 @@ atom://id?param=value
 
 The system resolves what the target atom is. If it's an index, it executes. If it's a direct atom, it resolves directly.
 
+Resolution rules:
+
+- Self-reference terminates (e.g. `model` → `atom://model`)
+- Cycles error — kernel tracks visited atoms per resolution
+- Dangling references error — no silent nulls
+- Max depth: 8 — fail if exceeded
+- Copy-on-write: first mutation to a referenced field detaches it into a local value
+- Resolved references are cached — invalidated on mutation broadcast
+
 Examples:
 
 ```
