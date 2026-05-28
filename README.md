@@ -303,6 +303,20 @@ Adding a new type means creating a model atom.
 
 No code. No deployment.
 
+### Type Compatibility
+
+`type` is not the primary classifier. The model reference is canonical.
+
+`type` may remain as a denormalized accelerator:
+
+```json
+{
+  "type": "invoice"
+}
+```
+
+It is derived from the resolved model. Optional cache/index metadata.
+
 ---
 
 ## Identity & Deduplication
