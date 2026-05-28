@@ -51,7 +51,7 @@ Domain types — `person`, `facility`, `invoice`, `task` — are defined per imp
 
 ```json
 {
-  "id": "rec_123",
+  "id": "rec.123",
   "type": "invoice",
   "attr": {},
   "lifecycle": {}
@@ -72,7 +72,7 @@ Real-world dates (`occurredAt`, `filedAt`, `effectiveAt`) belong in `attr`. `lif
 A ref is a field value pointing to another atom:
 
 ```json
-{ "$ref": "rec_person_123" }
+{ "$ref": "rec.person.123" }
 ```
 
 A ref is just a field with `kind: "ref"` in the model. The system resolves ref paths for traversal (e.g., `order.customer.region`).
@@ -85,7 +85,7 @@ A reusable field shape:
 
 ```json
 {
-  "id": "trait_address",
+  "id": "trait.address",
   "type": "trait",
   "attr": {
     "fields": {
@@ -102,8 +102,8 @@ A reusable field shape:
 Models reference traits with a ref. The interface resolves and expands the fields:
 
 ```json
-"headquarters": { "$ref": "trait_address" },
-"mailingAddress": { "$ref": "trait_address" }
+"headquarters": { "$ref": "trait.address" },
+"mailingAddress": { "$ref": "trait.address" }
 ```
 
 Same shape, different field names, one definition. Change the trait → every model using it reflects the change.
@@ -116,15 +116,15 @@ A model defines an atom type — its fields, display, and behavior:
 
 ```json
 {
-  "id": "model_facility",
+  "id": "model.facility",
   "type": "model",
   "attr": {
     "appliesTo": "facility",
     "label": "Facility",
     "fields": {
-      "name": { "$ref": "trait_profile" },
-      "location": { "$ref": "trait_address" },
-      "contact": { "$ref": "trait_contact" },
+      "name": { "$ref": "trait.profile" },
+      "location": { "$ref": "trait.address" },
+      "contact": { "$ref": "trait.contact" },
       "capacity": { "kind": "integer" },
       "openedAt": { "kind": "datetime", "filterable": true, "sortable": true }
     },
@@ -154,7 +154,7 @@ A derived view:
 
 ```json
 {
-  "id": "report_invoices_by_quarter",
+  "id": "report.invoices.by.quarter",
   "type": "report.pivot",
   "attr": {
     "source": "invoice",
@@ -175,16 +175,16 @@ Bundles models, reports, hooks, and config that activate per tenant:
 
 ```json
 {
-  "id": "plugin_invoicing",
+  "id": "plugin.invoicing",
   "type": "plugin",
   "attr": {
     "name": "Invoicing",
     "provides": {
-      "models": ["model_invoice", "model_payment"],
-      "reports": ["report_invoices_by_quarter", "report_aging"],
-      "hooks": ["hook_payment_reconciliation"]
+      "models": ["model.invoice", "model.payment"],
+      "reports": ["report.invoices.by.quarter", "report.aging"],
+      "hooks": ["hook.payment.reconciliation"]
     },
-    "requires": ["plugin_base_finance"]
+    "requires": ["plugin.base.finance"]
   }
 }
 ```
@@ -234,7 +234,7 @@ Hooks are atoms that run at defined points in the pipeline:
 
 ```json
 {
-  "id": "hook_validate_payment",
+  "id": "hook.validate.payment",
   "type": "hook",
   "attr": {
     "on": "pre:save",
@@ -348,9 +348,9 @@ Every operation produces an append-only log entry (same transaction): atom ID, a
 Immutable atoms are never edited. Corrections use reversals:
 
 ```
-rec_1 → original ($2500, status: reversed)
-rec_2 → reversal (-$2500, reverses: rec_1)
-rec_3 → correction ($2000, corrects: rec_1)
+rec.1 → original ($2500, status: reversed)
+rec.2 → reversal (-$2500, reverses: rec.1)
+rec.3 → correction ($2000, corrects: rec.1)
 ```
 
 ---
