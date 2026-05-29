@@ -1,19 +1,21 @@
 # Atomic
 
-Atomic stores typed records and the schemas that define them as one kind of record: an atom. Relationships are typed edges. Indexes, permissions, rendering, and migrations are declared as atoms and executed by one kernel. Target use: graph-relational, queryable stores such as CRM.
+Atomic is a data substrate for graph-relational, queryable stores such as CRM. Every record is an atom, including the schema that defines other records. Relationships are typed edges. Queries, constraints, permissions, rendering, and migrations are stored as atoms and run by one kernel.
 
 ## Primitives
 
-Six. Uniqueness, identity, dedup, inverse edges, embedding, dashboards, audit, and time-travel are roles of these or sugar over them.
+Atomic is built from six concepts:
 
-1. **Atom** — `{ id, model, manifest, attr, lifecycle }`. The record shape.
-1. **Model** — a type definition. A trait is a model with `behavior.embedded`.
-1. **Index** — access and constraint. `filter`, `sort`, `unique`, `identity`, `inverse` are roles.
-1. **Path** — the expression language for filters, rules, display, migrations, exports.
-1. **Logic** — a declarative spec the kernel evaluates, or a handler. Rules, hooks, and custom migrations use it. Handlers are the only code.
-1. **Log** — append-only history. Provenance, audit, and time-travel are reads of it.
+1. **Atom** — a record: `{ id, model, manifest, attr, lifecycle }`.
+1. **Model** — defines a type’s fields, indexes, display, and rules.
+1. **Index** — a query or constraint over a model’s fields.
+1. **Path** — a dotted expression for reading across fields and edges.
+1. **Logic** — a rule or transform, written as a path expression or a handler.
+1. **Log** — an append-only record of every change.
 
 ## Atom
+
+Every record has the same five fields.
 
 ```json
 {
@@ -37,25 +39,25 @@ Six. Uniqueness, identity, dedup, inverse edges, embedding, dashboards, audit, a
 }
 ```
 
-|Field      |Definition                                                                                      |
-|-----------|------------------------------------------------------------------------------------------------|
-|`id`       |Flat, opaque, immutable address. Route: `atom://id`. Not derived from data.                     |
-|`model`    |The model atom defining schema, edges, display, and rules.                                      |
-|`manifest` |Prose. Caller-owned, CRUD-settable, full-text indexed.                                          |
-|`attr`     |Model-shaped values. `ref` fields are edges.                                                    |
-|`lifecycle`|Kernel-owned: `status`, `version` (write count), `modelVersion`, created/updated actor and time.|
+|Field      |Definition                                                                                            |
+|-----------|------------------------------------------------------------------------------------------------------|
+|`id`       |Unique, opaque, immutable identifier. The reference route is `atom://id`.                             |
+|`model`    |Reference to the model atom that defines this record’s type.                                          |
+|`manifest` |Free-text description. Set through CRUD; full-text indexed.                                           |
+|`attr`     |The record’s values, shaped by its model. `ref` values are edges.                                     |
+|`lifecycle`|Kernel-managed: `status`, `version` (write count), `modelVersion`, and created/updated actor and time.|
 
-`id` is a surrogate key; it stays opaque and immutable so edges survive data changes. Identity is a separate index role. Domain timestamps (`closedAt`) go in `attr`; `lifecycle` is operational.
+`id` is opaque and never changes, so references remain valid when data changes. Domain timestamps such as `closedAt` go in `attr`; `lifecycle` holds operational metadata only.
 
 ## Model
 
-A model atom defines a type’s fields, indexes, display, rules, and behavior. The kernel is self-describing: `model`, `index`, `hook`, `migration`, `token`, `config`, `file`, `log`, `plugin`, `tenant` are model atoms.
+A model is an atom that defines a type. It lists the type’s fields, indexes, display layouts, and rules. The kernel’s own types — `model`, `index`, `hook`, `migration`, `token`, `config`, `file`, `log`, `plugin`, `tenant` — are themselves model atoms.
 
 ```json
 {
   "id": "model",
   "model": "atom://model",
-  "manifest": "Defines a type: fields, indexes, display, rules",
+  "manifest": "Defines a type",
   "attr": {
     "label": "Model",
     "version": 1,
@@ -108,17 +110,22 @@ A model atom defines a type’s fields, indexes, display, rules, and behavior. T
 }
 ```
 
-Field kinds: scalars (`text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`); `ref` (typed pointer to a model); containers (`list`, `map`, `json`); modifiers (`required`, `default`, `unique`, `filterable`, `sortable`).
+**Field kinds**
 
-A `ref` resolves in one lookup. Its meaning is set by its target: a ref to a standalone model is a graph edge; a ref to an embedded model inlines the value.
+- Scalars: `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`.
+- `ref`: a reference to another model. A reference to a standalone model is a graph edge; a reference to an embedded model inlines that model’s fields.
+- Containers: `list`, `map`, `json`.
+- Modifiers: `required`, `default`, `unique`, `filterable`, `sortable`.
 
-A model with `behavior.embedded` has no standalone instances. Referencing it inlines its fields, which carry no `id` or `lifecycle`.
+**Embedded models**
+
+A model with `behavior.embedded: true` has no standalone records. Its fields are inlined wherever it is referenced and carry no `id` or `lifecycle` of their own. This is how reusable field groups are defined.
 
 ```json
 {
   "id": "address",
   "model": "atom://model",
-  "manifest": "Embedded model (a trait)",
+  "manifest": "Embedded address",
   "attr": {
     "label": "Address",
     "behavior": {
@@ -151,38 +158,41 @@ A model with `behavior.embedded` has no standalone instances. Referencing it inl
 
 ## Graph
 
-`ref` fields are edges. An edge declares `to` and optional `inverse`. The kernel registers the inverse as an index on the target and maintains it on write, so both directions are queryable.
+A `ref` field is an edge. It declares `to` (the target model) and an optional `inverse` (a field name on the target). When `inverse` is set, the kernel maintains the reverse edge automatically, so both directions are queryable.
 
-```txt
-company → contacts → company        (edge and inverse)
-contact → company → owner → team
-deal → company → deals → deal        (cycle)
+A path is a dotted expression that reads across edges and nested values:
+
 ```
-
-One path language reads through edges and nested JSON, used by filters, indexes, rules, display, and exports:
-
-```txt
 deal.company.owner.team
 ```
 
-Traversal: refs may be cyclic; traversals terminate by cycle detection (visited-set), not a depth cap; each runs under a budget (wall-clock, nodes, result size) callers may raise; dangling refs error; resolved edges are cached and invalidated on mutation.
+Paths are used in filters, indexes, rules, display, and exports. Traversal follows these rules:
+
+- References may form cycles. Traversal tracks visited atoms and stops when it revisits one; there is no fixed depth limit.
+- Each traversal runs under a budget (time, atoms visited, result size). Callers may raise the budget.
+- A reference to a missing atom is an error, not a null.
+- Resolved references are cached and invalidated when the target changes.
 
 ## Index
 
-An index declares `over`, `params`, `match`, `sort`, `returns`, and a `role`:
+An index is a query or constraint over a model’s fields. It declares `over`, `params`, `match`, `sort`, `returns`, and a `role`:
 
-- `filter` / `sort` — parameterized query over a model.
-- `unique` — rejects a write that duplicates the key.
-- `identity` — a unique index checked at create for dedup.
-- `inverse` — the back-edge of a `ref`, exposed as a field on the target.
+- `filter` / `sort`: a parameterized query.
+- `unique`: rejects a write that would duplicate the key.
+- `identity`: a unique key used to detect duplicates on create.
+- `inverse`: the reverse side of a `ref`, exposed as a field on the target.
 
-Field-level `unique` and `inverse` desugar to indexes. A standalone index is invoked as a reference: `atom://openDeals?company=atom://northwind`.
+The `unique` and `inverse` field modifiers are shorthand for indexes. An index is run by referencing it with parameters:
+
+```
+atom://openDeals?company=atom://northwind
+```
 
 ```json
 {
   "id": "openDeals",
   "model": "atom://index",
-  "manifest": "Open deals for a company, by value",
+  "manifest": "Open deals for a company",
   "attr": {
     "label": "Open deals",
     "over": "atom://deal",
@@ -212,23 +222,27 @@ Field-level `unique` and `inverse` desugar to indexes. A standalone index is inv
 }
 ```
 
-`display` declares `row`, `detail`, and `board` layouts; the kernel renders any atom or index from them. A dashboard is a set of saved indexes and `display` declarations.
+## Display
+
+A model’s `display` defines how its records render: `row` for tables, `detail` for a single record, `board` for grouped views. The kernel generates the UI from these definitions. A dashboard is a set of saved indexes plus their display layouts.
 
 ## Correctness
 
-Four rules.
+**Identity and deduplication.** On create, the kernel checks the model’s `identity` indexes. If a record with the same key exists, the write is merged into it (per `behavior.merge`) instead of inserting a duplicate. The `id` is not used for matching. By default `id` is a generated surrogate; `behavior.addressing: content` derives `id` from the identity key and is allowed only for immutable, single-key models.
 
-Identity: on create the kernel looks up the `identity` indexes; a match is upserted (merged per `behavior.merge`), not inserted. `id` is not used for matching. Addressing is `surrogate` by default; `addressing: content` (id = hash of identity) is permitted only for immutable, single-keyed models.
+**Concurrency.** A write carries the `lifecycle.version` it read. The kernel commits the write only if the stored version is unchanged; otherwise it returns a conflict for the caller to retry. A model may opt into last-writer-wins.
 
-Concurrency: a write includes the `lifecycle.version` it read. The kernel commits only if the stored version is unchanged, else returns a conflict. Last-writer-wins is opt-in per model.
+**Provenance.** The log records every change at field level: actor, time, old value, new value. A field’s full history is its log entries. Audit and point-in-time queries read the same log. Values computed on read are not stored; values that are audited or billed are written so they are indexed, logged, and fixed at write time.
 
-Provenance: the log records each mutation at field granularity — actor, time, before, after. A value’s origin and history are the log entries for its field. Audit and time-travel read the same log. Computed-on-read values are not stored; audited or billed values are written, so they are indexed, logged, and fixed at write time.
-
-Permissions: `rules` are `read` and `write` path predicates. Evaluation is fail-closed — false, error, or budget exhaustion denies. Permission traversal cannot fail open.
+**Permissions.** A model’s `rules` hold `read` and `write` predicates, written as path expressions. A predicate that is false, errors, or exceeds its traversal budget denies access. Access is never granted by default.
 
 ## Schema evolution
 
-Models carry `version`. Additive or derivable changes do not bump it; existing atoms stay valid. A breaking change bumps `version` and ships a `migration` atom: immutable, forward-only. Each atom stores `modelVersion`. The kernel chains migrations on read, persists on the next write (copy-on-write), and runs a background sweep over atoms behind current. `op: rename` and `op: default` execute from `spec`; `op: custom` runs a handler. A field is complete only after the sweep; sweep before filtering, searching, or billing on it.
+Each model has a `version`. Adding an optional field does not change it; existing records stay valid. A breaking change (rename, retype, new required field, removal, or identity change) increments `version` and ships a `migration` atom, which is immutable and applies in one direction only.
+
+Each record stores the `modelVersion` it was written under. When a record is behind the current version, the kernel applies the migrations in order on read and returns the current shape. The record is rewritten to the new shape on its next write. A background job rewrites records that are never otherwise written.
+
+`op: rename` and `op: default` are applied by the kernel from `spec`. `op: custom` runs a named handler. A field is fully migrated only after the background job completes; run it to completion before filtering, searching, or billing on that field.
 
 ```json
 {
@@ -248,7 +262,7 @@ Models carry `version`. Additive or derivable changes do not bump it; existing a
 
 ## Example: CRM
 
-Three model atoms wired by `ref`/`inverse` edges. The graph, queries, rendering, dedup, log, and permissions are derived from them.
+The following three models define a CRM. `contact` and `deal` reference `company`; `company` exposes the reverse edges as `contacts` and `deals`. Identity, the reverse edges, display, and permissions are all declared in the models.
 
 ```json
 {
