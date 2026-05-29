@@ -1,18 +1,23 @@
 # Atomic
 
-A substrate for building graph-relational, queryable databases. Schema is data, relationships are first-class edges, every surface is generated from atoms, and correctness comes first: identity, provenance, and permissions are guarantees of the kernel, not features of the app.
+A substrate for building graph-relational, queryable databases — CRM and anything shaped like it. Schema is data, relationships are first-class edges, every surface is generated, and correctness is the kernel’s job: identity, provenance, and permissions are guarantees, not app code.
 
-Everything is an atom.
+## Primitives
 
-```
-{ id, model, manifest, attr, lifecycle }
-```
+Atomic has six. Everything else — uniqueness, dedup, inverse edges, embedding, dashboards, audit, time-travel — is a *role* one of these plays or sugar over them.
+
+1. **Atom** — `{ id, model, manifest, attr, lifecycle }`. The only record shape.
+1. **Model** — defines a type. A *trait* is a model whose instances embed instead of standing alone (`behavior.embedded`).
+1. **Index** — the only access and constraint. Filter, sort, `unique`, `identity`, and `inverse` are roles an index plays.
+1. **Path** — the only expression language. Filters, rules, display, migrations, and exports all read it.
+1. **Logic** — a declarative spec the kernel runs, or a handler when it can’t. Rules, hooks, and custom migrations share this shape; deployed code lives only in handlers.
+1. **Log** — the only history. Provenance, audit, and time-travel are views of it.
 
 ## The atom
 
 ```json
 {
-  "id": "7b8f-...",
+  "id": "7b8f-2f0c",
   "model": "atom://contact",
   "manifest": "Jane Roe, VP Eng at Northwind",
   "attr": {
@@ -32,25 +37,25 @@ Everything is an atom.
 }
 ```
 
-|Field      |Meaning                                                                                                                 |
-|-----------|------------------------------------------------------------------------------------------------------------------------|
-|`id`       |Flat, opaque, stable address. The route: `atom://id`. Never derived from data, never changes.                           |
-|`model`    |The model atom defining this atom’s schema, relationships, display, and rules.                                          |
-|`manifest` |Prose description, human- and agent-readable. Caller-owned, CRUD-settable, full-text searchable.                        |
-|`attr`     |Model-shaped values, including `ref` fields that are edges in the graph.                                                |
-|`lifecycle`|Kernel-owned: `status`, `version` (write count, used for concurrency), `modelVersion`, and created/updated actor + time.|
+|Field      |Meaning                                                                                                             |
+|-----------|--------------------------------------------------------------------------------------------------------------------|
+|`id`       |Flat, opaque, stable address — the route `atom://id`. Never derived from data, never changes.                       |
+|`model`    |The model atom defining schema, edges, display, and rules.                                                          |
+|`manifest` |Prose, human- and agent-readable. Caller-owned, CRUD-settable, full-text searchable.                                |
+|`attr`     |Model-shaped values; `ref` fields are edges in the graph.                                                           |
+|`lifecycle`|Kernel-owned: `status`, `version` (write count, used for concurrency), `modelVersion`, created/updated actor + time.|
 
-`id` is a surrogate key and stays flat and opaque so references never break when data changes. *Identity* — how two records are recognized as the same real-world thing — is a separate, model-defined natural key (see Correctness). Real-world timestamps (`closedAt`, `signedAt`) live in `attr`; `lifecycle` is operational only.
+`id` is a surrogate and stays opaque so edges never break when data changes. Recognizing two records as the same real thing is *identity*, a separate index role. Real-world times (`closedAt`) live in `attr`; `lifecycle` is operational only.
 
 ## Models
 
-A model is an atom that defines a type: its fields, identity, display, permissions, and behavior. Adding a type is creating a model atom — no code, no deploy. The kernel is self-describing: `model`, `trait`, `index`, `hook`, `token`, `config`, `file`, `log`, `migration`, `plugin`, and `tenant` are all model atoms, defined the same way as the types you add.
+A model is an atom defining a type. Adding a type is writing a model atom — no code, no deploy. The kernel is self-describing: `model`, `index`, `hook`, `migration`, `token`, `config`, `file`, `log`, `plugin`, `tenant` are model atoms, defined exactly as the types you add.
 
 ```json
 {
   "id": "model",
   "model": "atom://model",
-  "manifest": "Defines atom schemas, relationships, display, and behavior",
+  "manifest": "Defines a type: fields, indexes, display, rules",
   "attr": {
     "label": "Model",
     "version": 1,
@@ -66,25 +71,26 @@ A model is an atom that defines a type: its fields, identity, display, permissio
         "kind": "map",
         "required": true
       },
-      "identity": {
-        "kind": "json"
+      "indexes": {
+        "kind": "map"
       },
       "display": {
         "kind": "json"
       },
-      "permissions": {
+      "rules": {
         "kind": "json"
       },
       "behavior": {
         "kind": "json"
       }
     },
-    "identity": {
-      "keys": [
-        [
+    "indexes": {
+      "byId": {
+        "on": [
           "id"
-        ]
-      ]
+        ],
+        "role": "identity"
+      }
     },
     "display": {
       "row": [
@@ -102,51 +108,83 @@ A model is an atom that defines a type: its fields, identity, display, permissio
 }
 ```
 
-### Field kinds
+**Field kinds.** Scalars (`text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`); `ref` (a typed pointer to a model); containers (`list`, `map`, `json`); modifiers (`required`, `default`, `unique`, `filterable`, `sortable`).
 
-A field definition declares a `kind` and optional modifiers:
+A `ref` is always a cheap typed pointer. What it *means* is decided by its target, not the field: a ref to a standalone model is a graph edge; a ref to an embedded model inlines the value. Composition and relationship are the same field.
 
-- scalars — `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum` (`values`)
-- `ref` — an edge to another atom. Declares `to` (target model) and optional `inverse` (the back-edge field maintained automatically on the target). This is what makes the data graph-relational.
-- containers — `list` (`of`), `map`, `json`
-- modifiers — `required`, `default`, `unique`, `filterable`, `sortable`
+**Traits are embedded models.** Mark a model `behavior.embedded` and its instances inline wherever referenced, carrying no id or lifecycle of their own — a reusable field shape, expressed as a model so there is one fewer concept.
 
-A `ref` is always a cheap, typed pointer. A *query* is always an index invoked by name (next section). The two are never confused, so reading a field’s kind tells you its cost.
+```json
+{
+  "id": "address",
+  "model": "atom://model",
+  "manifest": "A postal address \u2014 an embedded model (a trait)",
+  "attr": {
+    "label": "Address",
+    "behavior": {
+      "embedded": true
+    },
+    "fields": {
+      "street": {
+        "kind": "text"
+      },
+      "city": {
+        "kind": "text",
+        "filterable": true
+      },
+      "state": {
+        "kind": "text",
+        "filterable": true
+      },
+      "zip": {
+        "kind": "text"
+      },
+      "country": {
+        "kind": "text",
+        "default": "US"
+      }
+    }
+  },
+  "lifecycle": "atom://0"
+}
+```
 
 ## The graph
 
-References use `atom://` and are first-class edges. Because a `ref` declares `to` and `inverse`, the graph is bidirectional and cheap to walk both ways: from a contact to its company, and from a company to its contacts, with no manual back-pointer.
+`ref` fields are edges. An edge declares `to` and optional `inverse`; the kernel registers the inverse as an index on the target, so the back-edge is a queryable field maintained automatically. The graph is bidirectional with no manual back-pointers.
 
 ```txt
-company → contacts → company        (inverse pair)
+company → contacts → company        (an edge and its inverse)
 contact → company → owner → team
-deal → company → deals → deal        (cycle — valid)
+deal → company → deals → deal        (a cycle — valid)
 ```
 
-Traversal paths read through edges and nested JSON with one language, used by filters, indexes, permissions, display, and exports:
+One path language reads through edges and nested JSON, used by filters, indexes, rules, display, and exports:
 
 ```txt
 deal.company.owner.team
 ```
 
-**Traversal rules**
+**Traversal:** refs may be cyclic; traversals terminate by cycle detection, never a depth cap; every traversal runs under an explicit budget (time, nodes, result size) callers may raise; dangling refs error — no silent nulls; resolved edges are cached and invalidated on mutation.
 
-- Refs may be cyclic. Traversals terminate by cycle detection (visited-set), never by a depth cap.
-- Every traversal runs under an explicit resource budget — wall-clock, nodes, result size — with a default callers may raise.
-- Dangling references error. No silent nulls.
-- Resolved edges are cached and invalidated on mutation broadcast.
+## Indexes, queries, and generated UI
 
-## Querying and generated surfaces
+An index is the single access-and-constraint primitive. The same declaration that answers a query also enforces a constraint, depending on its `role`:
 
-An **index** is the one query primitive: a named, reusable, parameterized access pattern over a model. It declares what it ranges `over`, its `params`, a `match`, a `sort`, and whether it `returns` a set or one atom.
+- *filter / sort* — a reusable, parameterized query over a model.
+- *unique* — rejects a write that would duplicate the key.
+- *identity* — a unique index used at create for dedup (below).
+- *inverse* — the back-edge of a `ref`, surfaced as a field on the target.
+
+Field-level `unique` and `inverse` are sugar; they desugar to indexes. A standalone index is invoked as a reference — `atom://openDeals?company=atom://northwind` — so a query is an atom you can pin, share, or embed.
 
 ```json
 {
-  "id": "dealsByStage",
+  "id": "openDeals",
   "model": "atom://index",
-  "manifest": "Open deals for a company, by stage",
+  "manifest": "Open deals for a company, by value",
   "attr": {
-    "label": "Deals by stage",
+    "label": "Open deals",
     "over": "atom://deal",
     "params": {
       "company": {
@@ -155,7 +193,7 @@ An **index** is the one query primitive: a named, reusable, parameterized access
       }
     },
     "match": {
-      "company": "atom://params.company",
+      "company": "params.company",
       "stage": {
         "in": [
           "lead",
@@ -174,32 +212,23 @@ An **index** is the one query primitive: a named, reusable, parameterized access
 }
 ```
 
-Indexes are invoked as references — `atom://dealsByStage?company=atom://northwind` — so a query is just an atom you can pin, share, or embed.
-
-**Generated UI** reads two declarations and needs no per-screen code:
-
-- a model’s `display` (`row` for tables, `detail` for records, `board` for grouped/kanban views) renders any atom of that type;
-- an index renders any list, filter, or dashboard tile.
-
-A dashboard is therefore a small set of saved indexes plus the models’ `display`. Building a new view is authoring atoms, not writing a frontend.
+**Generated UI** needs no per-screen code: a model’s `display` (`row`, `detail`, `board`) renders any atom of that type, and an index renders any list or tile. A dashboard is saved indexes plus `display`. Building a view is authoring atoms.
 
 ## Correctness
 
-The four guarantees the kernel enforces. Each is a single rule over the envelope, not a subsystem.
+Each guarantee is one rule over the primitives — not a subsystem.
 
-**Identity and dedup.** A model’s `identity` lists natural keys (`[["email"]]`, `[["domain"],["name"]]`). On create, the kernel resolves identity first: a match becomes an upsert (merged per `behavior.merge`), not a duplicate. `id` is never reused for this — it stays an opaque surrogate. Addressing is `surrogate` by default; a model may opt into `addressing: "content"` only if it is immutable and single-keyed, in which case the id is a hash of its identity.
+**Identity / dedup.** Indexes with `role: identity` are the natural keys. On create the kernel resolves them first: a match upserts (merged per `behavior.merge`) instead of duplicating. `id` is never reused for this. Addressing is `surrogate` by default; a model may set `addressing: content` only if immutable and single-keyed.
 
-**Concurrency.** Every write carries the `lifecycle.version` it read. The kernel commits only if the stored version is unchanged; otherwise the write is rejected as a conflict for the caller to retry. No lost updates. A model may opt into last-writer-wins where conflicts are acceptable.
+**Concurrency.** Every write carries the `lifecycle.version` it read; the kernel commits only if the stored version is unchanged, else rejects as a conflict to retry. No lost updates. Last-writer-wins is opt-in per model.
 
-**Provenance.** The `log` is append-only and field-granular: every mutation records actor, time, and before/after. Any value’s origin and full history are reconstructable by replaying its field’s log — provenance is a property of the log, not extra bookkeeping. Derived (computed-on-read) values are display-only; anything audited or billed is stored at write so it is indexable, logged, and frozen in time.
+**Provenance.** The log is append-only and field-granular. Any value’s origin and history replay from its field’s log; audit and time-travel are the same data read differently. Computed-on-read values are display-only; anything audited or billed is stored at write — indexable, logged, frozen.
 
-**Permissions.** A model declares `read` and `write` predicates as traversal-path expressions (`actor.team == company.owner.team`). They are evaluated fail-closed: a predicate that is false, errors, or exhausts its budget denies access. Permission traversal cannot fail open. Permissions compose across edges using the same path language as everything else.
+**Permissions.** A model’s `rules` are `read`/`write` path predicates (`actor.team == company.owner.team`), evaluated fail-closed: false, error, or budget-exhausted all deny. Permission traversal cannot fail open. Rules, hooks, and custom migrations are the one Logic shape; code, when needed, is a registered handler.
 
 ## Schema evolution
 
-Models carry an integer `version`. Adding an optional or derivable field does not bump it; existing atoms stay valid. A breaking change — rename, retype, optional→required, remove, identity or merge change — bumps `version` and ships a `migration` atom, which is immutable and forward-only.
-
-Each atom stores the `modelVersion` it was written under. The kernel migrates lazily: on read it chains migrations from the atom’s version to current and returns the current shape; on the atom’s next write it persists that shape (copy-on-write); a background sweep rewrites the cold tail until none remain. `op: "rename"` and `op: "default"` run from `spec` with no code; `op: "custom"` runs a registered handler — the only place deployed code is required.
+Models carry `version`. Additive or derivable changes do not bump it; existing atoms stay valid. A breaking change bumps `version` and ships an immutable, forward-only `migration`. Each atom stores its `modelVersion`; the kernel migrates lazily — chained on read, persisted on next write (copy-on-write), and a background sweep clears the cold tail. `op: rename` / `op: default` run from `spec` with no code; `op: custom` is the one Logic handler. Sweep a field to completion before filtering, searching, or billing on it.
 
 ```json
 {
@@ -217,11 +246,9 @@ Each atom stores the `modelVersion` it was written under. The kernel migrates la
 }
 ```
 
-A field that is filtered, searched, or billed on is trustworthy only after the sweep completes; sweep before querying on it.
-
 ## A model is just an atom
 
-The CRM above is three model atoms — `company`, `contact`, `deal` — wired by `ref`/`inverse` edges, each with identity, display, and rules. That is the whole pattern: define atoms, and the graph, the queries, the UI, the dedup, the audit trail, and the permissions follow from them.
+This CRM is three model atoms wired by `ref`/`inverse` edges. From them the kernel derives the graph, the queries, the UI, the dedup, the audit trail, and the permissions. Nothing else is authored.
 
 ```json
 {
@@ -237,8 +264,11 @@ The CRM above is three model atoms — `company`, `contact`, `deal` — wired by
         "required": true
       },
       "domain": {
-        "kind": "text",
-        "unique": true
+        "kind": "text"
+      },
+      "hq": {
+        "kind": "ref",
+        "to": "atom://address"
       },
       "tier": {
         "kind": "enum",
@@ -250,15 +280,27 @@ The CRM above is three model atoms — `company`, `contact`, `deal` — wired by
         "filterable": true
       }
     },
-    "identity": {
-      "keys": [
-        [
+    "indexes": {
+      "byDomain": {
+        "on": [
           "domain"
         ],
-        [
+        "role": "identity"
+      },
+      "byName": {
+        "on": [
           "name"
-        ]
-      ]
+        ],
+        "role": "identity"
+      },
+      "contacts": {
+        "role": "inverse",
+        "of": "atom://contact.company"
+      },
+      "deals": {
+        "role": "inverse",
+        "of": "atom://deal.company"
+      }
     },
     "display": {
       "row": [
@@ -268,7 +310,7 @@ The CRM above is three model atoms — `company`, `contact`, `deal` — wired by
       "detail": [
         "name",
         "domain",
-        "tier",
+        "hq",
         "contacts",
         "deals"
       ]
@@ -296,9 +338,7 @@ The CRM above is three model atoms — `company`, `contact`, `deal` — wired by
         "required": true
       },
       "email": {
-        "kind": "text",
-        "unique": true,
-        "filterable": true
+        "kind": "text"
       },
       "company": {
         "kind": "ref",
@@ -306,12 +346,13 @@ The CRM above is three model atoms — `company`, `contact`, `deal` — wired by
         "inverse": "contacts"
       }
     },
-    "identity": {
-      "keys": [
-        [
+    "indexes": {
+      "byEmail": {
+        "on": [
           "email"
-        ]
-      ]
+        ],
+        "role": "identity"
+      }
     },
     "display": {
       "row": [
@@ -320,7 +361,7 @@ The CRM above is three model atoms — `company`, `contact`, `deal` — wired by
         "company"
       ]
     },
-    "permissions": {
+    "rules": {
       "read": "true",
       "write": "actor.team == company.owner.team"
     },
@@ -370,13 +411,6 @@ The CRM above is three model atoms — `company`, `contact`, `deal` — wired by
         "kind": "ref",
         "to": "atom://user"
       }
-    },
-    "identity": {
-      "keys": [
-        [
-          "id"
-        ]
-      ]
     },
     "display": {
       "row": [
