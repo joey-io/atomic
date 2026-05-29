@@ -30,9 +30,12 @@ Atomic ships these atoms:
   "id": "model",
   "model": "atom://model",
   "attr": {
-    "purpose": "Defines atom schemas and behavior",
+    "manifest": "Defines atom schemas and behavior",
     "label": "Model",
     "fields": {
+      "manifest": {
+        "kind": "text"
+      },
       "label": {
         "kind": "text"
       },
@@ -88,7 +91,7 @@ Atomic ships these atoms:
   "id": "trait",
   "model": "atom://model",
   "attr": {
-    "purpose": "Reusable field shapes",
+    "manifest": "Reusable field shapes",
     "label": "Trait",
     "fields": {
       "label": {
@@ -120,7 +123,7 @@ Atomic ships these atoms:
   "id": "index",
   "model": "atom://model",
   "attr": {
-    "purpose": "Reusable access pattern and physical index intent",
+    "manifest": "Reusable access pattern and physical index intent",
     "label": "Index",
     "fields": {
       "label": {
@@ -173,7 +176,7 @@ Atomic ships these atoms:
   "id": "plugin",
   "model": "atom://model",
   "attr": {
-    "purpose": "Bundle of atoms (models, indexes, hooks, config)",
+    "manifest": "Bundle of atoms (models, indexes, hooks, config)",
     "label": "Plugin",
     "fields": {
       "label": {
@@ -217,7 +220,7 @@ Atomic ships these atoms:
   "id": "tenant",
   "model": "atom://model",
   "attr": {
-    "purpose": "Defines active plugins, config, and capabilities",
+    "manifest": "Defines active plugins, config, and capabilities",
     "label": "Tenant",
     "fields": {
       "name": {
@@ -260,7 +263,7 @@ Atomic ships these atoms:
   "id": "hook",
   "model": "atom://model",
   "attr": {
-    "purpose": "Pipeline logic",
+    "manifest": "Pipeline logic",
     "label": "Hook",
     "fields": {
       "label": {
@@ -315,7 +318,7 @@ Atomic ships these atoms:
   "id": "token",
   "model": "atom://model",
   "attr": {
-    "purpose": "Authentication",
+    "manifest": "Authentication",
     "label": "Token",
     "fields": {
       "label": {
@@ -366,7 +369,7 @@ Atomic ships these atoms:
   "id": "config",
   "model": "atom://model",
   "attr": {
-    "purpose": "Cascading settings",
+    "manifest": "Cascading settings",
     "label": "Config",
     "fields": {
       "label": {
@@ -416,7 +419,7 @@ Atomic ships these atoms:
   "id": "file",
   "model": "atom://model",
   "attr": {
-    "purpose": "Object storage pointers",
+    "manifest": "Object storage pointers",
     "label": "File",
     "fields": {
       "label": {
@@ -461,7 +464,7 @@ Atomic ships these atoms:
   "id": "log",
   "model": "atom://model",
   "attr": {
-    "purpose": "Append-only audit entries",
+    "manifest": "Append-only audit entries",
     "label": "Log",
     "fields": {
       "at": {
