@@ -135,17 +135,18 @@ Atomic ships these atoms:
 }
 ```
 
----
+-----
 
 ## Principles
 
 ```
 1. Models define behavior, indexes define access, logs capture mutations
 2. One kernel, one pipeline — all surfaces are generated from atoms
-3. Refs may be cyclic; traversals are bounded
+3. Refs may be cyclic; traversals terminate by cycle detection and are
+   bounded by resource budget, not depth
 ```
 
----
+-----
 
 ## The Atom
 
@@ -165,18 +166,18 @@ Atomic ships these atoms:
 }
 ```
 
-| Field | Purpose |
-|-------|---------|
-| `id` | Unique identity. Caller-assigned or system-generated GUID. Must be unique within the workspace. |
-| `model` | Points to the model atom defining schema and behavior. |
-| `attr` | Attributes shaped by the model. |
-| `lifecycle` | Kernel-managed operational metadata. |
+|Field      |Purpose                                                                                        |
+|-----------|-----------------------------------------------------------------------------------------------|
+|`id`       |Unique identity. Caller-assigned or system-generated GUID. Must be unique within the workspace.|
+|`model`    |Points to the model atom defining schema and behavior.                                         |
+|`attr`     |Attributes shaped by the model.                                                                |
+|`lifecycle`|Kernel-managed operational metadata.                                                           |
 
 IDs may be human-readable (`invoice-2026-000001`) or GUIDs (`7b8f2f0c-5f0f-4a3d-9f0d-2d6e2d4d1c11`). No dots — the atom ID is the route. Do not rely on ID shape for deduplication, permissions, validation, or behavior — identity is model-defined.
 
 Real-world timestamps (`occurredAt`, `effectiveAt`, `filedAt`) belong in `attr`.
 
----
+-----
 
 ## References
 
@@ -187,7 +188,7 @@ atom://id
 atom://id?param=value
 ```
 
-The system resolves what the target atom is. If it's an index, it executes. If it's a direct atom, it resolves directly.
+The system resolves what the target atom is. If it’s an index, it executes. If it’s a direct atom, it resolves directly.
 
 References may be cyclic.
 
@@ -203,12 +204,17 @@ Cycles are valid graph structures.
 
 The kernel protects execution — not the graph itself.
 
-Resolution rules:
+### Resolution rules
 
 - Self-reference terminates safely (e.g. `model` → `atom://model`)
 - Cyclic refs are allowed
+- Traversals terminate via cycle detection (visited-set), not depth limits
+- Traversals are bounded by an explicit resource budget — wall-clock, nodes visited, result size — with a default budget callers may raise
+- Dangling references error — no silent nulls
 - Copy-on-write: first mutation to a referenced field detaches it into a local value
 - Resolved references are cached — invalidated on mutation broadcast
+
+Cycle detection guarantees termination; the resource budget guarantees bounded cost. Depth is neither — it is not a bound.
 
 Examples:
 
@@ -249,7 +255,7 @@ The same traversal language works across:
 - exports
 - generated UI
 
----
+-----
 
 ## Traits
 
@@ -294,7 +300,7 @@ Models reference traits:
 }
 ```
 
----
+-----
 
 ## Models
 
