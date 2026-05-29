@@ -113,24 +113,28 @@ A model is an atom that defines a type. It lists the type’s fields, indexes, d
 **Field kinds**
 
 - Scalars: `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`.
-- `ref`: a reference to another model. A reference to a standalone model is a graph edge; a reference to an embedded model inlines that model’s fields.
+- `ref`: a reference to a standalone atom. Declares `to` (target model) and optional `inverse`. Stored as a link to a separate record.
 - Containers: `list`, `map`, `json`.
 - Modifiers: `required`, `default`, `unique`, `filterable`, `sortable`.
 
-**Embedded models**
+## References
 
-A model with `behavior.embedded: true` has no standalone records. Its fields are inlined wherever it is referenced and carry no `id` or `lifecycle` of their own. This is how reusable field groups are defined.
+Two reference schemes appear in a model’s field definitions:
+
+- **`atom://x`** — an edge to a standalone atom `x`. Stored as a live link; reads see `x`’s current values.
+- **`embed://x`** — inline the fields of model `x` here. Resolved when the schema compiles. The field’s values are stored in the parent record’s `attr` and validated against `x`; they carry no `id` or `lifecycle`.
+
+`embed://` appears only in model definitions, never in stored records. A record holds resolved values, not the `embed://` string. Any model can be embedded by referencing it with `embed://`; the same model may also be used as a standalone atom elsewhere via `atom://`.
+
+Use `atom://` when the target is a record that exists on its own and may be shared (a company, a user). Use `embed://` for a field group that belongs to one parent and is not shared (an address).
 
 ```json
 {
   "id": "address",
   "model": "atom://model",
-  "manifest": "Embedded address",
+  "manifest": "Address fields, embedded by reference",
   "attr": {
     "label": "Address",
-    "behavior": {
-      "embedded": true
-    },
     "fields": {
       "street": {
         "kind": "text"
@@ -158,9 +162,7 @@ A model with `behavior.embedded: true` has no standalone records. Its fields are
 
 ## Graph
 
-A `ref` field is an edge. It declares `to` (the target model) and an optional `inverse` (a field name on the target). When `inverse` is set, the kernel maintains the reverse edge automatically, so both directions are queryable.
-
-A path is a dotted expression that reads across edges and nested values:
+An `atom://` field is an edge. With `inverse` set, the kernel maintains the reverse edge automatically, so both directions are queryable. A path is a dotted expression that reads across edges and nested values:
 
 ```
 deal.company.owner.team
@@ -180,7 +182,7 @@ An index is a query or constraint over a model’s fields. It declares `over`, `
 - `filter` / `sort`: a parameterized query.
 - `unique`: rejects a write that would duplicate the key.
 - `identity`: a unique key used to detect duplicates on create.
-- `inverse`: the reverse side of a `ref`, exposed as a field on the target.
+- `inverse`: the reverse side of an `atom://` edge, exposed as a field on the target.
 
 The `unique` and `inverse` field modifiers are shorthand for indexes. An index is run by referencing it with parameters:
 
@@ -262,7 +264,7 @@ Each record stores the `modelVersion` it was written under. When a record is beh
 
 ## Example: CRM
 
-The following three models define a CRM. `contact` and `deal` reference `company`; `company` exposes the reverse edges as `contacts` and `deals`. Identity, the reverse edges, display, and permissions are all declared in the models.
+The following three models define a CRM. `contact` and `deal` hold an `atom://company` edge; `company` exposes the reverse edges as `contacts` and `deals`, and embeds an address with `embed://address`. Identity, the reverse edges, display, and permissions are all declared in the models.
 
 ```json
 {
@@ -280,10 +282,7 @@ The following three models define a CRM. `contact` and `deal` reference `company
       "domain": {
         "kind": "text"
       },
-      "hq": {
-        "kind": "ref",
-        "to": "atom://address"
-      },
+      "hq": "embed://address",
       "tier": {
         "kind": "enum",
         "values": [
