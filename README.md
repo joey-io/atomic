@@ -1,6 +1,6 @@
 # Atomic
 
-Traditionally, interfaces are built ontop of schema. Atomic makes them one: define a model, and its API, queries, permissions, and UI come from that definition.
+Traditionally, interfaces are built on top of schema. Atomic makes them one: define a model, and its API, queries, permissions, and UI come from that definition.
 
 Atomic is a data substrate for graph-relational, queryable stores such as CRM. Every record is an atom, including the schema that defines other records. Relationships are typed edges. Queries, constraints, permissions, rendering, and migrations are stored as atoms and run by one kernel.
 
@@ -266,7 +266,9 @@ Each record stores the `modelVersion` it was written under. When a record is beh
 
 ## Example: CRM
 
-The following three models define a CRM. `contact` and `deal` hold an `atom://company` edge; `company` exposes the reverse edges as `contacts` and `deals`, and embeds an address with `embed://address`. Identity, the reverse edges, display, and permissions are all declared in the models.
+Three models define a CRM. `contact` and `deal` hold an `atom://company` edge; the `inverse` on each edge makes `company.contacts` and `company.deals` queryable without a separate declaration. `company.owner` is an `atom://user` edge used by the contact write rule. `company.hq` embeds an address with `embed://address`.
+
+### Models
 
 ```json
 {
@@ -285,6 +287,10 @@ The following three models define a CRM. `contact` and `deal` hold an `atom://co
         "kind": "text"
       },
       "hq": "embed://address",
+      "owner": {
+        "kind": "ref",
+        "to": "atom://user"
+      },
       "tier": {
         "kind": "enum",
         "values": [
@@ -307,14 +313,6 @@ The following three models define a CRM. `contact` and `deal` hold an `atom://co
           "name"
         ],
         "role": "identity"
-      },
-      "contacts": {
-        "role": "inverse",
-        "of": "atom://contact.company"
-      },
-      "deals": {
-        "role": "inverse",
-        "of": "atom://deal.company"
       }
     },
     "display": {
@@ -326,6 +324,7 @@ The following three models define a CRM. `contact` and `deal` hold an `atom://co
         "name",
         "domain",
         "hq",
+        "owner",
         "contacts",
         "deals"
       ]
@@ -355,6 +354,9 @@ The following three models define a CRM. `contact` and `deal` hold an `atom://co
       "email": {
         "kind": "text"
       },
+      "title": {
+        "kind": "text"
+      },
       "company": {
         "kind": "ref",
         "to": "atom://company",
@@ -372,7 +374,7 @@ The following three models define a CRM. `contact` and `deal` hold an `atom://co
     "display": {
       "row": [
         "name",
-        "email",
+        "title",
         "company"
       ]
     },
@@ -450,3 +452,129 @@ The following three models define a CRM. `contact` and `deal` hold an `atom://co
   "lifecycle": "atom://0"
 }
 ```
+
+### Records
+
+One company, its owner, two contacts, and a deal. `hq` holds resolved address values (no `embed://` in stored data). The `company` edges all point at `atom://northwind`.
+
+```json
+{
+  "id": "u-amy",
+  "model": "atom://user",
+  "manifest": "Amy Chen, account executive",
+  "attr": {
+    "name": "Amy Chen",
+    "team": "atom://team-west"
+  },
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-01-10T09:00:00Z",
+    "createdBy": "atom://u-root"
+  }
+}
+```
+
+```json
+{
+  "id": "northwind",
+  "model": "atom://company",
+  "manifest": "Northwind Traders, enterprise account",
+  "attr": {
+    "name": "Northwind Traders",
+    "domain": "northwind.com",
+    "hq": {
+      "street": "500 Market St",
+      "city": "Seattle",
+      "state": "WA",
+      "zip": "98101",
+      "country": "US"
+    },
+    "owner": "atom://u-amy",
+    "tier": "enterprise"
+  },
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-05-20T09:00:00Z",
+    "createdBy": "atom://u-amy"
+  }
+}
+```
+
+```json
+{
+  "id": "7b8f-2f0c",
+  "model": "atom://contact",
+  "manifest": "Jane Roe, VP Eng at Northwind",
+  "attr": {
+    "name": "Jane Roe",
+    "email": "jane@northwind.com",
+    "title": "VP Engineering",
+    "company": "atom://northwind"
+  },
+  "lifecycle": {
+    "status": "active",
+    "version": 3,
+    "modelVersion": 1,
+    "createdAt": "2026-05-28T12:00:00Z",
+    "createdBy": "atom://u-amy",
+    "updatedAt": "2026-05-28T15:20:00Z",
+    "updatedBy": "atom://u-amy"
+  }
+}
+```
+
+```json
+{
+  "id": "a31c-90fe",
+  "model": "atom://contact",
+  "manifest": "John Vega, CFO at Northwind",
+  "attr": {
+    "name": "John Vega",
+    "email": "john@northwind.com",
+    "title": "CFO",
+    "company": "atom://northwind"
+  },
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-05-28T12:05:00Z",
+    "createdBy": "atom://u-amy"
+  }
+}
+```
+
+```json
+{
+  "id": "deal-9001",
+  "model": "atom://deal",
+  "manifest": "Northwind platform expansion",
+  "attr": {
+    "name": "Platform expansion",
+    "amount": 120000,
+    "stage": "qualified",
+    "company": "atom://northwind",
+    "owner": "atom://u-amy"
+  },
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-05-25T16:00:00Z",
+    "createdBy": "atom://u-amy"
+  }
+}
+```
+
+### Resolving
+
+- `atom://northwind` → the company record above.
+- `atom://northwind.contacts` → `[ atom://7b8f-2f0c, atom://a31c-90fe ]` (the inverse of `contact.company`).
+- `atom://northwind.deals` → `[ atom://deal-9001 ]` (the inverse of `deal.company`).
+- `atom://7b8f-2f0c.company.owner.team` → `atom://team-west` (path across two edges).
+- `atom://openDeals?company=atom://northwind` → `[ atom://deal-9001 ]` (stage in lead/qualified, sorted by amount).
+- Writing a second contact with `email: jane@northwind.com` matches the `byEmail` identity index and merges into `atom://7b8f-2f0c` instead of creating a duplicate.
