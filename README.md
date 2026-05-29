@@ -542,17 +542,19 @@ Atomic ships these atoms:
 }
 ```
 
-|Field      |Purpose                                                                                                                |
-|-----------|-----------------------------------------------------------------------------------------------------------------------|
-|`id`       |Unique identity. Caller-assigned or system-generated GUID. Must be unique within the workspace.                        |
-|`model`    |Points to the model atom defining schema and behavior.                                                                 |
-|`manifest` |Optional, human- and agent-readable statement of what the atom is for. Caller-set and declarative; ignored by behavior.|
-|`attr`     |Attributes shaped by the model.                                                                                        |
-|`lifecycle`|Kernel-managed operational metadata.                                                                                   |
+|Field      |Purpose                                                                                                                                                                       |
+|-----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|`id`       |Unique identity. Caller-assigned or system-generated GUID. Must be unique within the workspace.                                                                               |
+|`model`    |Points to the model atom defining schema and behavior.                                                                                                                        |
+|`manifest` |Prose description of the atom, human- and agent-readable. Caller-owned: created and updated through CRUD like any field, and full-text searchable. Not validated by the model.|
+|`attr`     |Attributes shaped by the model.                                                                                                                                               |
+|`lifecycle`|Kernel-managed operational metadata.                                                                                                                                          |
 
 IDs may be human-readable (`invoice-2026-000001`) or GUIDs (`7b8f2f0c-5f0f-4a3d-9f0d-2d6e2d4d1c11`). No dots — the atom ID is the route. Do not rely on ID shape for deduplication, permissions, validation, or behavior — identity is model-defined.
 
 Real-world timestamps (`occurredAt`, `effectiveAt`, `filedAt`) belong in `attr`.
+
+`manifest` is plain prose — a description of what the atom is for, readable by people and agents. It is caller-owned: written and changed through ordinary create and update operations, not kernel-managed like `lifecycle`. The kernel maintains a full-text index over every atom’s `manifest`, so it is searchable without any model declaring it. `manifest` resolves as a path in the traversal language — usable in filters, indexes, and permissions — and supports text-match against the index.
 
 -----
 
@@ -599,6 +601,7 @@ Examples:
 atom://invoice
 atom://officialsByDistrict?state=MD&district=5
 atom://modelsByKey?key=invoice
+atom://search?manifest=data+center
 ```
 
 Indexes return sets by default. An index can be constrained to return one atom with `limit: 1` or `returns: "one"`.
