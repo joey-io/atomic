@@ -3,7 +3,7 @@
 A framework for building data systems. Everything is an atom — models, traits, indexes, hooks, config, tokens, and attributes.
 
 ```
-{ id, model, attr, lifecycle }
+{ id, model, manifest, attr, lifecycle }
 ```
 
 Atomic ships these atoms:
@@ -29,13 +29,10 @@ Atomic ships these atoms:
 {
   "id": "model",
   "model": "atom://model",
+  "manifest": "Defines atom schemas and behavior",
   "attr": {
-    "manifest": "Defines atom schemas and behavior",
     "label": "Model",
     "fields": {
-      "manifest": {
-        "kind": "text"
-      },
       "label": {
         "kind": "text"
       },
@@ -79,7 +76,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "replace"
+      "merge": "replace"
     }
   },
   "lifecycle": "atom://0"
@@ -90,8 +87,8 @@ Atomic ships these atoms:
 {
   "id": "trait",
   "model": "atom://model",
+  "manifest": "Reusable field shapes",
   "attr": {
-    "manifest": "Reusable field shapes",
     "label": "Trait",
     "fields": {
       "label": {
@@ -111,7 +108,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "replace"
+      "merge": "replace"
     }
   },
   "lifecycle": "atom://0"
@@ -122,8 +119,8 @@ Atomic ships these atoms:
 {
   "id": "index",
   "model": "atom://model",
+  "manifest": "Reusable access pattern and physical index intent",
   "attr": {
-    "manifest": "Reusable access pattern and physical index intent",
     "label": "Index",
     "fields": {
       "label": {
@@ -164,7 +161,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "replace"
+      "merge": "replace"
     }
   },
   "lifecycle": "atom://0"
@@ -175,8 +172,8 @@ Atomic ships these atoms:
 {
   "id": "plugin",
   "model": "atom://model",
+  "manifest": "Bundle of atoms (models, indexes, hooks, config)",
   "attr": {
-    "manifest": "Bundle of atoms (models, indexes, hooks, config)",
     "label": "Plugin",
     "fields": {
       "label": {
@@ -208,7 +205,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "replace"
+      "merge": "replace"
     }
   },
   "lifecycle": "atom://0"
@@ -219,8 +216,8 @@ Atomic ships these atoms:
 {
   "id": "tenant",
   "model": "atom://model",
+  "manifest": "Defines active plugins, config, and capabilities",
   "attr": {
-    "manifest": "Defines active plugins, config, and capabilities",
     "label": "Tenant",
     "fields": {
       "name": {
@@ -251,7 +248,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "merge"
+      "merge": "merge"
     }
   },
   "lifecycle": "atom://0"
@@ -262,8 +259,8 @@ Atomic ships these atoms:
 {
   "id": "hook",
   "model": "atom://model",
+  "manifest": "Pipeline logic",
   "attr": {
-    "manifest": "Pipeline logic",
     "label": "Hook",
     "fields": {
       "label": {
@@ -306,7 +303,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "replace"
+      "merge": "replace"
     }
   },
   "lifecycle": "atom://0"
@@ -317,8 +314,8 @@ Atomic ships these atoms:
 {
   "id": "token",
   "model": "atom://model",
+  "manifest": "Authentication",
   "attr": {
-    "manifest": "Authentication",
     "label": "Token",
     "fields": {
       "label": {
@@ -357,7 +354,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "replace"
+      "merge": "replace"
     }
   },
   "lifecycle": "atom://0"
@@ -368,8 +365,8 @@ Atomic ships these atoms:
 {
   "id": "config",
   "model": "atom://model",
+  "manifest": "Cascading settings",
   "attr": {
-    "manifest": "Cascading settings",
     "label": "Config",
     "fields": {
       "label": {
@@ -407,7 +404,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "merge"
+      "merge": "merge"
     }
   },
   "lifecycle": "atom://0"
@@ -418,8 +415,8 @@ Atomic ships these atoms:
 {
   "id": "file",
   "model": "atom://model",
+  "manifest": "Object storage pointers",
   "attr": {
-    "manifest": "Object storage pointers",
     "label": "File",
     "fields": {
       "label": {
@@ -452,7 +449,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": false,
-      "mergeStrategy": "replace"
+      "merge": "replace"
     }
   },
   "lifecycle": "atom://0"
@@ -463,8 +460,8 @@ Atomic ships these atoms:
 {
   "id": "log",
   "model": "atom://model",
+  "manifest": "Append-only audit entries",
   "attr": {
-    "manifest": "Append-only audit entries",
     "label": "Log",
     "fields": {
       "at": {
@@ -507,7 +504,7 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": false,
-      "mergeStrategy": "append"
+      "merge": "append"
     }
   },
   "lifecycle": "atom://0"
@@ -545,12 +542,13 @@ Atomic ships these atoms:
 }
 ```
 
-|Field      |Purpose                                                                                        |
-|-----------|-----------------------------------------------------------------------------------------------|
-|`id`       |Unique identity. Caller-assigned or system-generated GUID. Must be unique within the workspace.|
-|`model`    |Points to the model atom defining schema and behavior.                                         |
-|`attr`     |Attributes shaped by the model.                                                                |
-|`lifecycle`|Kernel-managed operational metadata.                                                           |
+|Field      |Purpose                                                                                                                |
+|-----------|-----------------------------------------------------------------------------------------------------------------------|
+|`id`       |Unique identity. Caller-assigned or system-generated GUID. Must be unique within the workspace.                        |
+|`model`    |Points to the model atom defining schema and behavior.                                                                 |
+|`manifest` |Optional, human- and agent-readable statement of what the atom is for. Caller-set and declarative; ignored by behavior.|
+|`attr`     |Attributes shaped by the model.                                                                                        |
+|`lifecycle`|Kernel-managed operational metadata.                                                                                   |
 
 IDs may be human-readable (`invoice-2026-000001`) or GUIDs (`7b8f2f0c-5f0f-4a3d-9f0d-2d6e2d4d1c11`). No dots — the atom ID is the route. Do not rely on ID shape for deduplication, permissions, validation, or behavior — identity is model-defined.
 
@@ -748,7 +746,7 @@ Each entry in a model’s `fields` map is a field definition:
     },
     "behavior": {
       "mutable": true,
-      "mergeStrategy": "model-defined"
+      "merge": "model-defined"
     }
   }
 }
