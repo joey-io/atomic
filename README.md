@@ -1,5 +1,7 @@
 # Atomic
 
+Traditionally interfaces are built ontop of schema. Atomic makes them one: define a model, and its API, queries, permissions, and UI come from that definition.
+
 Atomic is a data substrate for graph-relational, queryable stores such as CRM. Every record is an atom, including the schema that defines other records. Relationships are typed edges. Queries, constraints, permissions, rendering, and migrations are stored as atoms and run by one kernel.
 
 ## Primitives
