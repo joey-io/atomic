@@ -30,7 +30,21 @@ Atomic ships these atoms:
   "id": "model",
   "model": "atom://model",
   "attr": {
-    "purpose": "Defines atom schemas and behavior"
+    "purpose": "Defines atom schemas and behavior",
+    "label": "Model",
+    "fields": {
+      "label": { "kind": "text" },
+      "fields": { "kind": "map", "required": true },
+      "identity": { "kind": "json" },
+      "display": { "kind": "json" },
+      "permissions": { "kind": "json" },
+      "behavior": { "kind": "json" },
+      "hooks": { "kind": "list", "of": "atom://hook" },
+      "indexes": { "kind": "list", "of": "atom://index" }
+    },
+    "identity": { "keys": [["id"]] },
+    "display": { "row": ["label", "id"] },
+    "behavior": { "mutable": true, "mergeStrategy": "replace" }
   },
   "lifecycle": "atom://0"
 }
@@ -41,7 +55,14 @@ Atomic ships these atoms:
   "id": "trait",
   "model": "atom://model",
   "attr": {
-    "purpose": "Reusable field shapes"
+    "purpose": "Reusable field shapes",
+    "label": "Trait",
+    "fields": {
+      "label": { "kind": "text" },
+      "fields": { "kind": "map", "required": true }
+    },
+    "identity": { "keys": [["id"]] },
+    "behavior": { "mutable": true, "mergeStrategy": "replace" }
   },
   "lifecycle": "atom://0"
 }
@@ -52,7 +73,19 @@ Atomic ships these atoms:
   "id": "index",
   "model": "atom://model",
   "attr": {
-    "purpose": "Reusable access pattern and physical index intent"
+    "purpose": "Reusable access pattern and physical index intent",
+    "label": "Index",
+    "fields": {
+      "label": { "kind": "text" },
+      "over": { "kind": "ref", "of": "atom://model", "required": true },
+      "params": { "kind": "map" },
+      "match": { "kind": "json" },
+      "sort": { "kind": "list" },
+      "returns": { "kind": "enum", "values": ["set", "one"], "default": "set" },
+      "limit": { "kind": "integer" }
+    },
+    "identity": { "keys": [["id"]] },
+    "behavior": { "mutable": true, "mergeStrategy": "replace" }
   },
   "lifecycle": "atom://0"
 }
@@ -63,7 +96,17 @@ Atomic ships these atoms:
   "id": "plugin",
   "model": "atom://model",
   "attr": {
-    "purpose": "Bundle of atoms (models, indexes, hooks, config)"
+    "purpose": "Bundle of atoms (models, indexes, hooks, config)",
+    "label": "Plugin",
+    "fields": {
+      "label": { "kind": "text" },
+      "version": { "kind": "text", "required": true },
+      "provides": { "kind": "list", "of": "ref", "required": true },
+      "requires": { "kind": "list", "of": "atom://plugin" },
+      "config": { "kind": "json" }
+    },
+    "identity": { "keys": [["id"]] },
+    "behavior": { "mutable": true, "mergeStrategy": "replace" }
   },
   "lifecycle": "atom://0"
 }
@@ -74,7 +117,17 @@ Atomic ships these atoms:
   "id": "tenant",
   "model": "atom://model",
   "attr": {
-    "purpose": "Defines active plugins, config, and capabilities"
+    "purpose": "Defines active plugins, config, and capabilities",
+    "label": "Tenant",
+    "fields": {
+      "name": { "kind": "text", "required": true },
+      "version": { "kind": "text" },
+      "plugins": { "kind": "list", "of": "atom://plugin" },
+      "config": { "kind": "json" },
+      "capabilities": { "kind": "list", "of": "text" }
+    },
+    "identity": { "keys": [["id"]] },
+    "behavior": { "mutable": true, "mergeStrategy": "merge" }
   },
   "lifecycle": "atom://0"
 }
@@ -85,7 +138,22 @@ Atomic ships these atoms:
   "id": "hook",
   "model": "atom://model",
   "attr": {
-    "purpose": "Pipeline logic"
+    "purpose": "Pipeline logic",
+    "label": "Hook",
+    "fields": {
+      "label": { "kind": "text" },
+      "on": {
+        "kind": "enum",
+        "values": ["beforeValidate", "beforeWrite", "afterWrite", "beforeRead", "afterRead"],
+        "required": true
+      },
+      "model": { "kind": "ref", "of": "atom://model" },
+      "run": { "kind": "text", "required": true },
+      "order": { "kind": "integer", "default": 0 },
+      "enabled": { "kind": "boolean", "default": true }
+    },
+    "identity": { "keys": [["id"]] },
+    "behavior": { "mutable": true, "mergeStrategy": "replace" }
   },
   "lifecycle": "atom://0"
 }
@@ -96,7 +164,19 @@ Atomic ships these atoms:
   "id": "token",
   "model": "atom://model",
   "attr": {
-    "purpose": "Authentication"
+    "purpose": "Authentication",
+    "label": "Token",
+    "fields": {
+      "label": { "kind": "text" },
+      "subject": { "kind": "ref", "required": true },
+      "scopes": { "kind": "list", "of": "text" },
+      "hash": { "kind": "text", "required": true },
+      "expiresAt": { "kind": "datetime", "filterable": true },
+      "lastUsedAt": { "kind": "datetime" },
+      "revoked": { "kind": "boolean", "default": false }
+    },
+    "identity": { "keys": [["id"]] },
+    "behavior": { "mutable": true, "mergeStrategy": "replace" }
   },
   "lifecycle": "atom://0"
 }
@@ -107,7 +187,21 @@ Atomic ships these atoms:
   "id": "config",
   "model": "atom://model",
   "attr": {
-    "purpose": "Cascading settings"
+    "purpose": "Cascading settings",
+    "label": "Config",
+    "fields": {
+      "label": { "kind": "text" },
+      "scope": {
+        "kind": "enum",
+        "values": ["tenant", "plugin", "model", "atom"],
+        "required": true
+      },
+      "target": { "kind": "ref" },
+      "values": { "kind": "json", "required": true },
+      "order": { "kind": "integer", "default": 0 }
+    },
+    "identity": { "keys": [["scope", "target"]] },
+    "behavior": { "mutable": true, "mergeStrategy": "merge" }
   },
   "lifecycle": "atom://0"
 }
@@ -118,7 +212,18 @@ Atomic ships these atoms:
   "id": "file",
   "model": "atom://model",
   "attr": {
-    "purpose": "Object storage pointers"
+    "purpose": "Object storage pointers",
+    "label": "File",
+    "fields": {
+      "label": { "kind": "text" },
+      "key": { "kind": "text", "required": true },
+      "bucket": { "kind": "text" },
+      "contentType": { "kind": "text" },
+      "size": { "kind": "integer" },
+      "checksum": { "kind": "text" }
+    },
+    "identity": { "keys": [["bucket", "key"]] },
+    "behavior": { "mutable": false, "mergeStrategy": "replace" }
   },
   "lifecycle": "atom://0"
 }
@@ -129,7 +234,22 @@ Atomic ships these atoms:
   "id": "log",
   "model": "atom://model",
   "attr": {
-    "purpose": "Append-only audit entries"
+    "purpose": "Append-only audit entries",
+    "label": "Log",
+    "fields": {
+      "at": { "kind": "datetime", "required": true, "filterable": true, "sortable": true },
+      "actor": { "kind": "ref" },
+      "action": {
+        "kind": "enum",
+        "values": ["create", "update", "delete", "read"],
+        "required": true
+      },
+      "target": { "kind": "ref", "required": true },
+      "model": { "kind": "ref", "of": "atom://model" },
+      "diff": { "kind": "json" }
+    },
+    "identity": { "keys": [["id"]] },
+    "behavior": { "mutable": false, "mergeStrategy": "append" }
   },
   "lifecycle": "atom://0"
 }
@@ -259,7 +379,7 @@ The same traversal language works across:
 
 ## Traits
 
-A trait is a reusable field shape.
+A trait is a first-class atom that defines a reusable field shape.
 
 ```json
 {
@@ -288,9 +408,7 @@ A trait is a reusable field shape.
 }
 ```
 
-Traits are schema includes — not separate atoms.
-
-An address is usually embedded JSON, not its own atom.
+When a model references a trait, the kernel resolves it and inlines its fields at schema-compile time. The resolved value is stored as embedded JSON on the host atom — the trait atom is the definition, the embedded fields are its expansion.
 
 Models reference traits:
 
@@ -317,7 +435,21 @@ A model defines:
 - indexes
 - generated surfaces
 
-Example:
+### Field definitions
+
+Each entry in a model’s `fields` map is a field definition:
+
+- `kind` — `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`, `ref`, `list`, `map`, or `json`
+- `required` — must be present (default `false`)
+- `default` — value used when the field is absent
+- `filterable` / `sortable` — exposed to indexes and queries
+- `unique` — enforced within the model
+- `of` — element constraint: a `kind` for `list`, or an `atom://model` target for a `ref` (or a list of refs)
+- `values` — allowed values for `enum`
+
+`json` is an open sub-object validated by hooks rather than by shape. `map` is a keyed collection whose values follow the same field-definition form (this is how `fields` itself is typed).
+
+### Example
 
 ```json
 {
