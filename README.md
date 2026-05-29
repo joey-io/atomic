@@ -1,39 +1,59 @@
 # Atomic
 
-A framework for building data systems. Everything is an atom — models, traits, indexes, plugins, tenants, hooks, migrations, tokens, config, files, and logs.
+A substrate for building graph-relational, queryable databases — CRM and anything shaped like it. Schema is data, relationships are first-class edges, every surface is generated from atoms, and correctness comes first: identity, provenance, and permissions are guarantees of the kernel, not features of the app.
+
+Everything is an atom.
 
 ```
 { id, model, manifest, attr, lifecycle }
 ```
 
-Atomic ships these atoms:
+## The atom
 
 ```json
 {
-  "id": "0",
-  "model": "atom://tenant",
-  "manifest": "The Atomic tenant",
+  "id": "7b8f-...",
+  "model": "atom://contact",
+  "manifest": "Jane Roe, VP Eng at Northwind",
   "attr": {
-    "name": "Atomic",
-    "version": "0.1.0"
+    "name": "Jane Roe",
+    "email": "jane@northwind.com",
+    "company": "atom://northwind"
   },
   "lifecycle": {
     "status": "active",
-    "version": 1,
+    "version": 3,
     "modelVersion": 1,
-    "createdAt": "2026-05-28T00:00:00Z",
-    "createdBy": "0"
+    "createdAt": "2026-05-28T12:00:00Z",
+    "createdBy": "atom://u-amy",
+    "updatedAt": "2026-05-28T15:20:00Z",
+    "updatedBy": "atom://u-amy"
   }
 }
 ```
+
+|Field      |Meaning                                                                                                                 |
+|-----------|------------------------------------------------------------------------------------------------------------------------|
+|`id`       |Flat, opaque, stable address. The route: `atom://id`. Never derived from data, never changes.                           |
+|`model`    |The model atom defining this atom’s schema, relationships, display, and rules.                                          |
+|`manifest` |Prose description, human- and agent-readable. Caller-owned, CRUD-settable, full-text searchable.                        |
+|`attr`     |Model-shaped values, including `ref` fields that are edges in the graph.                                                |
+|`lifecycle`|Kernel-owned: `status`, `version` (write count, used for concurrency), `modelVersion`, and created/updated actor + time.|
+
+`id` is a surrogate key and stays flat and opaque so references never break when data changes. *Identity* — how two records are recognized as the same real-world thing — is a separate, model-defined natural key (see Correctness). Real-world timestamps (`closedAt`, `signedAt`) live in `attr`; `lifecycle` is operational only.
+
+## Models
+
+A model is an atom that defines a type: its fields, identity, display, permissions, and behavior. Adding a type is creating a model atom — no code, no deploy. The kernel is self-describing: `model`, `trait`, `index`, `hook`, `token`, `config`, `file`, `log`, `migration`, `plugin`, and `tenant` are all model atoms, defined the same way as the types you add.
 
 ```json
 {
   "id": "model",
   "model": "atom://model",
-  "manifest": "Defines atom schemas and behavior",
+  "manifest": "Defines atom schemas, relationships, display, and behavior",
   "attr": {
     "label": "Model",
+    "version": 1,
     "fields": {
       "label": {
         "kind": "text"
@@ -57,14 +77,6 @@ Atomic ships these atoms:
       },
       "behavior": {
         "kind": "json"
-      },
-      "hooks": {
-        "kind": "list",
-        "of": "atom://hook"
-      },
-      "indexes": {
-        "kind": "list",
-        "of": "atom://index"
       }
     },
     "identity": {
@@ -82,744 +94,310 @@ Atomic ships these atoms:
     },
     "behavior": {
       "mutable": true,
-      "merge": "replace"
+      "merge": "replace",
+      "addressing": "surrogate"
     }
   },
   "lifecycle": "atom://0"
 }
 ```
 
-```json
-{
-  "id": "trait",
-  "model": "atom://model",
-  "manifest": "Reusable field shapes",
-  "attr": {
-    "label": "Trait",
-    "fields": {
-      "label": {
-        "kind": "text"
-      },
-      "fields": {
-        "kind": "map",
-        "required": true
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "id"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": true,
-      "merge": "replace"
-    }
-  },
-  "lifecycle": "atom://0"
-}
+### Field kinds
+
+A field definition declares a `kind` and optional modifiers:
+
+- scalars — `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum` (`values`)
+- `ref` — an edge to another atom. Declares `to` (target model) and optional `inverse` (the back-edge field maintained automatically on the target). This is what makes the data graph-relational.
+- containers — `list` (`of`), `map`, `json`
+- modifiers — `required`, `default`, `unique`, `filterable`, `sortable`
+
+A `ref` is always a cheap, typed pointer. A *query* is always an index invoked by name (next section). The two are never confused, so reading a field’s kind tells you its cost.
+
+## The graph
+
+References use `atom://` and are first-class edges. Because a `ref` declares `to` and `inverse`, the graph is bidirectional and cheap to walk both ways: from a contact to its company, and from a company to its contacts, with no manual back-pointer.
+
+```txt
+company → contacts → company        (inverse pair)
+contact → company → owner → team
+deal → company → deals → deal        (cycle — valid)
 ```
+
+Traversal paths read through edges and nested JSON with one language, used by filters, indexes, permissions, display, and exports:
+
+```txt
+deal.company.owner.team
+```
+
+**Traversal rules**
+
+- Refs may be cyclic. Traversals terminate by cycle detection (visited-set), never by a depth cap.
+- Every traversal runs under an explicit resource budget — wall-clock, nodes, result size — with a default callers may raise.
+- Dangling references error. No silent nulls.
+- Resolved edges are cached and invalidated on mutation broadcast.
+
+## Querying and generated surfaces
+
+An **index** is the one query primitive: a named, reusable, parameterized access pattern over a model. It declares what it ranges `over`, its `params`, a `match`, a `sort`, and whether it `returns` a set or one atom.
 
 ```json
 {
-  "id": "index",
-  "model": "atom://model",
-  "manifest": "Reusable access pattern and physical index intent",
+  "id": "dealsByStage",
+  "model": "atom://index",
+  "manifest": "Open deals for a company, by stage",
   "attr": {
-    "label": "Index",
-    "fields": {
-      "label": {
-        "kind": "text"
-      },
-      "over": {
+    "label": "Deals by stage",
+    "over": "atom://deal",
+    "params": {
+      "company": {
         "kind": "ref",
-        "of": "atom://model",
-        "required": true
-      },
-      "params": {
-        "kind": "map"
-      },
-      "match": {
-        "kind": "json"
-      },
-      "sort": {
-        "kind": "list"
-      },
-      "returns": {
-        "kind": "enum",
-        "values": [
-          "set",
-          "one"
-        ],
-        "default": "set"
-      },
-      "limit": {
-        "kind": "integer"
+        "to": "atom://company"
       }
     },
-    "identity": {
-      "keys": [
-        [
-          "id"
+    "match": {
+      "company": "atom://params.company",
+      "stage": {
+        "in": [
+          "lead",
+          "qualified"
         ]
-      ]
+      }
     },
-    "behavior": {
-      "mutable": true,
-      "merge": "replace"
-    }
+    "sort": [
+      {
+        "amount": "desc"
+      }
+    ],
+    "returns": "set"
   },
   "lifecycle": "atom://0"
 }
 ```
 
+Indexes are invoked as references — `atom://dealsByStage?company=atom://northwind` — so a query is just an atom you can pin, share, or embed.
+
+**Generated UI** reads two declarations and needs no per-screen code:
+
+- a model’s `display` (`row` for tables, `detail` for records, `board` for grouped/kanban views) renders any atom of that type;
+- an index renders any list, filter, or dashboard tile.
+
+A dashboard is therefore a small set of saved indexes plus the models’ `display`. Building a new view is authoring atoms, not writing a frontend.
+
+## Correctness
+
+The four guarantees the kernel enforces. Each is a single rule over the envelope, not a subsystem.
+
+**Identity and dedup.** A model’s `identity` lists natural keys (`[["email"]]`, `[["domain"],["name"]]`). On create, the kernel resolves identity first: a match becomes an upsert (merged per `behavior.merge`), not a duplicate. `id` is never reused for this — it stays an opaque surrogate. Addressing is `surrogate` by default; a model may opt into `addressing: "content"` only if it is immutable and single-keyed, in which case the id is a hash of its identity.
+
+**Concurrency.** Every write carries the `lifecycle.version` it read. The kernel commits only if the stored version is unchanged; otherwise the write is rejected as a conflict for the caller to retry. No lost updates. A model may opt into last-writer-wins where conflicts are acceptable.
+
+**Provenance.** The `log` is append-only and field-granular: every mutation records actor, time, and before/after. Any value’s origin and full history are reconstructable by replaying its field’s log — provenance is a property of the log, not extra bookkeeping. Derived (computed-on-read) values are display-only; anything audited or billed is stored at write so it is indexable, logged, and frozen in time.
+
+**Permissions.** A model declares `read` and `write` predicates as traversal-path expressions (`actor.team == company.owner.team`). They are evaluated fail-closed: a predicate that is false, errors, or exhausts its budget denies access. Permission traversal cannot fail open. Permissions compose across edges using the same path language as everything else.
+
+## Schema evolution
+
+Models carry an integer `version`. Adding an optional or derivable field does not bump it; existing atoms stay valid. A breaking change — rename, retype, optional→required, remove, identity or merge change — bumps `version` and ships a `migration` atom, which is immutable and forward-only.
+
+Each atom stores the `modelVersion` it was written under. The kernel migrates lazily: on read it chains migrations from the atom’s version to current and returns the current shape; on the atom’s next write it persists that shape (copy-on-write); a background sweep rewrites the cold tail until none remain. `op: "rename"` and `op: "default"` run from `spec` with no code; `op: "custom"` runs a registered handler — the only place deployed code is required.
+
 ```json
 {
-  "id": "plugin",
-  "model": "atom://model",
-  "manifest": "Bundle of atoms (models, indexes, hooks, config)",
+  "id": "contact@1->2",
+  "model": "atom://migration",
+  "manifest": "Split name into firstName + lastName",
   "attr": {
-    "label": "Plugin",
-    "fields": {
-      "label": {
-        "kind": "text"
-      },
-      "version": {
-        "kind": "text",
-        "required": true
-      },
-      "provides": {
-        "kind": "list",
-        "of": "ref",
-        "required": true
-      },
-      "requires": {
-        "kind": "list",
-        "of": "atom://plugin"
-      },
-      "config": {
-        "kind": "json"
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "id"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": true,
-      "merge": "replace"
-    }
+    "model": "atom://contact",
+    "from": 1,
+    "to": 2,
+    "op": "custom",
+    "run": "splitName"
   },
   "lifecycle": "atom://0"
 }
 ```
 
+A field that is filtered, searched, or billed on is trustworthy only after the sweep completes; sweep before querying on it.
+
+## A model is just an atom
+
+The CRM above is three model atoms — `company`, `contact`, `deal` — wired by `ref`/`inverse` edges, each with identity, display, and rules. That is the whole pattern: define atoms, and the graph, the queries, the UI, the dedup, the audit trail, and the permissions follow from them.
+
 ```json
 {
-  "id": "tenant",
+  "id": "company",
   "model": "atom://model",
-  "manifest": "Defines active plugins, config, and capabilities",
+  "manifest": "An organization in the CRM",
   "attr": {
-    "label": "Tenant",
+    "label": "Company",
+    "version": 1,
     "fields": {
       "name": {
         "kind": "text",
         "required": true
       },
-      "version": {
-        "kind": "text"
+      "domain": {
+        "kind": "text",
+        "unique": true
       },
-      "plugins": {
-        "kind": "list",
-        "of": "atom://plugin"
-      },
-      "config": {
-        "kind": "json"
-      },
-      "capabilities": {
-        "kind": "list",
-        "of": "text"
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "id"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": true,
-      "merge": "merge"
-    }
-  },
-  "lifecycle": "atom://0"
-}
-```
-
-```json
-{
-  "id": "hook",
-  "model": "atom://model",
-  "manifest": "Pipeline logic",
-  "attr": {
-    "label": "Hook",
-    "fields": {
-      "label": {
-        "kind": "text"
-      },
-      "on": {
+      "tier": {
         "kind": "enum",
         "values": [
-          "beforeValidate",
-          "beforeWrite",
-          "afterWrite",
-          "beforeRead",
-          "afterRead"
+          "smb",
+          "mid",
+          "enterprise"
         ],
-        "required": true
-      },
-      "model": {
-        "kind": "ref",
-        "of": "atom://model"
-      },
-      "run": {
-        "kind": "text",
-        "required": true
-      },
-      "order": {
-        "kind": "integer",
-        "default": 0
-      },
-      "enabled": {
-        "kind": "boolean",
-        "default": true
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "id"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": true,
-      "merge": "replace"
-    }
-  },
-  "lifecycle": "atom://0"
-}
-```
-
-```json
-{
-  "id": "token",
-  "model": "atom://model",
-  "manifest": "Authentication",
-  "attr": {
-    "label": "Token",
-    "fields": {
-      "label": {
-        "kind": "text"
-      },
-      "subject": {
-        "kind": "ref",
-        "required": true
-      },
-      "scopes": {
-        "kind": "list",
-        "of": "text"
-      },
-      "hash": {
-        "kind": "text",
-        "required": true
-      },
-      "expiresAt": {
-        "kind": "datetime",
         "filterable": true
-      },
-      "lastUsedAt": {
-        "kind": "datetime"
-      },
-      "revoked": {
-        "kind": "boolean",
-        "default": false
       }
     },
     "identity": {
       "keys": [
         [
-          "id"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": true,
-      "merge": "replace"
-    }
-  },
-  "lifecycle": "atom://0"
-}
-```
-
-```json
-{
-  "id": "config",
-  "model": "atom://model",
-  "manifest": "Cascading settings",
-  "attr": {
-    "label": "Config",
-    "fields": {
-      "label": {
-        "kind": "text"
-      },
-      "scope": {
-        "kind": "enum",
-        "values": [
-          "tenant",
-          "plugin",
-          "model",
-          "atom"
-        ],
-        "required": true
-      },
-      "target": {
-        "kind": "ref"
-      },
-      "values": {
-        "kind": "json",
-        "required": true
-      },
-      "order": {
-        "kind": "integer",
-        "default": 0
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "scope",
-          "target"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": true,
-      "merge": "merge"
-    }
-  },
-  "lifecycle": "atom://0"
-}
-```
-
-```json
-{
-  "id": "file",
-  "model": "atom://model",
-  "manifest": "Object storage pointers",
-  "attr": {
-    "label": "File",
-    "fields": {
-      "label": {
-        "kind": "text"
-      },
-      "key": {
-        "kind": "text",
-        "required": true
-      },
-      "bucket": {
-        "kind": "text"
-      },
-      "contentType": {
-        "kind": "text"
-      },
-      "size": {
-        "kind": "integer"
-      },
-      "checksum": {
-        "kind": "text"
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "bucket",
-          "key"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": false,
-      "merge": "replace"
-    }
-  },
-  "lifecycle": "atom://0"
-}
-```
-
-```json
-{
-  "id": "log",
-  "model": "atom://model",
-  "manifest": "Append-only audit entries",
-  "attr": {
-    "label": "Log",
-    "fields": {
-      "at": {
-        "kind": "datetime",
-        "required": true,
-        "filterable": true,
-        "sortable": true
-      },
-      "actor": {
-        "kind": "ref"
-      },
-      "action": {
-        "kind": "enum",
-        "values": [
-          "create",
-          "update",
-          "delete",
-          "read"
-        ],
-        "required": true
-      },
-      "target": {
-        "kind": "ref",
-        "required": true
-      },
-      "model": {
-        "kind": "ref",
-        "of": "atom://model"
-      },
-      "diff": {
-        "kind": "json"
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "id"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": false,
-      "merge": "append"
-    }
-  },
-  "lifecycle": "atom://0"
-}
-```
-
-```json
-{
-  "id": "migration",
-  "model": "atom://model",
-  "manifest": "Versioned, forward-only transform between two model versions",
-  "attr": {
-    "label": "Migration",
-    "fields": {
-      "model": {
-        "kind": "ref",
-        "of": "atom://model",
-        "required": true
-      },
-      "from": {
-        "kind": "integer",
-        "required": true
-      },
-      "to": {
-        "kind": "integer",
-        "required": true
-      },
-      "op": {
-        "kind": "enum",
-        "values": [
-          "rename",
-          "default",
-          "custom"
-        ],
-        "required": true
-      },
-      "spec": {
-        "kind": "json"
-      },
-      "run": {
-        "kind": "text"
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "model",
-          "from",
-          "to"
-        ]
-      ]
-    },
-    "behavior": {
-      "mutable": false,
-      "merge": "replace"
-    }
-  },
-  "lifecycle": "atom://0"
-}
-```
-
------
-
-## Principles
-
-```
-1. Models define behavior, indexes define access, logs capture mutations
-2. One kernel, one pipeline — all surfaces are generated from atoms
-3. Refs may be cyclic; traversals terminate by cycle detection and are
-   bounded by resource budget, not depth
-4. Models are versioned; additive changes are free, breaking changes ship
-   a migration
-```
-
------
-
-## The Atom
-
-```json
-{
-  "id": "invoice-2026-000001",
-  "model": "atom://invoice",
-  "attr": {},
-  "lifecycle": {
-    "status": "active",
-    "version": 1,
-    "modelVersion": 1,
-    "createdAt": "2026-05-28T12:00:00Z",
-    "createdBy": "actor-id",
-    "updatedAt": "2026-05-28T12:00:00Z",
-    "updatedBy": "actor-id"
-  }
-}
-```
-
-|Field      |Purpose                                                                                                                                                                       |
-|-----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|`id`       |Unique identity. Caller-assigned or system-generated GUID. Must be unique within the workspace.                                                                               |
-|`model`    |Points to the model atom defining schema and behavior.                                                                                                                        |
-|`manifest` |Prose description of the atom, human- and agent-readable. Caller-owned: created and updated through CRUD like any field, and full-text searchable. Not validated by the model.|
-|`attr`     |Attributes shaped by the model.                                                                                                                                               |
-|`lifecycle`|Kernel-managed operational metadata.                                                                                                                                          |
-
-IDs may be human-readable (`invoice-2026-000001`) or GUIDs (`7b8f2f0c-5f0f-4a3d-9f0d-2d6e2d4d1c11`). No dots — the atom ID is the route. Do not rely on ID shape for deduplication, permissions, validation, or behavior — identity is model-defined.
-
-`lifecycle` holds `status`, `version` (the atom’s write count), `modelVersion` (the model version the atom was last written under), and `createdAt`/`createdBy`/`updatedAt`/`updatedBy`. The kernel owns it; callers do not set it.
-
-Real-world timestamps (`occurredAt`, `effectiveAt`, `filedAt`) belong in `attr`.
-
-`manifest` is plain prose describing what the atom is for. It is caller-owned: written and changed through ordinary create and update operations, not kernel-managed like `lifecycle`. The kernel maintains a full-text index over every atom’s `manifest`, so it is searchable without any model declaring it, and `manifest` resolves as a path in the traversal language for use in filters, indexes, and permissions.
-
------
-
-## References
-
-All references use `atom://`.
-
-```
-atom://id
-atom://id?param=value
-```
-
-The system resolves what the target atom is. If it is an index, it executes. If it is a direct atom, it resolves directly. References may be cyclic.
-
-```txt
-person → company → boardMember → person
-country → ally → country
-bill → amendment → bill
-```
-
-The kernel protects execution, not the graph itself.
-
-### Resolution rules
-
-- Self-reference terminates safely (e.g. `model` → `atom://model`)
-- Cyclic refs are allowed
-- Traversals terminate via cycle detection (visited-set), not depth limits
-- Traversals are bounded by an explicit resource budget — wall-clock, nodes visited, result size — with a default budget callers may raise
-- Dangling references error — no silent nulls
-- Copy-on-write: first mutation to a referenced field detaches it into a local value
-- Resolved references are cached, invalidated on mutation broadcast
-
-Cycle detection guarantees termination; the resource budget guarantees bounded cost.
-
-Indexes return sets by default. An index returns one atom with `limit: 1` or `returns: "one"`. Indexes resolve a target set through reusable access logic: imports, templates, config, manifests, identity resolution, relationship resolution, generated lists, dashboards, and reports.
-
-```
-atom://invoice
-atom://officialsByDistrict?state=MD&district=5
-atom://modelsByKey?key=invoice
-atom://search?manifest=data+center
-```
-
-Traversal paths resolve through references and nested JSON:
-
-```txt
-contribution.committee.treasurer.address.state
-```
-
-The same traversal language works across filters, indexes, GraphQL, permissions, hooks, exports, and generated UI.
-
------
-
-## Traits
-
-A trait is a first-class atom that defines a reusable field shape.
-
-```json
-{
-  "id": "address",
-  "model": "atom://trait",
-  "attr": {
-    "fields": {
-      "street": {
-        "kind": "text"
-      },
-      "city": {
-        "kind": "text"
-      },
-      "state": {
-        "kind": "text"
-      },
-      "zip": {
-        "kind": "text"
-      },
-      "country": {
-        "kind": "text",
-        "default": "US"
-      }
-    }
-  }
-}
-```
-
-When a model references a trait, the kernel resolves it and inlines its fields at schema-compile time. The resolved value is stored as embedded JSON on the host atom — the trait atom is the definition, the embedded fields are its expansion. Editing a trait does not retroactively change atoms that already inlined it; that is a schema change (see Schema evolution).
-
-Models reference traits:
-
-```json
-{
-  "location": "atom://address"
-}
-```
-
------
-
-## Models
-
-A model defines fields, validation, display, permissions, identity, merge rules, retention, hooks, indexes, and generated surfaces. It carries an integer `version`.
-
-### Field definitions
-
-Each entry in a model’s `fields` map is a field definition:
-
-- `kind` — `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`, `ref`, `list`, `map`, or `json`
-- `required` — must be present (default `false`)
-- `default` — value used when the field is absent
-- `filterable` / `sortable` — exposed to indexes and queries
-- `unique` — enforced within the model
-- `of` — element constraint: a `kind` for `list`, or an `atom://model` target for a `ref`
-- `values` — allowed values for `enum`
-
-`json` is an open sub-object validated by hooks rather than by shape. `map` is a keyed collection whose values follow the field-definition form; this is how `fields` itself is typed.
-
-### Example
-
-```json
-{
-  "id": "facility",
-  "model": "atom://model",
-  "manifest": "A physical facility",
-  "attr": {
-    "label": "Facility",
-    "version": 1,
-    "fields": {
-      "name": {
-        "kind": "text",
-        "required": true
-      },
-      "location": "atom://address",
-      "openedAt": {
-        "kind": "datetime",
-        "filterable": true,
-        "sortable": true
-      }
-    },
-    "identity": {
-      "keys": [
-        [
-          "externalIds.fec"
+          "domain"
         ],
         [
-          "name",
-          "location.city",
-          "location.state"
+          "name"
         ]
       ]
     },
     "display": {
       "row": [
         "name",
-        "location.city"
+        "tier"
+      ],
+      "detail": [
+        "name",
+        "domain",
+        "tier",
+        "contacts",
+        "deals"
       ]
     },
     "behavior": {
       "mutable": true,
-      "merge": "model-defined"
-    }
-  }
-}
-```
-
-Adding a model means creating a model atom. No code changes. No deployment.
-
------
-
-## Schema evolution
-
-Models carry an integer `version`. Adding an optional or derivable field does not bump it: existing atoms stay valid, and the field reads as absent or is computed from a traversal path. A breaking change — rename, retype, optional→required, remove, identity-key change, or merge-strategy change — bumps `version` and ships a `migration` atom from the prior version to the new one.
-
-Each atom records the model version it was last written under in `lifecycle.modelVersion`.
-
-The kernel applies migrations without a manual migration step:
-
-- **On read**, if an atom is behind the model’s current version, the kernel chains the registered `migration` atoms from the atom’s version up to current and returns the current shape. Storage is unchanged.
-- **On the atom’s next write**, the migrated shape is persisted and `lifecycle.modelVersion` advances. This is copy-on-write applied to schema.
-- **A background sweep** reads and rewrites atoms behind the current version, in batches, until none remain.
-
-Migrations are immutable and forward-only: a published `migration` is never edited; a correction is a new `migration` to a higher version. The version chain is therefore reproducible, and an atom’s historical shape can be reconstructed.
-
-Two transform ops need no code: `op: "rename"` and `op: "default"` are executed by the kernel from `spec`. `op: "custom"` runs a registered handler named by `run` — the only case requiring deployed code.
-
-```json
-{
-  "id": "facility@1->2",
-  "model": "atom://migration",
-  "manifest": "Rename openedAt to commissionedAt on facility",
-  "attr": {
-    "model": "atom://facility",
-    "from": 1,
-    "to": 2,
-    "op": "rename",
-    "spec": {
-      "from": "openedAt",
-      "to": "commissionedAt"
+      "merge": "merge"
     }
   },
   "lifecycle": "atom://0"
 }
 ```
 
-Read-time migration populates a field only on atoms that are read. A field that is filtered, sorted, searched, or billed on is trustworthy only after the sweep completes; until then, indexes cover migrated atoms only. Sweep such fields to completion before querying or billing on them. Do not derive billable or audited values on read — store them at write so they are indexable, logged, and frozen in time.
+```json
+{
+  "id": "contact",
+  "model": "atom://model",
+  "manifest": "A person at a company",
+  "attr": {
+    "label": "Contact",
+    "version": 1,
+    "fields": {
+      "name": {
+        "kind": "text",
+        "required": true
+      },
+      "email": {
+        "kind": "text",
+        "unique": true,
+        "filterable": true
+      },
+      "company": {
+        "kind": "ref",
+        "to": "atom://company",
+        "inverse": "contacts"
+      }
+    },
+    "identity": {
+      "keys": [
+        [
+          "email"
+        ]
+      ]
+    },
+    "display": {
+      "row": [
+        "name",
+        "email",
+        "company"
+      ]
+    },
+    "permissions": {
+      "read": "true",
+      "write": "actor.team == company.owner.team"
+    },
+    "behavior": {
+      "mutable": true,
+      "merge": "merge"
+    }
+  },
+  "lifecycle": "atom://0"
+}
+```
+
+```json
+{
+  "id": "deal",
+  "model": "atom://model",
+  "manifest": "A sales opportunity",
+  "attr": {
+    "label": "Deal",
+    "version": 1,
+    "fields": {
+      "name": {
+        "kind": "text",
+        "required": true
+      },
+      "amount": {
+        "kind": "number",
+        "filterable": true,
+        "sortable": true
+      },
+      "stage": {
+        "kind": "enum",
+        "values": [
+          "lead",
+          "qualified",
+          "won",
+          "lost"
+        ],
+        "filterable": true
+      },
+      "company": {
+        "kind": "ref",
+        "to": "atom://company",
+        "inverse": "deals"
+      },
+      "owner": {
+        "kind": "ref",
+        "to": "atom://user"
+      }
+    },
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "display": {
+      "row": [
+        "name",
+        "amount",
+        "stage"
+      ],
+      "board": {
+        "groupBy": "stage",
+        "card": [
+          "name",
+          "amount",
+          "company"
+        ]
+      }
+    },
+    "behavior": {
+      "mutable": true,
+      "merge": "replace"
+    }
+  },
+  "lifecycle": "atom://0"
+}
+```
