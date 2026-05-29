@@ -33,18 +33,51 @@ Atomic ships these atoms:
     "purpose": "Defines atom schemas and behavior",
     "label": "Model",
     "fields": {
-      "label": { "kind": "text" },
-      "fields": { "kind": "map", "required": true },
-      "identity": { "kind": "json" },
-      "display": { "kind": "json" },
-      "permissions": { "kind": "json" },
-      "behavior": { "kind": "json" },
-      "hooks": { "kind": "list", "of": "atom://hook" },
-      "indexes": { "kind": "list", "of": "atom://index" }
+      "label": {
+        "kind": "text"
+      },
+      "fields": {
+        "kind": "map",
+        "required": true
+      },
+      "identity": {
+        "kind": "json"
+      },
+      "display": {
+        "kind": "json"
+      },
+      "permissions": {
+        "kind": "json"
+      },
+      "behavior": {
+        "kind": "json"
+      },
+      "hooks": {
+        "kind": "list",
+        "of": "atom://hook"
+      },
+      "indexes": {
+        "kind": "list",
+        "of": "atom://index"
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "display": { "row": ["label", "id"] },
-    "behavior": { "mutable": true, "mergeStrategy": "replace" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "display": {
+      "row": [
+        "label",
+        "id"
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "replace"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -58,11 +91,25 @@ Atomic ships these atoms:
     "purpose": "Reusable field shapes",
     "label": "Trait",
     "fields": {
-      "label": { "kind": "text" },
-      "fields": { "kind": "map", "required": true }
+      "label": {
+        "kind": "text"
+      },
+      "fields": {
+        "kind": "map",
+        "required": true
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "behavior": { "mutable": true, "mergeStrategy": "replace" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "replace"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -76,16 +123,46 @@ Atomic ships these atoms:
     "purpose": "Reusable access pattern and physical index intent",
     "label": "Index",
     "fields": {
-      "label": { "kind": "text" },
-      "over": { "kind": "ref", "of": "atom://model", "required": true },
-      "params": { "kind": "map" },
-      "match": { "kind": "json" },
-      "sort": { "kind": "list" },
-      "returns": { "kind": "enum", "values": ["set", "one"], "default": "set" },
-      "limit": { "kind": "integer" }
+      "label": {
+        "kind": "text"
+      },
+      "over": {
+        "kind": "ref",
+        "of": "atom://model",
+        "required": true
+      },
+      "params": {
+        "kind": "map"
+      },
+      "match": {
+        "kind": "json"
+      },
+      "sort": {
+        "kind": "list"
+      },
+      "returns": {
+        "kind": "enum",
+        "values": [
+          "set",
+          "one"
+        ],
+        "default": "set"
+      },
+      "limit": {
+        "kind": "integer"
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "behavior": { "mutable": true, "mergeStrategy": "replace" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "replace"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -99,14 +176,37 @@ Atomic ships these atoms:
     "purpose": "Bundle of atoms (models, indexes, hooks, config)",
     "label": "Plugin",
     "fields": {
-      "label": { "kind": "text" },
-      "version": { "kind": "text", "required": true },
-      "provides": { "kind": "list", "of": "ref", "required": true },
-      "requires": { "kind": "list", "of": "atom://plugin" },
-      "config": { "kind": "json" }
+      "label": {
+        "kind": "text"
+      },
+      "version": {
+        "kind": "text",
+        "required": true
+      },
+      "provides": {
+        "kind": "list",
+        "of": "ref",
+        "required": true
+      },
+      "requires": {
+        "kind": "list",
+        "of": "atom://plugin"
+      },
+      "config": {
+        "kind": "json"
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "behavior": { "mutable": true, "mergeStrategy": "replace" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "replace"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -120,14 +220,36 @@ Atomic ships these atoms:
     "purpose": "Defines active plugins, config, and capabilities",
     "label": "Tenant",
     "fields": {
-      "name": { "kind": "text", "required": true },
-      "version": { "kind": "text" },
-      "plugins": { "kind": "list", "of": "atom://plugin" },
-      "config": { "kind": "json" },
-      "capabilities": { "kind": "list", "of": "text" }
+      "name": {
+        "kind": "text",
+        "required": true
+      },
+      "version": {
+        "kind": "text"
+      },
+      "plugins": {
+        "kind": "list",
+        "of": "atom://plugin"
+      },
+      "config": {
+        "kind": "json"
+      },
+      "capabilities": {
+        "kind": "list",
+        "of": "text"
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "behavior": { "mutable": true, "mergeStrategy": "merge" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "merge"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -141,19 +263,48 @@ Atomic ships these atoms:
     "purpose": "Pipeline logic",
     "label": "Hook",
     "fields": {
-      "label": { "kind": "text" },
+      "label": {
+        "kind": "text"
+      },
       "on": {
         "kind": "enum",
-        "values": ["beforeValidate", "beforeWrite", "afterWrite", "beforeRead", "afterRead"],
+        "values": [
+          "beforeValidate",
+          "beforeWrite",
+          "afterWrite",
+          "beforeRead",
+          "afterRead"
+        ],
         "required": true
       },
-      "model": { "kind": "ref", "of": "atom://model" },
-      "run": { "kind": "text", "required": true },
-      "order": { "kind": "integer", "default": 0 },
-      "enabled": { "kind": "boolean", "default": true }
+      "model": {
+        "kind": "ref",
+        "of": "atom://model"
+      },
+      "run": {
+        "kind": "text",
+        "required": true
+      },
+      "order": {
+        "kind": "integer",
+        "default": 0
+      },
+      "enabled": {
+        "kind": "boolean",
+        "default": true
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "behavior": { "mutable": true, "mergeStrategy": "replace" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "replace"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -167,16 +318,44 @@ Atomic ships these atoms:
     "purpose": "Authentication",
     "label": "Token",
     "fields": {
-      "label": { "kind": "text" },
-      "subject": { "kind": "ref", "required": true },
-      "scopes": { "kind": "list", "of": "text" },
-      "hash": { "kind": "text", "required": true },
-      "expiresAt": { "kind": "datetime", "filterable": true },
-      "lastUsedAt": { "kind": "datetime" },
-      "revoked": { "kind": "boolean", "default": false }
+      "label": {
+        "kind": "text"
+      },
+      "subject": {
+        "kind": "ref",
+        "required": true
+      },
+      "scopes": {
+        "kind": "list",
+        "of": "text"
+      },
+      "hash": {
+        "kind": "text",
+        "required": true
+      },
+      "expiresAt": {
+        "kind": "datetime",
+        "filterable": true
+      },
+      "lastUsedAt": {
+        "kind": "datetime"
+      },
+      "revoked": {
+        "kind": "boolean",
+        "default": false
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "behavior": { "mutable": true, "mergeStrategy": "replace" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "replace"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -190,18 +369,43 @@ Atomic ships these atoms:
     "purpose": "Cascading settings",
     "label": "Config",
     "fields": {
-      "label": { "kind": "text" },
+      "label": {
+        "kind": "text"
+      },
       "scope": {
         "kind": "enum",
-        "values": ["tenant", "plugin", "model", "atom"],
+        "values": [
+          "tenant",
+          "plugin",
+          "model",
+          "atom"
+        ],
         "required": true
       },
-      "target": { "kind": "ref" },
-      "values": { "kind": "json", "required": true },
-      "order": { "kind": "integer", "default": 0 }
+      "target": {
+        "kind": "ref"
+      },
+      "values": {
+        "kind": "json",
+        "required": true
+      },
+      "order": {
+        "kind": "integer",
+        "default": 0
+      }
     },
-    "identity": { "keys": [["scope", "target"]] },
-    "behavior": { "mutable": true, "mergeStrategy": "merge" }
+    "identity": {
+      "keys": [
+        [
+          "scope",
+          "target"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": true,
+      "mergeStrategy": "merge"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -215,15 +419,38 @@ Atomic ships these atoms:
     "purpose": "Object storage pointers",
     "label": "File",
     "fields": {
-      "label": { "kind": "text" },
-      "key": { "kind": "text", "required": true },
-      "bucket": { "kind": "text" },
-      "contentType": { "kind": "text" },
-      "size": { "kind": "integer" },
-      "checksum": { "kind": "text" }
+      "label": {
+        "kind": "text"
+      },
+      "key": {
+        "kind": "text",
+        "required": true
+      },
+      "bucket": {
+        "kind": "text"
+      },
+      "contentType": {
+        "kind": "text"
+      },
+      "size": {
+        "kind": "integer"
+      },
+      "checksum": {
+        "kind": "text"
+      }
     },
-    "identity": { "keys": [["bucket", "key"]] },
-    "behavior": { "mutable": false, "mergeStrategy": "replace" }
+    "identity": {
+      "keys": [
+        [
+          "bucket",
+          "key"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": false,
+      "mergeStrategy": "replace"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -237,19 +464,48 @@ Atomic ships these atoms:
     "purpose": "Append-only audit entries",
     "label": "Log",
     "fields": {
-      "at": { "kind": "datetime", "required": true, "filterable": true, "sortable": true },
-      "actor": { "kind": "ref" },
+      "at": {
+        "kind": "datetime",
+        "required": true,
+        "filterable": true,
+        "sortable": true
+      },
+      "actor": {
+        "kind": "ref"
+      },
       "action": {
         "kind": "enum",
-        "values": ["create", "update", "delete", "read"],
+        "values": [
+          "create",
+          "update",
+          "delete",
+          "read"
+        ],
         "required": true
       },
-      "target": { "kind": "ref", "required": true },
-      "model": { "kind": "ref", "of": "atom://model" },
-      "diff": { "kind": "json" }
+      "target": {
+        "kind": "ref",
+        "required": true
+      },
+      "model": {
+        "kind": "ref",
+        "of": "atom://model"
+      },
+      "diff": {
+        "kind": "json"
+      }
     },
-    "identity": { "keys": [["id"]] },
-    "behavior": { "mutable": false, "mergeStrategy": "append" }
+    "identity": {
+      "keys": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": false,
+      "mergeStrategy": "append"
+    }
   },
   "lifecycle": "atom://0"
 }
@@ -471,12 +727,21 @@ Each entry in a model’s `fields` map is a field definition:
     },
     "identity": {
       "keys": [
-        ["externalIds.fec"],
-        ["name", "location.city", "location.state"]
+        [
+          "externalIds.fec"
+        ],
+        [
+          "name",
+          "location.city",
+          "location.state"
+        ]
       ]
     },
     "display": {
-      "row": ["name", "location.city"]
+      "row": [
+        "name",
+        "location.city"
+      ]
     },
     "behavior": {
       "mutable": true,
