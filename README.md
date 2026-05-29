@@ -1,6 +1,6 @@
 # Atomic
 
-A substrate for building graph-relational, queryable databases — CRM and anything shaped like it. Schema is data, relationships are first-class edges, every surface is generated from atoms, and correctness comes first: identity, provenance, and permissions are guarantees of the kernel, not features of the app.
+A substrate for building graph-relational, queryable databases. Schema is data, relationships are first-class edges, every surface is generated from atoms, and correctness comes first: identity, provenance, and permissions are guarantees of the kernel, not features of the app.
 
 Everything is an atom.
 
