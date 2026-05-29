@@ -1,6 +1,6 @@
 # Atomic
 
-A framework for building data systems. Everything is an atom — models, traits, indexes, hooks, config, tokens, and attributes.
+A framework for building data systems. Everything is an atom — models, traits, indexes, plugins, tenants, hooks, migrations, tokens, config, files, and logs.
 
 ```
 { id, model, manifest, attr, lifecycle }
@@ -12,6 +12,7 @@ Atomic ships these atoms:
 {
   "id": "0",
   "model": "atom://tenant",
+  "manifest": "The Atomic tenant",
   "attr": {
     "name": "Atomic",
     "version": "0.1.0"
@@ -19,6 +20,7 @@ Atomic ships these atoms:
   "lifecycle": {
     "status": "active",
     "version": 1,
+    "modelVersion": 1,
     "createdAt": "2026-05-28T00:00:00Z",
     "createdBy": "0"
   }
@@ -35,6 +37,10 @@ Atomic ships these atoms:
     "fields": {
       "label": {
         "kind": "text"
+      },
+      "version": {
+        "kind": "integer",
+        "default": 1
       },
       "fields": {
         "kind": "map",
@@ -511,6 +517,61 @@ Atomic ships these atoms:
 }
 ```
 
+```json
+{
+  "id": "migration",
+  "model": "atom://model",
+  "manifest": "Versioned, forward-only transform between two model versions",
+  "attr": {
+    "label": "Migration",
+    "fields": {
+      "model": {
+        "kind": "ref",
+        "of": "atom://model",
+        "required": true
+      },
+      "from": {
+        "kind": "integer",
+        "required": true
+      },
+      "to": {
+        "kind": "integer",
+        "required": true
+      },
+      "op": {
+        "kind": "enum",
+        "values": [
+          "rename",
+          "default",
+          "custom"
+        ],
+        "required": true
+      },
+      "spec": {
+        "kind": "json"
+      },
+      "run": {
+        "kind": "text"
+      }
+    },
+    "identity": {
+      "keys": [
+        [
+          "model",
+          "from",
+          "to"
+        ]
+      ]
+    },
+    "behavior": {
+      "mutable": false,
+      "merge": "replace"
+    }
+  },
+  "lifecycle": "atom://0"
+}
+```
+
 -----
 
 ## Principles
@@ -520,6 +581,8 @@ Atomic ships these atoms:
 2. One kernel, one pipeline — all surfaces are generated from atoms
 3. Refs may be cyclic; traversals terminate by cycle detection and are
    bounded by resource budget, not depth
+4. Models are versioned; additive changes are free, breaking changes ship
+   a migration
 ```
 
 -----
@@ -534,6 +597,7 @@ Atomic ships these atoms:
   "lifecycle": {
     "status": "active",
     "version": 1,
+    "modelVersion": 1,
     "createdAt": "2026-05-28T12:00:00Z",
     "createdBy": "actor-id",
     "updatedAt": "2026-05-28T12:00:00Z",
@@ -552,9 +616,11 @@ Atomic ships these atoms:
 
 IDs may be human-readable (`invoice-2026-000001`) or GUIDs (`7b8f2f0c-5f0f-4a3d-9f0d-2d6e2d4d1c11`). No dots — the atom ID is the route. Do not rely on ID shape for deduplication, permissions, validation, or behavior — identity is model-defined.
 
+`lifecycle` holds `status`, `version` (the atom’s write count), `modelVersion` (the model version the atom was last written under), and `createdAt`/`createdBy`/`updatedAt`/`updatedBy`. The kernel owns it; callers do not set it.
+
 Real-world timestamps (`occurredAt`, `effectiveAt`, `filedAt`) belong in `attr`.
 
-`manifest` is plain prose — a description of what the atom is for, readable by people and agents. It is caller-owned: written and changed through ordinary create and update operations, not kernel-managed like `lifecycle`. The kernel maintains a full-text index over every atom’s `manifest`, so it is searchable without any model declaring it. `manifest` resolves as a path in the traversal language — usable in filters, indexes, and permissions — and supports text-match against the index.
+`manifest` is plain prose describing what the atom is for. It is caller-owned: written and changed through ordinary create and update operations, not kernel-managed like `lifecycle`. The kernel maintains a full-text index over every atom’s `manifest`, so it is searchable without any model declaring it, and `manifest` resolves as a path in the traversal language for use in filters, indexes, and permissions.
 
 -----
 
@@ -567,11 +633,7 @@ atom://id
 atom://id?param=value
 ```
 
-The system resolves what the target atom is. If it’s an index, it executes. If it’s a direct atom, it resolves directly.
-
-References may be cyclic.
-
-Examples:
+The system resolves what the target atom is. If it is an index, it executes. If it is a direct atom, it resolves directly. References may be cyclic.
 
 ```txt
 person → company → boardMember → person
@@ -579,9 +641,7 @@ country → ally → country
 bill → amendment → bill
 ```
 
-Cycles are valid graph structures.
-
-The kernel protects execution — not the graph itself.
+The kernel protects execution, not the graph itself.
 
 ### Resolution rules
 
@@ -591,11 +651,11 @@ The kernel protects execution — not the graph itself.
 - Traversals are bounded by an explicit resource budget — wall-clock, nodes visited, result size — with a default budget callers may raise
 - Dangling references error — no silent nulls
 - Copy-on-write: first mutation to a referenced field detaches it into a local value
-- Resolved references are cached — invalidated on mutation broadcast
+- Resolved references are cached, invalidated on mutation broadcast
 
-Cycle detection guarantees termination; the resource budget guarantees bounded cost. Depth is neither — it is not a bound.
+Cycle detection guarantees termination; the resource budget guarantees bounded cost.
 
-Examples:
+Indexes return sets by default. An index returns one atom with `limit: 1` or `returns: "one"`. Indexes resolve a target set through reusable access logic: imports, templates, config, manifests, identity resolution, relationship resolution, generated lists, dashboards, and reports.
 
 ```
 atom://invoice
@@ -604,36 +664,13 @@ atom://modelsByKey?key=invoice
 atom://search?manifest=data+center
 ```
 
-Indexes return sets by default. An index can be constrained to return one atom with `limit: 1` or `returns: "one"`.
-
-Indexes are used when the target set must be resolved through reusable access logic:
-
-- imports
-- templates
-- config
-- portable manifests
-- human-authored definitions
-- identity resolution
-- relationship resolution
-- generated lists
-- dashboards
-- reports
-
 Traversal paths resolve through references and nested JSON:
 
 ```txt
 contribution.committee.treasurer.address.state
 ```
 
-The same traversal language works across:
-
-- filters
-- indexes
-- GraphQL
-- permissions
-- hooks
-- exports
-- generated UI
+The same traversal language works across filters, indexes, GraphQL, permissions, hooks, exports, and generated UI.
 
 -----
 
@@ -668,7 +705,7 @@ A trait is a first-class atom that defines a reusable field shape.
 }
 ```
 
-When a model references a trait, the kernel resolves it and inlines its fields at schema-compile time. The resolved value is stored as embedded JSON on the host atom — the trait atom is the definition, the embedded fields are its expansion.
+When a model references a trait, the kernel resolves it and inlines its fields at schema-compile time. The resolved value is stored as embedded JSON on the host atom — the trait atom is the definition, the embedded fields are its expansion. Editing a trait does not retroactively change atoms that already inlined it; that is a schema change (see Schema evolution).
 
 Models reference traits:
 
@@ -682,18 +719,7 @@ Models reference traits:
 
 ## Models
 
-A model defines:
-
-- fields
-- validation
-- display
-- permissions
-- identity
-- merge rules
-- retention
-- hooks
-- indexes
-- generated surfaces
+A model defines fields, validation, display, permissions, identity, merge rules, retention, hooks, indexes, and generated surfaces. It carries an integer `version`.
 
 ### Field definitions
 
@@ -704,10 +730,10 @@ Each entry in a model’s `fields` map is a field definition:
 - `default` — value used when the field is absent
 - `filterable` / `sortable` — exposed to indexes and queries
 - `unique` — enforced within the model
-- `of` — element constraint: a `kind` for `list`, or an `atom://model` target for a `ref` (or a list of refs)
+- `of` — element constraint: a `kind` for `list`, or an `atom://model` target for a `ref`
 - `values` — allowed values for `enum`
 
-`json` is an open sub-object validated by hooks rather than by shape. `map` is a keyed collection whose values follow the same field-definition form (this is how `fields` itself is typed).
+`json` is an open sub-object validated by hooks rather than by shape. `map` is a keyed collection whose values follow the field-definition form; this is how `fields` itself is typed.
 
 ### Example
 
@@ -715,8 +741,10 @@ Each entry in a model’s `fields` map is a field definition:
 {
   "id": "facility",
   "model": "atom://model",
+  "manifest": "A physical facility",
   "attr": {
     "label": "Facility",
+    "version": 1,
     "fields": {
       "name": {
         "kind": "text",
@@ -755,4 +783,43 @@ Each entry in a model’s `fields` map is a field definition:
 }
 ```
 
-Adding a new type means creating a model atom. No code changes. No deployment.
+Adding a model means creating a model atom. No code changes. No deployment.
+
+-----
+
+## Schema evolution
+
+Models carry an integer `version`. Adding an optional or derivable field does not bump it: existing atoms stay valid, and the field reads as absent or is computed from a traversal path. A breaking change — rename, retype, optional→required, remove, identity-key change, or merge-strategy change — bumps `version` and ships a `migration` atom from the prior version to the new one.
+
+Each atom records the model version it was last written under in `lifecycle.modelVersion`.
+
+The kernel applies migrations without a manual migration step:
+
+- **On read**, if an atom is behind the model’s current version, the kernel chains the registered `migration` atoms from the atom’s version up to current and returns the current shape. Storage is unchanged.
+- **On the atom’s next write**, the migrated shape is persisted and `lifecycle.modelVersion` advances. This is copy-on-write applied to schema.
+- **A background sweep** reads and rewrites atoms behind the current version, in batches, until none remain.
+
+Migrations are immutable and forward-only: a published `migration` is never edited; a correction is a new `migration` to a higher version. The version chain is therefore reproducible, and an atom’s historical shape can be reconstructed.
+
+Two transform ops need no code: `op: "rename"` and `op: "default"` are executed by the kernel from `spec`. `op: "custom"` runs a registered handler named by `run` — the only case requiring deployed code.
+
+```json
+{
+  "id": "facility@1->2",
+  "model": "atom://migration",
+  "manifest": "Rename openedAt to commissionedAt on facility",
+  "attr": {
+    "model": "atom://facility",
+    "from": 1,
+    "to": 2,
+    "op": "rename",
+    "spec": {
+      "from": "openedAt",
+      "to": "commissionedAt"
+    }
+  },
+  "lifecycle": "atom://0"
+}
+```
+
+Read-time migration populates a field only on atoms that are read. A field that is filtered, sorted, searched, or billed on is trustworthy only after the sweep completes; until then, indexes cover migrated atoms only. Sweep such fields to completion before querying or billing on them. Do not derive billable or audited values on read — store them at write so they are indexable, logged, and frozen in time.
