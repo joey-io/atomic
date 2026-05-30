@@ -2,3 +2,4 @@ node_modules/
 .store/
 store/
 .env
+.claude/scheduled_tasks.lock
