@@ -207,6 +207,15 @@ for (const [name, category, room, owner] of things)
 //     rejects a grant that exceeds the issuer's), so he can never mint an admin;
 //   • create-only — `create` does not imply read, so he still can't GET /token
 //     to enumerate existing tokens. He can make members, not snoop on them.
+//
+// He CAN save reports: `index.* read + create` lets him browse the available
+// queries and define his own views of his data ("all electronics", "kids'
+// belongings"). An index grants nothing — when anyone runs it, runIndex filters
+// by THAT viewer's read grants + tenant, so a report Billy defines can only ever
+// return what Billy can already read. He gets read + create but NOT update/delete,
+// so he can't edit or remove the shared household indexes. His own indexes are
+// born into his tenant (the kernel forbids a non-superuser placing global), so
+// they stay private to his household and never clutter another tenant's nav.
 // ---------------------------------------------------------------------------
 const BILLY_GRANTS = [
   { path: 'house.**',     mode: 'read'   },
@@ -216,6 +225,8 @@ const BILLY_GRANTS = [
   { path: 'belonging.**', mode: 'all'    },
   { path: 'usage.**',     mode: 'all'    },
   { path: 'token.*',      mode: 'create' }, // invite household members (attenuated)
+  { path: 'index.*',      mode: 'read'   }, // browse reports/views
+  { path: 'index.*',      mode: 'create' }, // save his own (run under the viewer's grants)
 ];
 await token('billy', 'd', { email: 'j@a-gnt.com', login: 'open', grants: BILLY_GRANTS });
 
