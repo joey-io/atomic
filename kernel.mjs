@@ -682,9 +682,29 @@ function renderCrossTable(atoms) {
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
 
-function renderIndexPage(indexAtom, atoms, actor) {
+function renderIndexPage(indexAtom, atoms, actor, values = {}) {
   const over = refId(indexAtom.attr.over);
-  let body = over === 'atom' ? renderCrossTable(atoms) : renderTable(over, atoms);
+  const params = indexAtom.attr.params || {};
+  let form = '';
+  if (Object.keys(params).length) {
+    const rows = Object.entries(params).map(([name, def]) => {
+      const v = values[name] || '';
+      let input;
+      if (def.kind === 'enum')
+        input = `<select name="${esc(name)}"><option value="">—</option>${(def.values || []).map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+      else if (def.kind === 'ref' && def.to)
+        input = `<input name="${esc(name)}" list="refs-${esc(refId(def.to))}" value="${esc(v)}" placeholder="atom://…">`;
+      else
+        input = `<input name="${esc(name)}" data-kind="${esc(def.kind || 'text')}" value="${esc(v)}">`;
+      return `<tr><th>${esc(name)}</th><td>${input}</td></tr>`;
+    }).join('');
+    const targets = [...new Set(Object.values(params).filter((d) => d.kind === 'ref' && d.to).map((d) => refId(d.to)))];
+    const lists = targets.map((t) => `<datalist id="refs-${esc(t)}">${[...store.values()]
+      .filter((a) => a.model === ref(t) && a.lifecycle?.status !== 'retired' && visible(actor, a))
+      .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}</datalist>`).join('');
+    form = `<form method="get" action="/${esc(indexAtom.id)}"><div class="tw"><table class="form">${rows}</table></div><p><button>Run</button></p>${lists}</form>`;
+  }
+  let body = form + (over === 'atom' ? renderCrossTable(atoms) : renderTable(over, atoms));
   const pg = indexAtom.attr.page;
   if (pg && atoms.length) {
     const last = atoms[atoms.length - 1];
@@ -794,7 +814,7 @@ const server = http.createServer(async (req, res) => {
       let result;
       if (headAtom.model === 'atom://index') {
         const atoms = runIndex(headAtom, url.search, actor);
-        if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, actor), true);
+        if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
         result = atoms;
       } else if (headAtom.model === 'atom://model' && segs.length === 0) {
         const atoms = listModel(head, q, actor);
