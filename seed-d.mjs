@@ -187,23 +187,37 @@ for (const [name, category, room, owner] of things)
     { name, category, room: A(room), ...(owner ? { owner: A(owner) } : {}) }, name);
 
 // ---------------------------------------------------------------------------
-// Billy's access — Billy OWNS the house. His open-login token (one-click on the
-// homepage) gets FULL write, but only inside his own house's ref tree:
-//   • read  everything in his tenant (**),
-//   • update his house atom (house.**),
-//   • full create/update/delete on rooms, residents, belongings, usage —
-//     but every one of those writes is gated by a model write-rule (below) to
-//     atoms whose ref path resolves back to his house (atom://d-house).
-// The grant says WHICH OPS; the rule says WHICH ATOMS (the house ref tree).
+// Billy's access — Billy OWNS the house, and NOTHING else. His open-login token
+// (one-click on the homepage) is scoped to the five household models only:
+//   • read + update his house atom (house.**) — but not create/delete houses,
+//   • full create/update/delete on rooms, residents, belongings, usage.
+// Every write is further gated by a model write-rule (below) to atoms whose ref
+// path resolves back to his house (atom://d-house). The grant says WHICH OPS on
+// WHICH MODELS; the rule says WHICH ATOMS (the house ref tree).
+//
+// Deliberately NO blanket `**` read. A `**` read would let Billy read every
+// global atom — the `token` and `session` models are parented at atom://0, so
+// `visible()` shows them to everyone — i.e. he'd see joey's admin token and
+// every live session id (a bearer cookie). A household owner is a household
+// user, not an operator: he can't see tokens, sessions, or other tenants at all.
+//
+// He CAN invite household members: `token.* create` lets him mint a login (for
+// Robin, the kids) under his own tenant. Two guards keep this safe:
+//   • attenuation — any token he mints holds AT MOST his own grants (the kernel
+//     rejects a grant that exceeds the issuer's), so he can never mint an admin;
+//   • create-only — `create` does not imply read, so he still can't GET /token
+//     to enumerate existing tokens. He can make members, not snoop on them.
 // ---------------------------------------------------------------------------
-await token('billy', 'd', { email: 'j@a-gnt.com', login: 'open', grants: [
-  { path: '**',           mode: 'read'   },
+const BILLY_GRANTS = [
+  { path: 'house.**',     mode: 'read'   },
   { path: 'house.**',     mode: 'update' },
   { path: 'room.**',      mode: 'all'    },
   { path: 'resident.**',  mode: 'all'    },
   { path: 'belonging.**', mode: 'all'    },
   { path: 'usage.**',     mode: 'all'    },
-] });
+  { path: 'token.*',      mode: 'create' }, // invite household members (attenuated)
+];
+await token('billy', 'd', { email: 'j@a-gnt.com', login: 'open', grants: BILLY_GRANTS });
 
 // lockToHouse(): anchor Billy to his house, then install the graph-gated write
 // rules — run LAST, after all data exists. Once the rules are on, only a token
@@ -214,14 +228,7 @@ async function lockToHouse() {
   // anchor the root's `home` to itself, and Billy to the house. Re-assert Billy's
   // tree-scoped grants too — idempotent even if the token pre-existed broader.
   await patch('d-house', { home: A('d-house') });
-  await patch('billy', { house: A('d-house'), grants: [
-    { path: '**',           mode: 'read'   },
-    { path: 'house.**',     mode: 'update' },
-    { path: 'room.**',      mode: 'all'    },
-    { path: 'resident.**',  mode: 'all'    },
-    { path: 'belonging.**', mode: 'all'    },
-    { path: 'usage.**',     mode: 'all'    },
-  ] });
+  await patch('billy', { house: A('d-house'), grants: BILLY_GRANTS });
   // a write is allowed iff the atom's ref path resolves to the writer's house.
   // Rooms/residents link house directly; belongings and usage reach it through
   // their room; the house anchors on itself via `home`.
