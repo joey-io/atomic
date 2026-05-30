@@ -640,7 +640,7 @@ function page(title, body, fab) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <link rel="stylesheet" href="/style.css">
-<p>${fab || peerSelect([], '')}</p>
+<p>${fab || ''}</p>
 ${body}
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
@@ -764,24 +764,22 @@ if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:at
 </script>`;
 }
 
-// the FAB: a floating select of the current route's peers, plus a home option
-function peerSelect(peers, current) {
-  const opts = [`<option value="/">atom://0</option>`]
-    .concat(peers.map((p) => `<option value="/${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.id)} — ${esc(p.label)}</option>`)).join('');
-  return `<select onchange="if(this.value)location.href=this.value">${opts}</select>`;
+// the top nav: a select of the models and indexes the actor can reach, by id
+function navSelect(actor, current) {
+  const all = getStore(actor).all();
+  const opt = (a) => `<option value="/${esc(a.id)}"${a.id === current ? ' selected' : ''}>atom://${esc(a.id)}</option>`;
+  const models = all.filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map(opt).join('');
+  const indexes = all.filter((a) => a.model === 'atom://index' && (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over)))).map(opt).join('');
+  return `<select onchange="if(this.value)location.href=this.value"><option value="/">atom://0</option>`
+    + (models ? `<optgroup label="models">${models}</optgroup>` : '')
+    + (indexes ? `<optgroup label="indexes">${indexes}</optgroup>` : '')
+    + `</select>`;
 }
-// peers = siblings in the tree: atoms sharing this atom's parent, visible to the actor
-const peersOf = (atom, actor) => {
-  const parent = atom.lifecycle?.parent;
-  return getStore(actor).all()
-    .filter((a) => a.lifecycle?.parent === parent && a.lifecycle?.status !== 'retired')
-    .map((a) => ({ id: a.id, label: a.manifest || a.attr?.name || a.attr?.label || a.id }));
-};
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
-    renderForm(modelId, null, actor) + renderTable(modelId, atoms), peerSelect(peersOf(m, actor), modelId));
+    renderForm(modelId, null, actor) + renderTable(modelId, atoms), navSelect(actor, modelId));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -822,15 +820,40 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
     body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, peerSelect(peersOf(indexAtom, actor), indexAtom.id));
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, navSelect(actor, indexAtom.id));
+}
+
+// every place a ref to `target` appears in a value, with its dotted field path
+function findRefs(v, target, prefix) {
+  if (v === target) return [prefix || 'attr'];
+  if (Array.isArray(v)) return v.flatMap((x) => findRefs(x, target, prefix));
+  if (v && typeof v === 'object') return Object.entries(v).flatMap(([k, val]) => findRefs(val, target, prefix ? `${prefix}.${k}` : k));
+  return [];
+}
+// the ref map: everything in scope that references this atom (attr or lifecycle)
+function referencedBy(atom, actor) {
+  const target = ref(atom.id), out = [];
+  for (const a of getStore(actor).all()) {
+    if (a.id === atom.id || a.lifecycle?.status === 'retired') continue;
+    for (const via of findRefs(a.attr, target, '')) out.push({ id: a.id, model: refId(a.model), via, label: a.manifest || a.attr?.name || a.id });
+    for (const via of findRefs(a.lifecycle, target, '')) out.push({ id: a.id, model: refId(a.model), via: `lifecycle.${via}`, label: a.manifest || a.attr?.name || a.id });
+  }
+  return out;
+}
+function renderRefMap(rows) {
+  if (!rows.length) return '';
+  const head = ['referenced by', 'model', 'via'].map((c) => `<th>${esc(c)}</th>`).join('');
+  const body = rows.slice(0, 200).map((r) =>
+    `<tr><td><a href="/${esc(r.id)}">${esc(r.label)}</a></td><td>${atomValue('atom://' + r.model)}</td><td>${esc(r.via)}</td></tr>`).join('');
+  return `<p>referenced by — ${rows.length}</p><div class="tw"><table><tr>${head}</tr>${body}</table></div>`;
 }
 
 function renderAtom(atom, actor) {
   const modelId = refId(atom.model);
   // the UI mirrors the schema: render the whole atom — id, model, manifest,
-  // attr, lifecycle — through the same recursive component
-  const body = renderFields(atom) + renderForm(modelId, atom, actor);
-  return page(atom.manifest || atom.id, body, peerSelect(peersOf(atom, actor), atom.id));
+  // attr, lifecycle — then the ref map (everything that references it)
+  const body = renderFields(atom) + renderForm(modelId, atom, actor) + renderRefMap(referencedBy(atom, actor));
+  return page(atom.manifest || atom.id, body, navSelect(actor, refId(atom.model)));
 }
 
 // ---------------------------------------------------------------------------
@@ -909,7 +932,7 @@ const server = http.createServer(async (req, res) => {
       let body = renderFields(a);
       body += isAnon ? sessionForm()
         : `<p>signed in as ${atomValue(ref(actor.id))} · <a href="/auth/logout">sign out</a></p>`;
-      return send(200, page(a.manifest || 'atom://0', body, peerSelect(peersOf(a, actor), '')), true);
+      return send(200, page(a.manifest || 'atom://0', body, navSelect(actor, '')), true);
     }
     // no anonymous access beyond the root
     if (isAnon) {
@@ -922,7 +945,7 @@ const server = http.createServer(async (req, res) => {
       if (head === 'atom' && segs.length === 0) {
         const atoms = sortBy(getStore(actor).all().filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
           .map((a) => redact(actor, a));
-        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), peerSelect(peersOf(getAtom('0'), actor), '')), true);
+        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), navSelect(actor, '')), true);
         return send(200, atoms);
       }
       const headAtom = getAtom(head);

@@ -29,9 +29,9 @@ for (let i = 0; i < 3; i++) await atom('official', `c-off${i + 1}`, T, { name: `
 for (let i = 0; i < 3; i++) await atom('district', `c-d${i + 1}`, T, { name: `Ward ${i + 1}`, official: A(`c-off${i + 1}`) }, `Ward ${i + 1}`);
 for (let i = 0; i < 6; i++) await atom('advocate', `c-adv${i + 1}`, T, { name: `Member ${i + 1}`, district: A(`c-d${(i % 3) + 1}`) }, `Member ${i + 1}`);
 for (let i = 0; i < 12; i++) {
-  const adv = (i % 6) + 1, d = ((adv - 1) % 3) + 1;
+  const adv = (i % 6) + 1;
   await atom('story', `c-st${i + 1}`, T,
-    { title: `Member voice #${i + 1}`, body: `A member who also donates shared how the program changed things (#${i + 1}).`, advocate: A(`c-adv${adv}`), district: A(`c-d${d}`) },
+    { title: `Member voice #${i + 1}`, body: `A member who also donates shared how the program changed things (#${i + 1}).`, advocate: A(`c-adv${adv}`) },
     `Member voice #${i + 1}`);
 }
 

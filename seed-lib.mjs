@@ -52,6 +52,5 @@ export async function defineModels() {
   await model('story', 'Story', {
     title: { kind: 'text', required: true }, body: { kind: 'longtext' },
     advocate: { kind: 'ref', to: 'atom://advocate', inverse: 'stories' },
-    district: { kind: 'ref', to: 'atom://district' },
-  }, { display: { row: ['title', 'advocate', 'district'] } });
+  }, { display: { row: ['title', 'advocate'] } });
 }
