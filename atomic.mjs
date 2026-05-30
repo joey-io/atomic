@@ -686,6 +686,12 @@ function tenantOf(atom) {
 function visible(actor, atom) {
   if (isExpired(atom)) return false;          // lazy expiry: past its policy → invisible
   const at = tenantOf(atom), ut = tenantOf(actor);
+  // a tenant-less (global) TOKEN is a system credential, not shared reference data:
+  // only a superuser may see it. This keeps the root admin token from leaking to a
+  // tenant user who happens to hold a `token` read grant — global tokens shouldn't
+  // be world-visible the way the core models or shared reference atoms are. The one
+  // exception is atom://0, the public app descriptor every caller is meant to see.
+  if (atom.model === 'atom://token' && at === null && atom.id !== '0') return ut === null;
   return at === null || ut === null || at === ut;
 }
 
@@ -1278,9 +1284,16 @@ function runIndex(indexAtom, search, actor) {
   const all = over === 'atom';                 // pseudo-model atom://atom = every atom
   const params = new URLSearchParams(search);
   const match = indexAtom.attr.match || {};
-  let atoms = getStore(actor).all().filter((a) =>
-    readableAtom(actor, a) &&
-    (all ? a.model !== 'atom://log' : a.model === ref(over)));
+  // scope the scan to the index's model AND the actor's shards — the same
+  // index-backed lever listModel uses — instead of materializing every atom in
+  // scope just to drop all but one model. atom://atom legitimately spans every
+  // model, so it still reads the full in-scope set (sessions excluded by getStore).
+  const ut = tenantOf(actor);
+  const shards = ut === null ? null : ['_global', ut];
+  let atoms = (all
+    ? getStore(actor).all().filter((a) => a.model !== 'atom://log')
+    : store.query({ shards, model: ref(over) }).filter((a) => a.model !== 'atom://session' && visible(actor, a))
+  ).filter((a) => readableAtom(actor, a));
   for (const [field, cond] of Object.entries(match)) {
     if (typeof cond === 'string' && cond.startsWith('params.')) {
       const val = params.get(cond.slice('params.'.length));

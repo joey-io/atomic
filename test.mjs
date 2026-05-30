@@ -214,6 +214,13 @@ await J('joey', 'POST', '/role', { id: 'role-admin', attr: { label: 'Admin', gra
 ok(await code('tk-mid', 'POST', '/token', { attr: { email: 'r1@x.com', roles: ['atom://role-admin'] } }) === 403, 'attenuation: cannot wear a role exceeding own grants');
 ok(await code('tk-mid', 'POST', '/token', { attr: { email: 'r2@x.com', roles: ['atom://role-reader'] } }) === 201, 'attenuation: a role within own grants is allowed');
 
+// global system tokens are superuser-only: even a token-read grant can't surface
+// the root admin token to a tenant user (it isn't shared reference data).
+await mk('tk-tokread', 't1', [{ path: 'token.*', mode: 'read' }]);
+ok(await code('tk-tokread', 'GET', '/joey') === 404, 'tenant user with token-read cannot see the global admin token');
+ok(await code('tk-tokread', 'GET', '/joey.email') === 404, 'nor read its fields via a path');
+ok(await code('joey', 'GET', '/joey') === 200, 'a superuser still sees the admin token');
+
 // M2: retiring a token revokes its Bearer credential immediately.
 await mk('tk-revoke', 't1', [{ path: 'widget.*', mode: 'read' }]);
 ok(await code('tk-revoke', 'GET', '/widget') === 200, 'live token reads');
