@@ -114,7 +114,7 @@ An atom names its model with the `model` pointer. The kernel uses that pointer t
 
 - Scalars: `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`.
 - `ref`: a reference to a standalone atom. Declares `to` (target model) and optional `inverse`. Stored as a link to a separate record.
-- Containers: `list`, `map`, `json`.
+- Containers: `list` (item type declared with `of`, e.g. `of: embed://grant`), `map`, `json`.
 - Modifiers: `required`, `default`, `unique`, `filterable`, `sortable`.
 
 ## Kernel atoms
@@ -246,6 +246,8 @@ atom://openDeals?company=atom://northwind
 }
 ```
 
+An index may range over every atom with `over: atom://atom` — the universal type — and `sort` may name a `lifecycle` field such as `createdAt`. An index that declares `page: { cursor, limit }` is paginated with `?before=<cursor>&limit=<n>`. Two kernel indexes use this: `recent` (`over: atom://atom`, `sort: [{ createdAt: desc }]`, paginated) is the cross-model activity feed, and `atomLog` (`over: atom://log`, `match: { atom: params.atom }`) is one atom's full history.
+
 ## Rendering
 
 A client renders an atom from its model's field kinds. Each kind has a default rendering: `text` is a text cell, `enum` is a fixed set of values, `ref` is a link to another atom, `datetime` is a date, `boolean` is a toggle. No extra definition is needed to render or edit any atom.
@@ -259,6 +261,7 @@ The kernel exposes one address space. Every atom, model, and index is reachable 
 - `atom://<id>` — a single record. As data, the atom JSON. As UI, its detail view, rendered from the model's field kinds.
 - `atom://<model>` — a model. As data, the model definition. As UI, a table of every atom of that model, with an add form generated from the model's fields.
 - `atom://<index>?<params>` — runs the index. As data, the result set. As UI, a table or board of the matching atoms.
+- `atom://atom` — the universal type: every atom, newest first. `atom://0` (the root) is the app's own atom and the anonymous identity.
 
 Every model gets create, read, update, and delete endpoints and a matching add-and-edit form, generated from its fields. Every index gets a query endpoint and a table view. Every edge in a result is a link to the referenced atom. The model's `rules` apply to both data and UI, because both resolve through the same path. There is no code generation step and no separate API or UI definition. The surface is computed from the atoms on each request.
 
@@ -428,9 +431,9 @@ So `"lifecycle": "atom://0"` on a kernel atom means "created at genesis by `atom
 }
 ```
 
-### The app describes itself
+### The root is atom://0
 
-An unauthenticated caller — resolved to `atom://0` — gets the app's public self-description at the root: a JSON-LD document with the app's name, the catalog of types and indexes it offers, and how to authenticate. It is discovery, not data; reading records requires a session. Because `atom://0` holds no data grants, the catalog of types is public while the records are not.
+The root of the surface is `atom://0` itself. `GET /` returns the `atom://0` atom; rendered, it shows that atom's fields (its name and description) like any other record. The homepage is not special-cased — it is the root atom, drawn by the same machinery as every atom. `atom://0` is world-readable, so an unauthenticated caller sees the app's address and description but, holding no data grants, no records. A signed-out browser is offered a form to create a session; reading data requires one.
 
 ### Attenuation
 
@@ -459,6 +462,8 @@ A grant gives a token access to a ref — a model, an index, or a single attribu
 - A grant is `{ "path": "<path>", "mode": "read" | "create" | "update" | "delete" | "write" }`. The mode is the operation, and the HTTP method selects it: `GET`→read, `POST`→create, `PUT`/`PATCH`→update, `DELETE`→delete. `write` is the mutation superset, and any grant implies read.
 - `*` matches one segment. `**` matches any number.
 - The path is an ordinary path, so a grant can name a model (`contact.*`), an index (`openDeals`), or reach across edges.
+
+A grant is itself a model (`{ path, mode }`), and `token.grants` is a `list` of `embed://grant`. Because the grant shape is declared, the kernel renders the grants editor as a repeater of path + mode rows — the auth schema edited through the same generated form as any other data.
 
 |Grant path          |Covers                                          |
 |--------------------|------------------------------------------------|
@@ -968,3 +973,7 @@ Atom CRUD is the ledger. Every create, update, and delete appends one `log` atom
 ```
 
 The actor on the entry is the outreach token, so every atom the integration creates is attributable to it. A later reader still sees `email` only if their own grants allow it; the writer's grant does not widen anyone else's read.
+
+## Reference kernel
+
+`kernel.mjs` is a minimal, dependency-free implementation of this spec — run it with `node kernel.mjs` (Node ≥ 18). It is an in-memory teaching kernel: atoms, models that validate `attr`, the `atom://0`←`atom://joey` genesis, CRUD over HTTP (`GET`/`POST`/`PUT`/`PATCH`/`DELETE`), path/edge/inverse resolution, ad-hoc queries and stored indexes, tokens with method-based grants and attribute redaction, magic-link sessions, the append-only log, and a surface that renders every atom from its model — root included. It leaves the deeper spec (rule predicates, migrations) as `TODO`.
