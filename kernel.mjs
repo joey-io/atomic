@@ -191,6 +191,31 @@ function findByIdentity(modelId, attr, modelAtom) {
 
 const magic = new Map(); // one-time sign-in codes: code -> { token, exp }
 
+// Magic-link delivery via SendGrid. The key is read from the environment
+// (ATOMIC reuses MondayDraft's SendGrid in our env); unset -> dev fallback
+// that shows the link instead of emailing it.
+const SENDGRID = process.env.SENDGRID_API_KEY || null;
+const MAIL_FROM = process.env.ATOMIC_MAIL_FROM || 'hello@mondaydraft.com';
+async function sendMagicLink(to, link) {
+  if (!SENDGRID) return false;
+  try {
+    const r = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + SENDGRID, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: MAIL_FROM, name: 'Atomic' },
+        subject: 'Your Atomic sign-in link',
+        content: [
+          { type: 'text/plain', value: `Sign in to Atomic:\n${link}\n\nThis link expires in 15 minutes.` },
+          { type: 'text/html', value: `<p>Sign in to Atomic:</p><p><a href="${link}">${link}</a></p><p>Expires in 15 minutes.</p>` },
+        ],
+      }),
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
 function parseCookies(req) {
   const out = {};
   for (const part of (req.headers.cookie || '').split(';')) {
@@ -646,11 +671,8 @@ function renderTable(modelId, atoms) {
 
 // a form to create a session (sign in) — a session is itself an atom
 function sessionForm() {
-  return `<p><button data-email="joey@emailjoey.com">joey@emailjoey.com (admin)</button></p>
-<form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com"> <button>send magic link</button></p></form>
-<script>document.querySelectorAll('button[data-email]').forEach(function(b){b.onclick=async function(){
-var r=await fetch('/auth',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:b.dataset.email})});
-var j=await r.json();if(j.link){location.href=j.link;}else{alert(j.error||'no token');}};});</script>`;
+  return `<form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com" required> <button>send magic link</button></p></form>
+<p><small>a one-time sign-in link is emailed to a registered token's address</small></p>`;
 }
 
 // one form generated from the model's field kinds, with a method picker built
@@ -856,10 +878,11 @@ const server = http.createServer(async (req, res) => {
       const code = randomUUID();
       magic.set(code, { token: tok.id, exp: Date.now() + 15 * 60000 });
       const link = `${origin}/auth/verify?code=${code}`;
-      if (wantsHtml) return send(200, page('Check your email',
-        `<p>Magic link for <code>${esc(email)}</code> — normally emailed, shown here for the demo:</p>
-<p><a href="${link}">${esc(link)}</a></p>`), true);
-      return send(200, { link });
+      const sent = await sendMagicLink(email, link);
+      if (wantsHtml) return send(200, page('Check your email', sent
+        ? `<p>A sign-in link was emailed to <code>${esc(email)}</code>. It expires in 15 minutes.</p>`
+        : `<p>Email is not configured — use this link:</p><p><a href="${link}">${esc(link)}</a></p>`), true);
+      return send(200, sent ? { sent: true } : { link });
     }
     if (req.method === 'GET' && path === 'auth/verify') {
       const code = url.searchParams.get('code');
