@@ -20,6 +20,9 @@ export async function model(id, label, fields, extra = {}) {
 export async function tenant(id, name) {
   okOrExists(await api('POST', '/tenant', { id, manifest: name, attr: { name } }), `tenant ${id}`);
 }
+export async function token(id, parent, attr) {
+  okOrExists(await api('POST', '/token', { id, parent: 'atom://' + parent, attr }), `token ${id}`);
+}
 export async function index(id, label, over, params, match, sort) {
   okOrExists(await api('POST', '/index', { id, manifest: label, attr: { label, over, params, match, sort, returns: 'set' } }), `index ${id}`);
 }

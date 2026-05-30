@@ -1,9 +1,12 @@
 // Demo B — an advocacy program: stories shared by advocates from districts that
 // each reference an elected official. Run: node seed-b.mjs
-import { tenant, defineModels, atom, A } from './seed-lib.mjs';
+import { tenant, defineModels, atom, token, A } from './seed-lib.mjs';
 
 await defineModels();
 await tenant('b', 'Demo B — Advocacy');
+
+// CapConnect: a one-click (open) login that can write only the advocate model
+await token('capconnect', 'b', { email: 'capconnect@emailjoey.com', login: 'open', grants: [{ path: 'advocate.*', mode: 'write' }] });
 
 const T = 'b';
 const offices = ['Mayor', 'State Senator', 'US Representative', 'City Council', 'Governor'];

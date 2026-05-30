@@ -674,7 +674,9 @@ function renderTable(modelId, atoms) {
 
 // a form to create a session (sign in) — a session is itself an atom
 function sessionForm() {
-  return `<form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com" required> <button>send magic link</button></p></form>
+  const open = [...store.values()].filter((a) => a.model === 'atom://token' && a.attr.login === 'open');
+  const buttons = open.map((t) => `<button onclick="location.href='/auth/open?token=${esc(t.id)}'">${esc(t.attr.email || t.id)}</button>`).join(' ');
+  return `${open.length ? `<p>${buttons}</p>` : ''}<form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com" required> <button>send magic link</button></p></form>
 <p><small>a one-time sign-in link is emailed to a registered token's address</small></p>`;
 }
 
@@ -918,6 +920,12 @@ const server = http.createServer(async (req, res) => {
       const sid = newSession(rec.token);
       return redirect('/', `atomic_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`);
     }
+    if (req.method === 'GET' && path === 'auth/open') {
+      const id = url.searchParams.get('token');
+      const t = id && store.get(id);
+      if (!t || t.model !== 'atom://token' || t.attr.login !== 'open') return send(403, { error: 'not an open-login token' });
+      return redirect('/', `atomic_session=${newSession(t.id)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`);
+    }
     if (req.method === 'GET' && path === 'auth/logout') {
       const sid = cookies['atomic_session'];
       if (sid && store.has(sid)) store.get(sid).lifecycle.status = 'retired';
@@ -1008,7 +1016,8 @@ function bootstrap() {
   // core model definitions (the kernel's own types are model atoms)
   model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
     indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } });
-  model('token',  'Token',  { email: { kind: 'email' }, grants: { kind: 'list', of: 'embed://grant' } });
+  model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
+    grants: { kind: 'list', of: 'embed://grant' } });
   model('grant',  'Grant',  { path: { kind: 'text', required: true },
     mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write'] } });
   model('tenant', 'Tenant', { name: { kind: 'text', required: true } });
