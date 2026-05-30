@@ -228,6 +228,16 @@ A client renders an atom from its model's field kinds. Each kind has a default r
 
 A model may add an optional `display` attr to curate the default: which fields appear, in what order, and how they group. `row` curates tables, `detail` curates a single record, `board` groups records into columns. `display` is a hint. When it is absent, the client renders from field kinds. A dashboard is a set of saved indexes plus optional display hints.
 
+## Surface
+
+The kernel exposes one address space. Every atom, model, and index is reachable by its `atom://` reference. A reference is both an API endpoint and a UI route. The kernel returns the same resource as data or as a rendered view, depending on the request.
+
+- `atom://<id>` — a single record. As data, the atom JSON. As UI, its detail view, rendered from the model's field kinds.
+- `atom://<model>` — a model. As data, the model definition. As UI, a table of every atom of that model, with an add form generated from the model's fields.
+- `atom://<index>?<params>` — runs the index. As data, the result set. As UI, a table or board of the matching atoms.
+
+Every model gets create, read, update, and delete endpoints and a matching add-and-edit form, generated from its fields. Every index gets a query endpoint and a table view. Every edge in a result is a link to the referenced atom. The model's `rules` apply to both data and UI, because both resolve through the same path. There is no code generation step and no separate API or UI definition. The surface is computed from the atoms on each request.
+
 ## Correctness
 
 **Identity and deduplication.** On create, the kernel checks the model's `identity` indexes. If a record with the same key exists, the write is merged into it (per `behavior.merge`) instead of inserting a duplicate. The `id` is not used for matching. By default `id` is a generated surrogate. `behavior.addressing: content` derives `id` from the identity key and is allowed only for immutable, single-key models.
