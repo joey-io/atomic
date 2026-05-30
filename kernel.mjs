@@ -125,14 +125,33 @@ function validate(modelId, attr) {
   return out;
 }
 
+// semantic string formats, like Zod's z.string().email() / .url() / .uuid()
+const FORMATS = {
+  email: /^[^@\s]+@[^@\s]+\.[^@\s]+$/,
+  url: /^https?:\/\/\S+$/i,
+  uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+};
 function checkKind(key, def, val) {
   const fail = (want) => { throw new Err(400, `field "${key}" must be ${want}`); };
+  const str = () => { if (typeof val !== 'string') fail('text'); };
+  const len = () => {
+    if (def.minLength != null && val.length < def.minLength) fail(`at least ${def.minLength} characters`);
+    if (def.maxLength != null && val.length > def.maxLength) fail(`at most ${def.maxLength} characters`);
+    if (def.pattern && !new RegExp(def.pattern).test(val)) fail(`to match ${def.pattern}`);
+  };
+  const range = () => {
+    if (def.min != null && val < def.min) fail(`>= ${def.min}`);
+    if (def.max != null && val > def.max) fail(`<= ${def.max}`);
+  };
   switch (def.kind) {
-    case 'text': case 'longtext': if (typeof val !== 'string') fail('text'); break;
-    case 'integer': if (!Number.isInteger(val)) fail('an integer'); break;
-    case 'number': if (typeof val !== 'number') fail('a number'); break;
+    case 'text': case 'longtext': str(); len(); break;
+    case 'email': str(); if (!FORMATS.email.test(val)) fail('an email'); break;
+    case 'url': str(); if (!FORMATS.url.test(val)) fail('a URL'); break;
+    case 'uuid': str(); if (!FORMATS.uuid.test(val)) fail('a UUID'); break;
+    case 'integer': if (!Number.isInteger(val)) fail('an integer'); range(); break;
+    case 'number': if (typeof val !== 'number') fail('a number'); range(); break;
     case 'boolean': if (typeof val !== 'boolean') fail('a boolean'); break;
-    case 'datetime': if (typeof val !== 'string') fail('a datetime string'); break;
+    case 'datetime': str(); if (isNaN(Date.parse(val))) fail('a datetime'); break;
     case 'enum': if (!def.values?.includes(val)) fail(`one of ${def.values?.join(', ')}`); break;
     case 'ref': if (!isRef(val)) fail('an atom:// reference'); break;
     case 'list': if (!Array.isArray(val)) fail('a list'); break;
@@ -240,6 +259,24 @@ const canTouch = (actor, name) =>
   grantsOf(actor).some((x) => { const s = x.path.split('.')[0]; return s === name || s === '*' || s === '**'; });
 const canRead = (actor, target) => allows(actor, target, 'read');
 
+// the tenant is the parent atom: an atom's tenant is its nearest tenant ancestor
+// (walk lifecycle.parent). Global atoms (the core models) have none.
+function tenantOf(atom) {
+  let cur = atom;
+  for (let hops = 0; cur && hops < 8; hops++) {
+    if (cur.model === 'atom://tenant') return cur.id;
+    const p = cur.lifecycle?.parent;
+    if (!isRef(p) || refId(p) === cur.id) return null;
+    cur = store.get(refId(p));
+  }
+  return null;
+}
+// a global atom is visible to all; otherwise the actor must share its tenant
+function visible(actor, atom) {
+  const at = tenantOf(atom), ut = tenantOf(actor);
+  return at === null || ut === null || at === ut;
+}
+
 function redact(actor, atom) {
   if (atom.id === '0') return atom; // the public root atom — the address everyone sees
   const modelId = refId(atom.model);
@@ -305,6 +342,7 @@ function create(modelId, body, actor) {
       status: 'active', version: 1,
       modelVersion: modelAtom.attr.version || 1,
       createdAt: now(), createdBy: ref(actor.id),
+      parent: ref(tenantOf(actor) || '0'), // born into the creator's tenant
     },
   };
   seed(atom);
@@ -315,6 +353,7 @@ function create(modelId, body, actor) {
 
 function update(id, body, actor, ifMatch) {
   const atom = getAtom(id);
+  if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
   if (!fields.every((f) => allows(actor, `${modelId}.${f}`, 'update')))
@@ -335,6 +374,7 @@ function update(id, body, actor, ifMatch) {
 // id and provenance (createdAt/createdBy). PATCH merges; PUT replaces.
 function replace(id, body, actor, ifMatch) {
   const atom = getAtom(id);
+  if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
   if (!fields.every((f) => allows(actor, `${modelId}.${f}`, 'update')))
@@ -352,6 +392,7 @@ function replace(id, body, actor, ifMatch) {
 
 function retire(id, actor) {
   const atom = getAtom(id);
+  if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
   if (!canOp(actor, refId(atom.model), 'delete'))
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   atom.lifecycle.status = 'retired';
@@ -404,7 +445,7 @@ function sortBy(atoms, sort) {
 
 function listModel(modelId, q, actor) {
   let atoms = [...store.values()].filter(
-    (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired');
+    (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired' && visible(actor, a));
   for (const f of q.filters) atoms = atoms.filter((a) => passes(a, f));
   atoms = sortBy(atoms, q.sort);
   return atoms.map((a) => redact(actor, a));
@@ -416,7 +457,7 @@ function runIndex(indexAtom, search, actor) {
   const params = new URLSearchParams(search);
   const match = indexAtom.attr.match || {};
   let atoms = [...store.values()].filter((a) =>
-    a.lifecycle?.status !== 'retired' &&
+    a.lifecycle?.status !== 'retired' && visible(actor, a) &&
     (all ? a.model !== 'atom://log' : a.model === ref(over)));
   for (const [field, cond] of Object.entries(match)) {
     if (typeof cond === 'string' && cond.startsWith('params.')) {
@@ -644,7 +685,7 @@ function renderAtom(atom, actor) {
   const modelId = refId(atom.model);
   const body = `<p>id <code>${esc(atom.id)}</code> · model ${atomValue(atom.model)} · v${atom.lifecycle?.version ?? ''} · ${esc(atom.lifecycle?.status || '')}</p>`
     + renderFields(atom.attr || {}) + renderForm(modelId, atom, actor);
-  const peers = [...store.values()].filter((a) => a.model === atom.model && a.lifecycle?.status !== 'retired')
+  const peers = [...store.values()].filter((a) => a.model === atom.model && a.lifecycle?.status !== 'retired' && visible(actor, a))
     .map((a) => ({ id: a.id, label: a.manifest || a.attr?.name || a.id }));
   return page(atom.manifest || atom.id, body, peerSelect(peers, atom.id));
 }
@@ -731,7 +772,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET') {
       // atom://atom is the universal type — every atom, newest first
       if (head === 'atom' && segs.length === 0) {
-        const atoms = sortBy([...store.values()].filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
+        const atoms = sortBy([...store.values()].filter((a) => a.lifecycle?.status !== 'retired' && visible(actor, a)), '-createdAt')
           .map((a) => redact(actor, a));
         if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), peerSelect(modelPeers(actor), '')), true);
         return send(200, atoms);
@@ -749,6 +790,7 @@ const server = http.createServer(async (req, res) => {
         result = atoms;
       } else if (segs.length) result = traverse(headAtom, segs);
       else {
+        if (!visible(actor, headAtom)) throw new Err(404, `no atom ${head}`);
         const a = redact(actor, headAtom);
         if (wantsHtml) return send(200, renderAtom(a, actor), true);
         result = a;
@@ -773,7 +815,7 @@ const server = http.createServer(async (req, res) => {
 // ---------------------------------------------------------------------------
 
 function bootstrap() {
-  const lc = (by) => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), createdBy: ref(by) });
+  const lc = (by, parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), createdBy: ref(by), parent: ref(parent) });
   const model = (id, label, fields, extra = {}) => seed({
     id, model: 'atom://model', manifest: label,
     attr: { label, version: 1, fields, ...extra }, lifecycle: lc('0'),
@@ -792,7 +834,7 @@ function bootstrap() {
   // core model definitions (the kernel's own types are model atoms)
   model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
     indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } });
-  model('token',  'Token',  { email: { kind: 'text' }, tenant: { kind: 'ref', to: 'atom://tenant' },
+  model('token',  'Token',  { email: { kind: 'email' },
     team: { kind: 'ref', to: 'atom://team' }, grants: { kind: 'list', of: 'embed://grant' } });
   model('grant',  'Grant',  { path: { kind: 'text', required: true },
     mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write'] } });
@@ -817,7 +859,7 @@ function bootstrap() {
   model('address', 'Address', { street: { kind: 'text' }, city: { kind: 'text' },
     state: { kind: 'text' }, zip: { kind: 'text' }, country: { kind: 'text', default: 'US' } });
   model('contact', 'Contact', {
-    name: { kind: 'text', required: true }, email: { kind: 'text' }, title: { kind: 'text' },
+    name: { kind: 'text', required: true }, email: { kind: 'email' }, title: { kind: 'text' },
     company: { kind: 'ref', to: 'atom://company', inverse: 'contacts' },
   }, { indexes: { byEmail: { on: ['email'], role: 'identity' } }, display: { row: ['name', 'title', 'company'] } });
   model('deal', 'Deal', {
@@ -844,27 +886,27 @@ function bootstrap() {
   seed({ id: 'acme', model: 'atom://tenant', manifest: 'Acme, Inc.', attr: { name: 'Acme, Inc.' }, lifecycle: lc('0') });
   seed({ id: 'team-west', model: 'atom://team', manifest: 'West team', attr: { name: 'West' }, lifecycle: lc('0') });
   seed({ id: 'tok-amy', model: 'atom://token', manifest: 'Amy Chen',
-    attr: { email: 'amy@acme.com', tenant: 'atom://acme', team: 'atom://team-west',
-      grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('0') });
+    attr: { email: 'amy@acme.com', team: 'atom://team-west',
+      grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('0', 'acme') });
   seed({ id: 'tok-read', model: 'atom://token', manifest: 'Read-limited viewer',
-    attr: { email: 'view@acme.com', tenant: 'atom://acme',
-      grants: [{ path: 'contact.name', mode: 'read' }, { path: 'contact.title', mode: 'read' }] }, lifecycle: lc('0') });
+    attr: { email: 'view@acme.com',
+      grants: [{ path: 'contact.name', mode: 'read' }, { path: 'contact.title', mode: 'read' }] }, lifecycle: lc('0', 'acme') });
   seed({ id: 'tok-outreach', model: 'atom://token', manifest: 'Outreach integration',
-    attr: { tenant: 'atom://acme', grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy') });
+    attr: { grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy', 'acme') });
   // demo records — so the live instance has data to navigate (in-memory: reseeded each start)
   seed({ id: 'northwind', model: 'atom://company', manifest: 'Northwind Traders, enterprise account',
     attr: { name: 'Northwind Traders', domain: 'northwind.com',
       hq: { street: '500 Market St', city: 'Seattle', state: 'WA', zip: '98101', country: 'US' },
-      owner: 'atom://tok-amy', tier: 'enterprise' }, lifecycle: lc('tok-amy') });
+      owner: 'atom://tok-amy', tier: 'enterprise' }, lifecycle: lc('tok-amy', 'acme') });
   seed({ id: 'jane', model: 'atom://contact', manifest: 'Jane Roe, VP Eng at Northwind',
     attr: { name: 'Jane Roe', email: 'jane@northwind.com', title: 'VP Engineering', company: 'atom://northwind' },
-    lifecycle: lc('tok-amy') });
+    lifecycle: lc('tok-amy', 'acme') });
   seed({ id: 'john', model: 'atom://contact', manifest: 'John Vega, CFO at Northwind',
     attr: { name: 'John Vega', email: 'john@northwind.com', title: 'CFO', company: 'atom://northwind' },
-    lifecycle: lc('tok-amy') });
+    lifecycle: lc('tok-amy', 'acme') });
   seed({ id: 'deal-9001', model: 'atom://deal', manifest: 'Northwind platform expansion',
     attr: { name: 'Platform expansion', amount: 120000, stage: 'qualified', company: 'atom://northwind', owner: 'atom://tok-amy' },
-    lifecycle: lc('tok-amy') });
+    lifecycle: lc('tok-amy', 'acme') });
 
   buildInverse();
 
