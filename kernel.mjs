@@ -799,7 +799,7 @@ function renderForm(modelId, atom, actor) {
     const sm = getAtom(subId);
     const rows = Object.entries(sm.attr.fields || {})
       .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(name + '.' + k, def, obj?.[k])}</td></tr>`).join('');
-    return `<table>${rows}</table>`;
+    return `<figure><table>${rows}</table></figure>`;
   }
   function repeater(name, ofDef, arr) {
     const items = arr.length ? arr : [undefined];
