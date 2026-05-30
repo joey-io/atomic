@@ -564,18 +564,20 @@ function renderForm(modelId, atom, actor) {
       return `<select name="${esc(k)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
     if (def.kind === 'boolean')
       return `<input type="checkbox" name="${esc(k)}"${v ? ' checked' : ''}>`;
-    if (def.kind === 'ref' && def.to) {
-      const opts = [...store.values()]
-        .filter((a) => a.model === def.to && a.lifecycle?.status !== 'retired')
-        .map((a) => `<option value="atom://${esc(a.id)}"${'atom://' + a.id === v ? ' selected' : ''}>${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('');
-      return `<select name="${esc(k)}" data-kind="ref"><option value="">—</option>${opts}</select>`;
-    }
+    if (def.kind === 'ref')
+      return `<input name="${esc(k)}" data-kind="ref" list="refs" value="${v === undefined ? '' : esc(v)}" placeholder="atom://… or embed://…">`;
     if (def.kind === 'json' || def.kind === 'map' || def.kind === 'list') return json(k, v);
-    const type = (def.kind === 'integer' || def.kind === 'number') ? 'number' : 'text';
-    return `<input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}" value="${v === undefined ? '' : esc(v)}">`;
+    if (def.kind === 'integer' || def.kind === 'number')
+      return `<input type="number" name="${esc(k)}" data-kind="${esc(def.kind)}" value="${v === undefined ? '' : esc(v)}">`;
+    // any other value: free text, but autocompletes atom:// / embed:// so it can be a ref too
+    return `<input type="text" name="${esc(k)}" data-kind="${esc(def.kind)}" list="refs" value="${v === undefined ? '' : esc(v)}">`;
   };
   const fieldRows = Object.entries(m.attr.fields || {})
     .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(k, def, cur[k])}</td></tr>`).join('');
+  // autocomplete source: every atom (atom://) and every model (embed://)
+  const suggest = `<datalist id="refs">${[...store.values()].filter((a) => a.lifecycle?.status !== 'retired')
+    .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}${[...store.values()]
+    .filter((a) => a.model === 'atom://model').map((a) => `<option value="embed://${esc(a.id)}">`).join('')}</datalist>`;
   // the methods this actor may run here, from its grants (the auth schema)
   const methods = [];
   if (!editing && canOp(actor, modelId, 'create')) methods.push('POST');
@@ -590,7 +592,7 @@ function renderForm(modelId, atom, actor) {
     + `<tr><th>model</th><td><code>atom://${esc(modelId)}</code></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
   return `<h1>${editing ? 'Edit' : 'New ' + esc(m.attr.label || modelId)}</h1>
-<form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p></form>
+<form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p>${suggest}</form>
 <script>
 var createUrl=${JSON.stringify('/' + modelId)}, atomUrl=${JSON.stringify(editing ? '/' + atom.id : '')};
 document.getElementById('f').onsubmit=async function(e){e.preventDefault();
