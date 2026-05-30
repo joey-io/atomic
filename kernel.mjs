@@ -486,11 +486,12 @@ form table td{width:100%}form .tw{display:inline-block;border:0}
 .list{display:block}.item{border:1px solid #eee;border-radius:4px;padding:4px 6px;margin:3px 0}
 table.form.sub{margin:0;border:0}.addItem{margin-top:4px}
 .fab{position:fixed;left:50%;bottom:1rem;transform:translateX(-50%);z-index:9;
-text-decoration:none;font-size:1.6rem;line-height:1;background:#111;color:#fff;
-width:3rem;height:3rem;border-radius:50%;display:flex;align-items:center;justify-content:center;
-box-shadow:0 2px 8px rgba(0,0,0,.25)}.fab:hover{background:#000}body{padding-bottom:5rem}</style>
-<h1>${esc(title)}</h1>${body}
-<a class="fab" href="/" title="Atomic — home">⚛</a>
+text-decoration:none;line-height:1;background:#111;color:#fff;border-radius:999px;
+max-width:90vw;display:flex;align-items:center;gap:.5rem;padding:.6rem 1.1rem;
+box-shadow:0 2px 8px rgba(0,0,0,.25)}.fab:hover{background:#000}
+.fab .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}body{padding-bottom:5rem}</style>
+${body}
+<a class="fab" href="/" title="Atomic — home">⚛ <span class="t">${esc(title)}</span></a>
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
