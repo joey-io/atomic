@@ -479,11 +479,15 @@ td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap}
 th{background:#f6f6f6;cursor:pointer;user-select:none}th:hover{background:#ececec}
 th[data-dir="1"]::after{content:" \\2191"}th[data-dir="-1"]::after{content:" \\2193"}
 h1{font-size:1.1rem}code{background:#f3f3f3;padding:1px 4px;border-radius:3px}
-input,select{font:inherit;padding:2px 4px}</style>
+input,select,textarea{font:inherit;padding:2px 4px}textarea{width:100%;min-width:22rem;resize:vertical}
+form table th{text-align:right;background:none;cursor:default;color:#555;font-weight:normal}
+form table th:hover{background:none}form table th::after{content:""}
+form table td{width:100%}form .tw{display:inline-block;border:0}</style>
 <h1><a href="/" style="text-decoration:none;color:inherit" title="Atomic">⚛</a> ${esc(title)}</h1>${body}
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
+ if(t.closest('form'))return;
  t.querySelectorAll('th').forEach(function(th,ci){
   th.addEventListener('click',function(){
    var dir=th.getAttribute('data-dir')==='1'?-1:1;
@@ -547,63 +551,73 @@ document.querySelectorAll('button[data-email]').forEach(function(b){
 </script>`);
 }
 
-// a form generated from the model's field kinds. Create (POST /model) when no
-// atom is given; edit (PATCH /id) when one is. Includes id, model, manifest.
-function renderForm(modelId, atom) {
+// one form generated from the model's field kinds, with a method picker built
+// from the actor's grants (the auth schema). Submit runs the chosen method.
+function renderForm(modelId, atom, actor) {
   const m = getAtom(modelId);
   const editing = !!atom;
   const cur = atom?.attr || {};
-  const inputs = Object.entries(m.attr.fields || {})
-    .filter(([, d]) => typeof d === 'object')
-    .map(([k, def]) => {
-      const v = cur[k];
-      if (def.kind === 'enum')
-        return `<p><label>${esc(k)} <select name="${esc(k)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select></label></p>`;
-      if (def.kind === 'boolean')
-        return `<p><label><input type="checkbox" name="${esc(k)}"${v ? ' checked' : ''}> ${esc(k)}</label></p>`;
-      if (def.kind === 'ref' && def.to) {
-        const opts = [...store.values()]
-          .filter((a) => a.model === def.to && a.lifecycle?.status !== 'retired')
-          .map((a) => `<option value="atom://${esc(a.id)}"${'atom://' + a.id === v ? ' selected' : ''}>${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('');
-        return `<p><label>${esc(k)} <select name="${esc(k)}" data-kind="ref"><option value="">—</option>${opts}</select></label></p>`;
-      }
-      const type = (def.kind === 'integer' || def.kind === 'number') ? 'number' : 'text';
-      return `<p><label>${esc(k)} <input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}" value="${v === undefined ? '' : esc(v)}"></label></p>`;
-    }).join('');
-  const idRow = editing
-    ? `<p>id <code>${esc(atom.id)}</code> · model <code>atom://${esc(modelId)}</code></p>`
-    : `<p><label>id <input name="$id" placeholder="auto"></label> &nbsp; model <code>atom://${esc(modelId)}</code></p>`;
-  const manifestRow = `<p><label>manifest <input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></label></p>`;
-  const method = editing ? 'PATCH' : 'POST';
-  const url = editing ? `/${atom.id}` : `/${modelId}`;
-  return `<h1>${editing ? 'Edit' : 'Add ' + esc(m.attr.label || modelId)}</h1>
-<form id="f">${idRow}${manifestRow}${inputs}<button>${editing ? 'Save' : 'Create'}</button></form>
+  const json = (k, v) => `<textarea name="${esc(k)}" data-kind="json" rows="3">${v === undefined ? '' : esc(JSON.stringify(v, null, 2))}</textarea>`;
+  const control = (k, def, v) => {
+    if (typeof def === 'string') return json(k, v); // embed://x — an atom inside an atom
+    if (def.kind === 'enum')
+      return `<select name="${esc(k)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+    if (def.kind === 'boolean')
+      return `<input type="checkbox" name="${esc(k)}"${v ? ' checked' : ''}>`;
+    if (def.kind === 'ref' && def.to) {
+      const opts = [...store.values()]
+        .filter((a) => a.model === def.to && a.lifecycle?.status !== 'retired')
+        .map((a) => `<option value="atom://${esc(a.id)}"${'atom://' + a.id === v ? ' selected' : ''}>${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('');
+      return `<select name="${esc(k)}" data-kind="ref"><option value="">—</option>${opts}</select>`;
+    }
+    if (def.kind === 'json' || def.kind === 'map' || def.kind === 'list') return json(k, v);
+    const type = (def.kind === 'integer' || def.kind === 'number') ? 'number' : 'text';
+    return `<input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}" value="${v === undefined ? '' : esc(v)}">`;
+  };
+  const fieldRows = Object.entries(m.attr.fields || {})
+    .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(k, def, cur[k])}</td></tr>`).join('');
+  // the methods this actor may run here, from its grants (the auth schema)
+  const methods = [];
+  if (!editing && canOp(actor, modelId, 'create')) methods.push('POST');
+  if (editing && canOp(actor, modelId, 'update')) methods.push('PATCH', 'PUT');
+  if (editing && canOp(actor, modelId, 'delete')) methods.push('DELETE');
+  if (!methods.length) return '';
+  const LABEL = { POST: 'POST · create', PUT: 'PUT · replace', PATCH: 'PATCH · update', DELETE: 'DELETE · delete' };
+  const methodRow = `<tr><th>method</th><td><select name="$method">${methods.map((x) => `<option value="${x}">${esc(LABEL[x])}</option>`).join('')}</select></td></tr>`;
+  const idRows = (editing
+    ? `<tr><th>id</th><td><code>${esc(atom.id)}</code></td></tr>`
+    : `<tr><th>id</th><td><input name="$id" placeholder="auto"></td></tr>`)
+    + `<tr><th>model</th><td><code>atom://${esc(modelId)}</code></td></tr>`;
+  const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
+  return `<h1>${editing ? 'Edit' : 'New ' + esc(m.attr.label || modelId)}</h1>
+<form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p></form>
 <script>
-document.getElementById('f').onsubmit=async function(e){e.preventDefault();var body={},attr={};
-e.target.querySelectorAll('[name]').forEach(function(el){var n=el.name;
+var createUrl=${JSON.stringify('/' + modelId)}, atomUrl=${JSON.stringify(editing ? '/' + atom.id : '')};
+document.getElementById('f').onsubmit=async function(e){e.preventDefault();
+var method=e.target.querySelector('[name="$method"]').value;
+var url=method==='POST'?createUrl:atomUrl;
+var opts={method:method,headers:{'content-type':'application/json'}};
+if(method==='DELETE'){if(!confirm('Delete '+atomUrl+'?'))return;}
+else{var body={},attr={},bad=null;
+ e.target.querySelectorAll('[name]').forEach(function(el){var n=el.name;
+  if(n==='$method')return;
   if(n==='$id'){if(el.value)body.id=el.value;return;}
   if(n==='$manifest'){body.manifest=el.value;return;}
   if(el.type==='checkbox'){attr[n]=el.checked;return;}
   if(el.value==='')return;
+  if(el.dataset.kind==='json'){try{attr[n]=JSON.parse(el.value);}catch(_){bad=n;}return;}
   attr[n]=(el.dataset.kind==='number'||el.dataset.kind==='integer')?Number(el.value):el.value;});
-body.attr=attr;
-var r=await fetch('${url}',{method:'${method}',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-if(r.ok){location.href='${editing ? '/' + atom.id : '/' + modelId}';}else{var j=await r.json();alert(j.error||'error');}};
+ if(bad){alert('invalid JSON in '+bad);return;}
+ body.attr=attr;opts.body=JSON.stringify(body);}
+var r=await fetch(url,opts);
+if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:atomUrl);}else{var j=await r.json();alert(j.error||'error');}};
 </script>`;
-}
-
-function renderDelete(id) {
-  return `<p><button id="del">Delete</button></p>
-<script>document.getElementById('del').onclick=async function(){
-if(!confirm('Retire '+${JSON.stringify(id)}+'?'))return;
-var r=await fetch('/'+${JSON.stringify(id)},{method:'DELETE'});
-if(r.ok){location.href='/';}else{var j=await r.json();alert(j.error||'error');}};</script>`;
 }
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
-  const form = canOp(actor, modelId, 'create') ? renderForm(modelId) : '';
-  return page(`${m.attr.label || modelId} — ${atoms.length}`, renderTable(modelId, atoms) + form);
+  return page(`${m.attr.label || modelId} — ${atoms.length}`,
+    renderForm(modelId, null, actor) + renderTable(modelId, atoms));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -629,10 +643,8 @@ function renderIndexPage(indexAtom, atoms) {
 
 function renderAtom(atom, actor) {
   const modelId = refId(atom.model);
-  let body = `<p>id <code>${esc(atom.id)}</code> · model ${atomValue(atom.model)} · v${atom.lifecycle?.version ?? ''} · ${esc(atom.lifecycle?.status || '')}</p>`
-    + renderFields(atom.attr || {});
-  if (canOp(actor, modelId, 'update')) body += renderForm(modelId, atom);
-  if (canOp(actor, modelId, 'delete')) body += renderDelete(atom.id);
+  const body = `<p>id <code>${esc(atom.id)}</code> · model ${atomValue(atom.model)} · v${atom.lifecycle?.version ?? ''} · ${esc(atom.lifecycle?.status || '')}</p>`
+    + renderFields(atom.attr || {}) + renderForm(modelId, atom, actor);
   return page(atom.manifest || atom.id, body);
 }
 
