@@ -420,10 +420,14 @@ const cell = (v) => isRef(v) ? `<a href="/${esc(refId(v))}">${esc(v)}</a>`
   : Array.isArray(v) ? v.map(cell).join(', ') : esc(v ?? '');
 
 function page(title, body) {
-  return `<!doctype html><meta charset=utf8><title>${esc(title)}</title>
-<style>body{font:14px system-ui;margin:2rem;color:#111}a{color:#06c}
-table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 8px;text-align:left}
-th{background:#f6f6f6}h1{font-size:1.1rem}</style><h1>${esc(title)}</h1>${body}`;
+  return `<!doctype html><meta charset=utf8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)}</title>
+<style>body{font:14px system-ui;margin:1.25rem;color:#111;max-width:100%;overflow-wrap:anywhere}
+a{color:#06c}table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}
+td,th{border:1px solid #ddd;padding:4px 8px;text-align:left}
+th{background:#f6f6f6}h1{font-size:1.1rem}input,select{font:inherit;padding:2px 4px}</style>
+<h1>${esc(title)}</h1>${body}`;
 }
 
 function renderTable(modelId, atoms) {
