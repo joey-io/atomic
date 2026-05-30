@@ -23,13 +23,13 @@ A runnable kernel lives in `kernel.mjs` (dependency-free, Node ≥ 18). It is de
 - Styling: Noto Sans (Google Fonts) and one small variable-driven `style.css` with **no classes and no ids** — every rule targets a semantic element. Structure carries meaning: a data grid is a `<table>` with a `<thead>` inside a scrolling `<figure>`; a key/value or form table is a bare `<table>`; a repeater is a `<fieldset>`. (The single exception is `<datalist id>` ↔ `<input list>`, the spec's only way to bind ref-autocomplete — a functional binding like `name`, not a style hook.)
 - Three demo tenants seeded from files (not baked into the kernel): **A** = a PAC (`seed-a.mjs` — 3 regions, 20 people in a `manager` reporting chain, 100 fundraising txns), **B** = an advocacy program (`seed-b.mjs` — officials, districts, advocates with real addresses, stories; CapConnect = open-login write-only intake wearing the `website` role), **C** = a hybrid (`seed-c.mjs`). Admin is `joey@emailjoey.com`. The census hook is verified live: Baltimore → MD-07, Chicago → IL-07, Dallas → TX-30.
 - **Durable, per-tenant persistence with opt-in encryption at rest.** Each tenant is an append-only NDJSON shard under `ATOMIC_STORE`, replayed on boot (state is the fold of the log). Set `ATOMIC_KEY` (64-hex, or a passphrase stretched with scrypt) and every shard line is sealed with AES-256-GCM — confidential and tamper-evident (a wrong or altered key fails the load closed). Unset, lines are plaintext; reads accept either form per line, so enabling the key is forward-only.
-- **Hardened HTTP surface.** Every response sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`; HTML adds a strict Content-Security-Policy (`script-src 'self'` — the client is one static, same-origin `/app.js`, with no inline script anywhere). Session cookies are `HttpOnly; SameSite=Lax`, add `Secure` behind TLS, and carry full-entropy ids; `/auth` answers identically for known and unknown emails (no enumeration oracle).
+- **Hardened HTTP surface.** Every response sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`; HTML adds a strict Content-Security-Policy (`script-src 'self'` — the client is one static, same-origin `/app.js`, with no inline script anywhere). Session cookies are `HttpOnly; SameSite=Lax`, add `Secure` behind TLS, and carry full-entropy ids; `/auth` answers identically for known and unknown emails (no enumeration oracle). A session is a bearer credential, never application data: session atoms are parented into their token's tenant and are **never served through the read surface** — no listing, index, universal feed, ref-map, or direct id read can ever return a live cookie, even to an admin. A bearer or session credential only resolves if it points at a live `token` atom.
 - **Governance self-check** — `npm run audit` (`node kernel.mjs --audit`): a fsck for the substrate that asserts its own invariants (every atom resolves to a model, every reference resolves, every atom conforms to its schema, every grant is well-formed, every ledger entry is well-formed, every parent resolves) and exits non-zero on any finding, so it slots into CI or a cron. Point it at a real store with `ATOMIC_STORE`/`ATOMIC_KEY`.
 
 **Left to do / open threads:**
 
 - Some prose sections below (Hooks, Identity and access) predate the current hook design — capabilities registered in `lifecycle.hooks`, run under their own grants, no caller invoke permission. The Status summary above and the kernel comments are authoritative where they differ.
-- Schema evolution (`migration` atoms) is specified (see *Schema evolution*) but not yet implemented in the kernel.
+- Schema evolution: the `migration` model exists and a migration atom validates, but applying migrations on read (the version-bump rewrite) is not yet implemented in the kernel.
 - Secondary field indexes: reads are a single in-memory pass through one `getStore(actor)` seam (memoized per request so a request scans the store at most once), not yet backed by per-field indexes. Fine at demo scale; the seam is exactly where a sharded/indexed store (SQLite/LMDB) would slot in.
 - A richer roles UI (the `roles` field renders as a plain list, not a ref repeater).
 - Nashville (`1 Public Sq`, TN) was the one demo address the geocoder didn't match (11 of 12 districts resolved) — cosmetic.
@@ -907,7 +907,7 @@ A public website collects signups. The form is a model atom that embeds the cont
 }
 ```
 
-`write: "true"` lets anyone submit, including an unauthenticated caller. `read` keeps submissions internal to the tenant.
+`write: "true"` lets the form accept a submission from a low-privilege caller; `read` keeps submissions internal to the tenant. Public access is carried by a **write-only open-login intake token** (the same pattern as CapConnect in Demo B), not by a truly anonymous principal: the genesis anonymous identity `atom://0` holds no grants and cannot write. A visitor one-clicks into the intake token (or the page mounts it as a bearer credential), and that token — attenuated to just this form — is the `createdBy` on each submission.
 
 The form is made from the contact model. Because `contact` is `embed://contact`, the person inputs come straight from the contact model's fields. The contact model is defined once and drives both the CRM's contact records and this public form. The `source` and `consent` fields are added by the registration model on top of the embedded contact.
 
@@ -934,7 +934,7 @@ curl -X POST https://crm.example/registration \
   }'
 ```
 
-The kernel validates the embedded `contact` values against the contact model, fills `source` from its default, generates `id` and `lifecycle` — `createdBy` is the anonymous token `atom://anon`, since the rule permits public writes — and stores the registration. The stored record holds resolved values, with no `embed://` string and no `id` or `lifecycle` on the embedded contact:
+The kernel validates the embedded `contact` values against the contact model, fills `source` from its default, generates `id` and `lifecycle` — `createdBy` is the write-only intake token the public form carries — and stores the registration. The stored record holds resolved values, with no `embed://` string and no `id` or `lifecycle` on the embedded contact:
 
 ```json
 {
@@ -954,7 +954,7 @@ The kernel validates the embedded `contact` values against the contact model, fi
     "version": 1,
     "modelVersion": 1,
     "createdAt": "2026-05-30T18:00:00Z",
-    "createdBy": "atom://anon"
+    "createdBy": "atom://tok-intake"
   }
 }
 ```

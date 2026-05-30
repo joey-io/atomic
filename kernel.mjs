@@ -107,6 +107,10 @@ function readField(node, seg) {
       return node.lifecycle[seg];
     const inv = invReg[seg];
     if (inv && inv.targetModel === refId(node.model)) return inverseList(node.id, inv);
+    // virtual `.tenant` edge: every atom's nearest tenant ancestor, as a ref (or
+    // null at the global root). Lets rules read `actor.tenant` / `atom.tenant`
+    // without a stored field. Only a fallback — a real `tenant` attr wins above.
+    if (seg === 'tenant') { const t = tenantOf(node); return t ? ref(t) : null; }
     throw new Err(404, `no field .${seg} on ${node.id}`);
   }
   if (typeof node === 'object') return node[seg];
@@ -251,14 +255,19 @@ function parseCookies(req) {
 function actorFromReq(req, cookies) {
   const auth = req.headers['authorization'] || '';
   const m = auth.match(/^Bearer\s+(.+)$/i);              // integrations present a token directly
-  if (m && store.has(m[1])) return getAtom(m[1]);
+  // a bearer credential must resolve to a TOKEN atom — never any other atom kind,
+  // so e.g. `Bearer northwind` (a company id) can't be presented as an identity.
+  if (m && store.has(m[1])) { const t = getAtom(m[1]); if (t.model === 'atom://token') return t; }
   const sid = cookies['atomic_session'];                 // browsers carry a session the kernel tracks
   if (sid && store.has(sid)) {
     const s = store.get(sid);
     if (s.model === 'atom://session' && s.lifecycle.status === 'active' &&
-        (!s.attr.expiresAt || s.attr.expiresAt > now()) && store.has(refId(s.attr.token)))
-      // a transient copy carrying the session id — never mutate the stored atom
-      return { ...getAtom(refId(s.attr.token)), _session: sid };
+        (!s.attr.expiresAt || s.attr.expiresAt > now()) && store.has(refId(s.attr.token))) {
+      const t = getAtom(refId(s.attr.token));
+      // the session must still bind a live token (it could have been retired)
+      if (t.model === 'atom://token' && t.lifecycle?.status !== 'retired')
+        return { ...t, _session: sid };  // a transient copy carrying the session id — never mutate the stored atom
+    }
   }
   return getAtom('0'); // atom://0 — the anonymous identity (no data grants)
 }
@@ -266,10 +275,14 @@ function actorFromReq(req, cookies) {
 // A session is an atom too — it binds a cookie id to the token it authenticates.
 function newSession(tokenId) {
   const id = `sess-${randomUUID()}`; // full 122-bit id — this cookie is a bearer credential
+  // a session is parented into the token's own tenant, not left global. Combined
+  // with the surface never serving session atoms (see getStore + the GET guard),
+  // this means one tenant can never read another's live session ids (cookies).
+  const parent = tenantOf(store.get(tokenId)) || '0';
   seed({
     id, model: 'atom://session', manifest: `session for ${tokenId}`,
     attr: { token: ref(tokenId), createdAt: now(), expiresAt: new Date(Date.now() + 7 * 864e5).toISOString() },
-    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(), createdBy: ref(tokenId) },
+    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(), createdBy: ref(tokenId), parent: ref(parent) },
   });
   return id;
 }
@@ -323,6 +336,11 @@ const canOp = (actor, name, op) =>
 const canTouch = (actor, name) =>
   grantsOf(actor).some((x) => { const s = x.path.split('.')[0]; return s === name || s === '*' || s === '**'; });
 const canRead = (actor, target) => allows(actor, target, 'read');
+// May the actor see this atom AT ALL (vs. just some of its attributes)? Used to
+// gate the universal feed and index results so they never leak the id/manifest of
+// an atom the actor holds no read grant for. Per-attribute redaction happens after.
+const readableAtom = (actor, a) =>
+  a.lifecycle?.status !== 'retired' && canOp(actor, refId(a.model), 'read') && ruleOk(actor, a, 'read');
 
 // Attenuation: a token may only be issued with grants that are a subset of the
 // issuer's own — it can never grant more than it holds.
@@ -394,7 +412,10 @@ const _scope = new WeakMap(); // actor obj -> { gen, list }
 function getStore(actor) {
   let hit = _scope.get(actor);
   if (!hit || hit.gen !== storeGen) {
-    hit = { gen: storeGen, list: [...store.values()].filter((a) => visible(actor, a)) };
+    // session atoms are bearer credentials, never application data: they are
+    // excluded from every actor-facing read here, so no listing, index, feed,
+    // ref-map, datalist, or workspace can ever surface a live cookie id.
+    hit = { gen: storeGen, list: [...store.values()].filter((a) => a.model !== 'atom://session' && visible(actor, a)) };
     _scope.set(actor, hit);
   }
   return { all: () => hit.list };
@@ -501,7 +522,10 @@ function bump(atom, by) {
 function create(modelId, body, actor) {
   const modelAtom = getAtom(modelId);
   const fields = Object.keys(body.attr || {});
-  if (!fields.every((f) => allows(actor, `${modelId}.${f}`, 'create')))
+  // a baseline create grant on the model is required even for an all-default/empty
+  // body — otherwise `fields.every(...)` is vacuously true and a grantless actor
+  // could create atoms of any all-optional model. Then each named field is checked.
+  if (!canOp(actor, modelId, 'create') || !fields.every((f) => allows(actor, `${modelId}.${f}`, 'create')))
     throw new Err(403, `${actor.id} cannot create ${modelId}`);
 
   // POST creates. An explicit id that already exists is a conflict — never clobber.
@@ -531,7 +555,10 @@ function create(modelId, body, actor) {
       throw new Err(403, `${actor.id} cannot place into ${body.parent}`);
     parentId = refId(body.parent);
   }
-  const id = body.id || randomUUID().slice(0, 8);
+  // a generated id must be unique — never silently clobber an existing atom.
+  // (An explicit body.id collision is already a 409 above.)
+  let id = body.id;
+  if (!id) do { id = randomUUID().slice(0, 8); } while (store.has(id));
   const atom = {
     id, model: ref(modelId),
     manifest: body.manifest || '',
@@ -753,7 +780,7 @@ function runIndex(indexAtom, search, actor) {
   const params = new URLSearchParams(search);
   const match = indexAtom.attr.match || {};
   let atoms = getStore(actor).all().filter((a) =>
-    a.lifecycle?.status !== 'retired' &&
+    readableAtom(actor, a) &&
     (all ? a.model !== 'atom://log' : a.model === ref(over)));
   for (const [field, cond] of Object.entries(match)) {
     if (typeof cond === 'string' && cond.startsWith('params.')) {
@@ -1128,6 +1155,12 @@ const server = http.createServer(async (req, res) => {
     const isAnon = actor.id === '0';
     const [head, ...segs] = path.split('.');
 
+    // A session is a bearer credential, not an addressable resource. No request
+    // (any method, any actor) may read, traverse, or write one through the
+    // surface — sign-in/out happen only via the /auth/* routes handled above.
+    if (head && store.has(head) && getAtom(head).model === 'atom://session')
+      throw new Err(404, `no atom ${head}`);
+
     // the root is atom://0 — render it like any atom; anon also gets a create-session form
     if (req.method === 'GET' && path === '') {
       const a = getAtom('0');
@@ -1154,7 +1187,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET') {
       // atom://atom is the universal type — every atom, newest first
       if (head === 'atom' && segs.length === 0) {
-        const atoms = sortBy(getStore(actor).all().filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
+        const atoms = sortBy(getStore(actor).all().filter((a) => readableAtom(actor, a)), '-createdAt')
           .map((a) => redact(actor, a));
         if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms, actor), navSelect(actor, ''), footer(actor)), true);
         return send(200, atoms);
@@ -1229,6 +1262,16 @@ function coreAtoms() {
       createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } }),
     model('hook',   'Hook',   { label: { kind: 'text' }, run: { kind: 'text', required: true },
       grants: { kind: 'list', of: 'embed://grant' } }),
+    // a one-way schema transform: moves a model from version `from` to `to`. The
+    // model atom exists and validates; applying migrations on read is still TODO.
+    model('migration', 'Migration', { model: { kind: 'ref', to: 'atom://model' },
+      from: { kind: 'integer' }, to: { kind: 'integer' },
+      op: { kind: 'enum', values: ['rename', 'default', 'custom'] }, spec: { kind: 'json' }, run: { kind: 'text' } }),
+    model('file',   'File',   { name: { kind: 'text' }, contentType: { kind: 'text' },
+      size: { kind: 'integer' }, data: { kind: 'longtext' } }),
+    model('config', 'Config', { key: { kind: 'text', required: true }, value: { kind: 'json' } }),
+    model('plugin', 'Plugin', { name: { kind: 'text', required: true }, version: { kind: 'integer' },
+      models: { kind: 'list' }, indexes: { kind: 'list' }, handlers: { kind: 'list' } }),
     // a condition is an atom { field, op, value } — a single reusable predicate.
     // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
     model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
