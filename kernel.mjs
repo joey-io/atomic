@@ -482,8 +482,15 @@ h1{font-size:1.1rem}code{background:#f3f3f3;padding:1px 4px;border-radius:3px}
 input,select,textarea{font:inherit;padding:2px 4px}textarea{width:100%;min-width:22rem;resize:vertical}
 form table th{text-align:right;background:none;cursor:default;color:#555;font-weight:normal}
 form table th:hover{background:none}form table th::after{content:""}
-form table td{width:100%}form .tw{display:inline-block;border:0}</style>
-<h1><a href="/" style="text-decoration:none;color:inherit" title="Atomic">⚛</a> ${esc(title)}</h1>${body}
+form table td{width:100%}form .tw{display:inline-block;border:0}
+.list{display:block}.item{border:1px solid #eee;border-radius:4px;padding:4px 6px;margin:3px 0}
+table.form.sub{margin:0;border:0}.addItem{margin-top:4px}
+.fab{position:fixed;left:50%;bottom:1rem;transform:translateX(-50%);z-index:9;
+text-decoration:none;font-size:1.6rem;line-height:1;background:#111;color:#fff;
+width:3rem;height:3rem;border-radius:50%;display:flex;align-items:center;justify-content:center;
+box-shadow:0 2px 8px rgba(0,0,0,.25)}.fab:hover{background:#000}body{padding-bottom:5rem}</style>
+<h1>${esc(title)}</h1>${body}
+<a class="fab" href="/" title="Atomic — home">⚛</a>
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
@@ -557,27 +564,40 @@ function renderForm(modelId, atom, actor) {
   const m = getAtom(modelId);
   const editing = !!atom;
   const cur = atom?.attr || {};
-  const json = (k, v) => `<textarea name="${esc(k)}" data-kind="json" rows="3">${v === undefined ? '' : esc(JSON.stringify(v, null, 2))}</textarea>`;
-  const control = (k, def, v) => {
-    if (typeof def === 'string') return json(k, v); // embed://x — an atom inside an atom
+  const json = (name, v) => `<textarea name="${esc(name)}" data-kind="json" rows="3">${v === undefined ? '' : esc(JSON.stringify(v, null, 2))}</textarea>`;
+  // recursive: scalars -> inputs, ref -> autocomplete, object/embed -> nested
+  // sub-table, list with a declared item type (`of`) -> a repeater
+  function control(name, def, v) {
+    if (typeof def === 'string' && def.startsWith('embed://')) return embed(name, def.slice('embed://'.length), v || {});
     if (def.kind === 'enum')
-      return `<select name="${esc(k)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+      return `<select name="${esc(name)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
     if (def.kind === 'boolean')
-      return `<input type="checkbox" name="${esc(k)}"${v ? ' checked' : ''}>`;
-    if (def.kind === 'ref')
-      return `<input name="${esc(k)}" data-kind="ref" list="refs" value="${v === undefined ? '' : esc(v)}" placeholder="atom://… or embed://…">`;
-    if (def.kind === 'json' || def.kind === 'map' || def.kind === 'list') return json(k, v);
+      return `<input type="checkbox" name="${esc(name)}"${v ? ' checked' : ''}>`;
+    if (def.kind === 'ref' && def.to)
+      return `<input name="${esc(name)}" data-kind="ref" list="refs-${esc(refId(def.to))}" value="${v === undefined ? '' : esc(v)}" placeholder="atom://… or embed://…">`;
+    if (def.kind === 'list' && def.of) return repeater(name, def.of, Array.isArray(v) ? v : []);
+    if (def.kind === 'json' || def.kind === 'map' || def.kind === 'list') return json(name, v);
     if (def.kind === 'integer' || def.kind === 'number')
-      return `<input type="number" name="${esc(k)}" data-kind="${esc(def.kind)}" value="${v === undefined ? '' : esc(v)}">`;
-    // any other value: free text, but autocompletes atom:// / embed:// so it can be a ref too
-    return `<input type="text" name="${esc(k)}" data-kind="${esc(def.kind)}" list="refs" value="${v === undefined ? '' : esc(v)}">`;
-  };
+      return `<input type="number" name="${esc(name)}" data-kind="number" value="${v === undefined ? '' : esc(v)}">`;
+    return `<input type="text" name="${esc(name)}" data-kind="text" value="${v === undefined ? '' : esc(v)}">`;
+  }
+  function embed(name, subId, obj) {
+    const sm = getAtom(subId);
+    const rows = Object.entries(sm.attr.fields || {})
+      .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(name + '.' + k, def, obj?.[k])}</td></tr>`).join('');
+    return `<table class="form sub">${rows}</table>`;
+  }
+  function repeater(name, ofDef, arr) {
+    const items = arr.length ? arr : [undefined];
+    const blocks = items.map((it, i) => `<div class="item">${control(name + '.' + i, ofDef, it)}</div>`).join('');
+    return `<div class="list" data-name="${esc(name)}">${blocks}</div><button type="button" class="addItem">+ add</button>`;
+  }
   const fieldRows = Object.entries(m.attr.fields || {})
     .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(k, def, cur[k])}</td></tr>`).join('');
-  // autocomplete source: every atom (atom://) and every model (embed://)
-  const suggest = `<datalist id="refs">${[...store.values()].filter((a) => a.lifecycle?.status !== 'retired')
-    .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}${[...store.values()]
-    .filter((a) => a.model === 'atom://model').map((a) => `<option value="embed://${esc(a.id)}">`).join('')}</datalist>`;
+  // a datalist per model — its atoms (atom://) plus embed://<model> — for any ref at any depth
+  const suggest = [...store.values()].filter((a) => a.model === 'atom://model').map((mm) =>
+    `<datalist id="refs-${esc(mm.id)}">${[...store.values()].filter((a) => a.model === ref(mm.id) && a.lifecycle?.status !== 'retired')
+      .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}<option value="embed://${esc(mm.id)}"></option></datalist>`).join('');
   // the methods this actor may run here, from its grants (the auth schema)
   const methods = [];
   if (!editing && canOp(actor, modelId, 'create')) methods.push('POST');
@@ -594,6 +614,16 @@ function renderForm(modelId, atom, actor) {
   return `<h1>${editing ? 'Edit' : 'New ' + esc(m.attr.label || modelId)}</h1>
 <form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p>${suggest}</form>
 <script>
+function setPath(root,path,val){var ks=path.split('.'),o=root;
+ for(var i=0;i<ks.length-1;i++){var k=ks[i],nn=/^[0-9]+$/.test(ks[i+1]);if(o[k]===undefined)o[k]=nn?[]:{};o=o[k];}
+ o[ks[ks.length-1]]=val;}
+document.querySelectorAll('.addItem').forEach(function(btn){btn.onclick=function(){
+ var box=btn.previousElementSibling,name=box.getAttribute('data-name');
+ var items=box.querySelectorAll(':scope > .item'),last=items.length-1,c=items[last].cloneNode(true);
+ c.querySelectorAll('[name]').forEach(function(el){
+  el.name=el.name.split(name+'.'+last+'.').join(name+'.'+items.length+'.');
+  if(el.type==='checkbox')el.checked=false;else el.value='';});
+ box.appendChild(c);};});
 var createUrl=${JSON.stringify('/' + modelId)}, atomUrl=${JSON.stringify(editing ? '/' + atom.id : '')};
 document.getElementById('f').onsubmit=async function(e){e.preventDefault();
 var method=e.target.querySelector('[name="$method"]').value;
@@ -605,10 +635,11 @@ else{var body={},attr={},bad=null;
   if(n==='$method')return;
   if(n==='$id'){if(el.value)body.id=el.value;return;}
   if(n==='$manifest'){body.manifest=el.value;return;}
-  if(el.type==='checkbox'){attr[n]=el.checked;return;}
-  if(el.value==='')return;
-  if(el.dataset.kind==='json'){try{attr[n]=JSON.parse(el.value);}catch(_){bad=n;}return;}
-  attr[n]=(el.dataset.kind==='number'||el.dataset.kind==='integer')?Number(el.value):el.value;});
+  var val;
+  if(el.type==='checkbox')val=el.checked;
+  else if(el.dataset.kind==='json'){if(el.value==='')return;try{val=JSON.parse(el.value);}catch(_){bad=n;return;}}
+  else{if(el.value==='')return;val=el.dataset.kind==='number'?Number(el.value):el.value;}
+  setPath(attr,n,val);});
  if(bad){alert('invalid JSON in '+bad);return;}
  body.attr=attr;opts.body=JSON.stringify(body);}
 var r=await fetch(url,opts);
@@ -813,7 +844,9 @@ function bootstrap() {
   model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
     indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } });
   model('token',  'Token',  { email: { kind: 'text' }, tenant: { kind: 'ref', to: 'atom://tenant' },
-    team: { kind: 'ref', to: 'atom://team' }, grants: { kind: 'list' } });
+    team: { kind: 'ref', to: 'atom://team' }, grants: { kind: 'list', of: 'embed://grant' } });
+  model('grant',  'Grant',  { path: { kind: 'text', required: true },
+    mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write'] } });
   model('tenant', 'Tenant', { name: { kind: 'text', required: true } });
   model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
     params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } });
