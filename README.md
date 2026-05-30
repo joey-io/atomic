@@ -115,6 +115,26 @@ An atom names its model with the `model` pointer. The kernel uses that pointer t
 - Containers: `list`, `map`, `json`.
 - Modifiers: `required`, `default`, `unique`, `filterable`, `sortable`.
 
+## Kernel atoms
+
+The system is made of atoms. The kernel's own types are model atoms, so the kernel runs on the same machinery as the data it stores. These are the models that make the system work:
+
+|Model      |What it is                                                                 |
+|-----------|---------------------------------------------------------------------------|
+|`model`    |Defines a type: its fields, indexes, and rules. Validates atoms of that type.|
+|`index`    |A stored query or constraint over a model's atoms.                         |
+|`migration`|A one-way transform that moves a model from one version to the next.       |
+|`token`    |A credential. Resolves to an actor and carries grants.                     |
+|`user`     |A person who can authenticate and act: email, tenant, and grants.          |
+|`tenant`   |An isolation boundary. Atoms, grants, and rules are scoped to it.          |
+|`log`      |An append-only entry recording one change to one atom. The ledger.         |
+|`file`     |A stored blob, addressed like any atom.                                    |
+|`config`   |Kernel and tenant settings.                                                |
+|`plugin`   |A bundle of models, indexes, and handlers installed together.              |
+|`hook`     |A handler that runs on a write — the transform side of Logic.              |
+
+Everything else — companies, contacts, deals, signups — is an application model built the same way. There is no privileged layer: defining a type, granting access, recording a change, and storing a record are all atom CRUD.
+
 ## References
 
 A model's field definitions use two reference schemes:
@@ -172,6 +192,8 @@ Paths are used in filters, indexes, rules, and exports. Traversal follows these 
 - Each traversal runs under a budget (time, atoms visited, result size). Callers may raise the budget.
 - A reference to a missing atom is an error, not a null.
 - Resolved references are cached and invalidated when the target changes.
+
+A path segment may be a wildcard. `*` matches any one field or edge step. `**` matches any number of steps. A wildcard over a list or an inverse edge fans out to every target. Wildcards work anywhere paths are used, including filters, indexes, rules, and grants.
 
 ## Index
 
@@ -347,6 +369,89 @@ curl -X PATCH https://crm.example/7b8f-2f0c \
 
 The kernel commits only if the stored version still equals `3`. Otherwise it returns a conflict.
 
+## Identity and access
+
+Authentication and authorization are part of the kernel. A user is an atom. Access is granted by path.
+
+### User
+
+`user` is a core model. A user atom has an email, a tenant, and a list of grants. The signed-in user atom is the `actor` that rules and grants are evaluated against. Any atom that fits this shape — an email and a set of grants — is a user.
+
+```json
+{
+  "id": "user",
+  "model": "atom://model",
+  "manifest": "A person who can authenticate and act",
+  "attr": {
+    "label": "User",
+    "version": 1,
+    "fields": {
+      "email": {
+        "kind": "text",
+        "required": true,
+        "unique": true
+      },
+      "name": {
+        "kind": "text"
+      },
+      "tenant": {
+        "kind": "ref",
+        "to": "atom://tenant"
+      },
+      "grants": {
+        "kind": "list"
+      }
+    },
+    "indexes": {
+      "byEmail": {
+        "on": [
+          "email"
+        ],
+        "role": "identity"
+      }
+    }
+  },
+  "lifecycle": "atom://0"
+}
+```
+
+### Magic-link sign-in
+
+The kernel signs users in by email. There are no passwords.
+
+- `POST /auth` with `{ "email": "amy@northwind.com" }` finds the user through the `byEmail` index, mints a short-lived `token` atom, and emails a link containing it.
+- Opening the link exchanges the token for a session. The session resolves to the user atom, which becomes `actor`.
+- A magic-link `token` is single-use and short-lived. `token` is a kernel model, logged like any atom.
+
+### Callers
+
+A caller is anything that holds a token: a person signed in by magic link, or an integration issued a token directly. An integration token is long-lived and carries its own grants. Grants attach to the user or to the token, and the `actor` is whatever the token resolves to. Access is checked the same way for both. An integration such as an outreach tool gets a token with only the grants it needs — there is no separate webhook or callback concept; an external system is just an API caller.
+
+### Tenant
+
+Every user belongs to a `tenant`. New atoms are created in the actor's tenant. Grants and rules are evaluated within it. Access across tenants is denied unless a grant allows it.
+
+### Grants
+
+A grant gives the actor access to a path, for read or write. A path may use wildcards, so one grant covers many attributes across many atoms.
+
+- A grant is `{ "path": "<path>", "mode": "read" | "write" }`.
+- `*` matches one segment. `**` matches any number.
+- The path is an ordinary path, so a grant can reach across edges.
+
+|Grant path          |Covers                                          |
+|--------------------|------------------------------------------------|
+|`contact.*`         |every field of every contact                    |
+|`contact.email`     |only the email field of contacts                |
+|`company.*.deals.**`|deals reached through any company field         |
+|`**`                |everything in the tenant (an admin)             |
+
+### Read filtering
+
+Access is evaluated per attribute, not only per atom. When the kernel returns an atom, it walks each attribute's path and keeps the attribute only if the actor holds a matching read grant. Attributes without a grant are redacted: they are removed from the response, and full-text and filters do not expose them. Two actors reading the same atom can receive different subsets. This is how PII is withheld — an actor without a grant for `contact.email` sees the contact but not the email.
+
+The model's `rules.read` gates the atom as a whole. Grants gate the attributes within it. Access is the intersection of both, and is denied by default.
+
 ## Correctness
 
 **Identity and deduplication.** On create, the kernel checks the model's `identity` indexes. If a record with the same key exists, the write is merged into it (per `behavior.merge`) instead of inserting a duplicate. The `id` is not used for matching. By default `id` is a generated surrogate. `behavior.addressing: content` derives `id` from the identity key and is allowed only for immutable, single-key models.
@@ -355,7 +460,7 @@ The kernel commits only if the stored version still equals `3`. Otherwise it ret
 
 **Provenance.** The log records every change at field level: actor, time, old value, new value. A field's full history is its log entries. Audit and point-in-time queries read the same log. Values computed on read are not stored. Values that are audited or billed are written so they are indexed, logged, and fixed at write time.
 
-**Permissions.** A model's `rules` hold `read` and `write` predicates, written as path expressions. A predicate that is false, errors, or exceeds its traversal budget denies access. Access is never granted by default.
+**Permissions.** A model's `rules` hold `read` and `write` predicates over the whole atom, written as path expressions. The actor's `grants` then gate access per attribute path (see Identity and access). Access is the intersection of rules and grants. A predicate that is false, errors, or exceeds its traversal budget denies access. Access is never granted by default.
 
 ## Schema evolution
 
@@ -781,3 +886,80 @@ The kernel validates the embedded `contact` values against the contact model, fi
 ```
 
 `GET /registration` returns the table of signups for sales. Each row shows the embedded contact fields.
+
+## Example: outreach through the API
+
+Outreach needs no special webhook. An external system is an API caller. It authenticates with a token, and the token carries grants. The outreach tool's token has one grant: write to the contact model.
+
+```json
+{
+  "id": "tok-outreach",
+  "model": "atom://token",
+  "manifest": "Outreach integration credential",
+  "attr": {
+    "tenant": "atom://tenant-acme",
+    "grants": [
+      {
+        "path": "contact.*",
+        "mode": "write"
+      }
+    ]
+  },
+  "lifecycle": "atom://0"
+}
+```
+
+The caller creates a contact with the same POST a person would, scoped to its grant:
+
+```
+curl -X POST https://crm.example/contact \
+  -H 'authorization: Bearer tok-outreach' \
+  -H 'content-type: application/json' \
+  -d '{
+    "attr": {
+      "name": "Dana Cruz",
+      "email": "dana@acme.com",
+      "company": "atom://northwind"
+    }
+  }'
+```
+
+The kernel resolves the token to its actor, checks the `contact.*` write grant, validates the body against the contact model, and writes. A write to a path the token does not grant — a deal, a user — is denied. The `byEmail` identity index dedups, so re-sending the same contact merges into the existing one instead of creating a duplicate.
+
+### The ledger
+
+Atom CRUD is the ledger. Every create, update, and delete appends one `log` atom. The log is append-only, and the current state of an atom is the fold of its log entries. Replaying the log rebuilds every atom, so the store is auditable and can be replicated entry by entry.
+
+```json
+{
+  "id": "log-9c20",
+  "model": "atom://log",
+  "manifest": "create contact dana",
+  "attr": {
+    "atom": "atom://e8a1-0c4d",
+    "op": "create",
+    "actor": "atom://tok-outreach",
+    "at": "2026-05-30T18:05:00Z",
+    "changes": [
+      {
+        "path": "name",
+        "from": null,
+        "to": "Dana Cruz"
+      },
+      {
+        "path": "email",
+        "from": null,
+        "to": "dana@acme.com"
+      },
+      {
+        "path": "company",
+        "from": null,
+        "to": "atom://northwind"
+      }
+    ]
+  },
+  "lifecycle": "atom://0"
+}
+```
+
+The actor on the entry is the outreach token, so every atom the integration creates is attributable to it. A later reader still sees `email` only if their own grants allow it; the writer's grant does not widen anyone else's read.
