@@ -785,7 +785,7 @@ function page(title, body, fab, foot) {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/style.css?v=${CSS.length}">
-<header><h1><a href="/">Atomic</a></h1>${foot ? `<p>${foot}</p>` : ''}</header>
+<header><h1><a href="/">Atomic</a></h1><p style="max-width:80vw">A data substrate where schema, data, identity, permissions, and every surface are all atoms — one organism, generated from the same core atoms and rendered on any surface.</p>${foot ? `<p>${foot}</p>` : ''}</header>
 <nav>${fab || ''}</nav>
 <main>${body}</main>
 <script>
