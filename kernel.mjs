@@ -416,8 +416,19 @@ function runIndex(indexAtom, search, actor) {
 // ---------------------------------------------------------------------------
 
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-const cell = (v) => isRef(v) ? `<a href="/${esc(refId(v))}">${esc(v)}</a>`
-  : Array.isArray(v) ? v.map(cell).join(', ') : esc(v ?? '');
+// a cell renders refs as links, scalars as text, and sub-objects as nested
+// tables (the same component as the parent), recursively
+const cell = (v) => {
+  if (v == null) return '';
+  if (isRef(v)) return `<a href="/${esc(refId(v))}">${esc(v)}</a>`;
+  if (Array.isArray(v))
+    return v.every((x) => typeof x !== 'object' || isRef(x)) ? v.map(cell).join(', ') : v.map(cell).join('');
+  if (typeof v === 'object') {
+    const rows = Object.entries(v).map(([k, val]) => `<tr><th>${esc(k)}</th><td>${cell(val)}</td></tr>`).join('');
+    return `<div class="tw"><table>${rows}</table></div>`;
+  }
+  return esc(v);
+};
 
 function page(title, body) {
   return `<!doctype html><meta charset=utf8>
@@ -427,11 +438,28 @@ function page(title, body) {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
 <style>body{font:14px 'Google Sans Code',ui-monospace,'Cascadia Code',Menlo,monospace;margin:1.25rem;color:#111;max-width:100%;overflow-wrap:anywhere}
-a{color:#06c}table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}
-td,th{border:1px solid #ddd;padding:4px 8px;text-align:left}
-th{background:#f6f6f6}h1{font-size:1.1rem}code{background:#f3f3f3;padding:1px 4px;border-radius:3px}
+a{color:#06c}.tw{overflow-x:auto;max-width:100%;border:1px solid #eee;border-radius:4px}
+table{border-collapse:collapse;width:auto}
+td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap}
+th{background:#f6f6f6;cursor:pointer;user-select:none}th:hover{background:#ececec}
+th[data-dir="1"]::after{content:" \\2191"}th[data-dir="-1"]::after{content:" \\2193"}
+h1{font-size:1.1rem}code{background:#f3f3f3;padding:1px 4px;border-radius:3px}
 input,select{font:inherit;padding:2px 4px}</style>
-<h1>${esc(title)}</h1>${body}`;
+<h1>${esc(title)}</h1>${body}
+<script>
+(function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
+document.querySelectorAll('table').forEach(function(t){
+ t.querySelectorAll('th').forEach(function(th,ci){
+  th.addEventListener('click',function(){
+   var dir=th.getAttribute('data-dir')==='1'?-1:1;
+   t.querySelectorAll('th').forEach(function(o){o.removeAttribute('data-dir');});
+   th.setAttribute('data-dir',dir);
+   var rows=Array.prototype.slice.call(t.rows).filter(function(r){return r.querySelector('td');});
+   rows.sort(function(a,b){var x=((a.cells[ci]||{}).innerText||'').trim(),y=((b.cells[ci]||{}).innerText||'').trim();
+    var nx=num(x),ny=num(y);var c=(nx!==null&&ny!==null)?nx-ny:x.localeCompare(y);return c*dir;});
+   rows.forEach(function(r){t.appendChild(r);});});});});
+})();
+</script>`;
 }
 
 function renderTable(modelId, atoms) {
@@ -441,7 +469,7 @@ function renderTable(modelId, atoms) {
   const rows = atoms.map((a) =>
     `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td>` +
     cols.map((c) => `<td>${cell(a.attr?.[c])}</td>`).join('') + '</tr>').join('');
-  return `<table><tr>${head}</tr>${rows}</table>`;
+  return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
 
 // atom://0 as the public, JSON-LD-shaped description of the app
@@ -511,7 +539,7 @@ function renderCrossTable(atoms) {
   const rows = atoms.map((a) =>
     `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td><td>${cell(a.model)}</td>` +
     `<td>${esc(a.manifest || '')}</td><td>${esc(a.lifecycle?.createdAt || '')}</td></tr>`).join('');
-  return `<table><tr>${head}</tr>${rows}</table>`;
+  return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
 
 function renderIndexPage(indexAtom, atoms) {
@@ -529,7 +557,7 @@ function renderIndexPage(indexAtom, atoms) {
 function renderAtom(atom) {
   const rows = Object.entries(atom.attr || {})
     .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${cell(v)}</td></tr>`).join('');
-  return page(atom.manifest || atom.id, `<table>${rows}</table>`);
+  return page(atom.manifest || atom.id, `<div class="tw"><table>${rows}</table></div>`);
 }
 
 function renderHome(h) {
