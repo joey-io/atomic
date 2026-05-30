@@ -20,6 +20,9 @@ export async function model(id, label, fields, extra = {}) {
 export async function tenant(id, name) {
   okOrExists(await api('POST', '/tenant', { id, manifest: name, attr: { name } }), `tenant ${id}`);
 }
+export async function index(id, label, over, params, match, sort) {
+  okOrExists(await api('POST', '/index', { id, manifest: label, attr: { label, over, params, match, sort, returns: 'set' } }), `index ${id}`);
+}
 // create an atom of `m` under tenant `parent`
 export async function atom(m, id, parent, attr, manifest) {
   okOrExists(await api('POST', '/' + m, { id, parent: 'atom://' + parent, manifest: manifest || id, attr }), `${m} ${id}`);
