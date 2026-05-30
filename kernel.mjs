@@ -5,9 +5,10 @@
 //
 // Dependency-free. Run: node kernel.mjs   (Node >= 18)
 //
-// This is a teaching kernel: in-memory, resets on restart. It implements
-// the load-bearing ideas from the README and leaves room marked TODO where
-// the spec goes deeper (rule predicates, migrations, embed validation depth).
+// In-memory by default; point ATOMIC_STORE at a directory for durable,
+// per-tenant, append-only persistence — replayed on boot, optionally AES-256-GCM
+// encrypted at rest. It implements the load-bearing model from the README; a few
+// deeper paths remain marked TODO (migration-on-read, rule-predicate breadth).
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -435,7 +436,7 @@ function getStore(actor) {
 // Durability. Each tenant is a shard on disk: an append-only NDJSON log under
 // ATOMIC_STORE/<tenant>/log.ndjson. State is the fold of the log, replayed on
 // boot. Per-tenant files give physical isolation (a node serves one tenant's
-// file); unset ATOMIC_STORE keeps the kernel pure in-memory (the demo).
+// file); unset ATOMIC_STORE keeps the kernel purely in-memory (the default).
 // ---------------------------------------------------------------------------
 const ROOT = process.env.ATOMIC_STORE || null;
 const _dirs = new Set(); // shard dirs we've already mkdir'd this process — skip the syscall
@@ -444,7 +445,7 @@ const shardOf = (atom) => tenantOf(atom) || '_global';
 // Encryption at rest (opt-in). Set ATOMIC_KEY to a 64-char hex key or any
 // passphrase (stretched with scrypt). When set, each shard-log line is written
 // as `enc:<base64(iv12 ‖ tag16 ‖ ciphertext)>` under AES-256-GCM — confidential
-// and tamper-evident (GCM auth tag). Unset → plaintext NDJSON (the demo default).
+// and tamper-evident (GCM auth tag). Unset → plaintext NDJSON (the default).
 // Reads accept either form per line, so turning the key on is forward-only and a
 // store written without it still loads.
 const KEY = process.env.ATOMIC_KEY
@@ -594,7 +595,6 @@ function create(modelId, body, actor) {
       modelVersion: modelAtom.attr.version || 1,
       createdAt: now(), updatedAt: now(), createdBy: ref(actor.id), parent: ref(parentId),
       expiration: resolveExpiration(body, actor, ref('policy-default')), // a chosen policy, else the default
-
       ...(body.hooks ? { hooks: body.hooks } : {}), // hooks registered on this atom
     },
   };
@@ -850,7 +850,7 @@ function runIndex(indexAtom, search, actor) {
 }
 
 // ---------------------------------------------------------------------------
-// Tiny HTML rendering (UI generated from field kinds)
+// HTML rendering — the UI generated from field kinds
 // ---------------------------------------------------------------------------
 
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));

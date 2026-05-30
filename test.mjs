@@ -43,7 +43,7 @@ await J('joey', 'POST', '/tenant', { id: 't2', attr: { name: 'T2' } });
 const mk = (id, t, grants) => J('joey', 'POST', '/token', { id, parent: 'atom://' + t, attr: { email: `${id}@x.com`, grants } });
 await mk('tk-all', 't1', [{ path: '**', mode: 'all' }]);
 await mk('tk-read', 't1', [{ path: 'widget.*', mode: 'read' }]);
-await mk('tk-name', 't1', [{ path: 'widget.name', mode: 'write' }]);          // write name only, no read
+await mk('tk-name', 't1', [{ path: 'widget.name', mode: 'write' }]); // write name only, no read
 await mk('tk-stamp', 't1', [{ path: 'widget.name', mode: 'write' }, { path: 'stamp', mode: 'read' }]);
 await mk('tk-link', 't1', [{ path: 'widget.name', mode: 'write' }, { path: 'link', mode: 'read' }]);
 await mk('tk2', 't2', [{ path: '**', mode: 'all' }]);
