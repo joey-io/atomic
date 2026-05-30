@@ -106,7 +106,7 @@ borrowed.
 
 ## The minimal kernel: a daemon beside any document
 
-So the more radical framing. Today `kernel.mjs` owns the record format *and* the index
+So the more radical framing. Today `atomic.mjs` owns the record format *and* the index
 *and* the permissions *and* the rendering — and because it owns the format, it can only
 govern data that was born as an atom. But the three things that survive (index, permission,
 logic) don't depend on the format at all. They depend only on there being **elements with
@@ -245,7 +245,7 @@ asks a blunter question:
 **What if Atomic is just a thin UI over SQLite, and the kernel is mostly reinventing a
 database that already exists?**
 
-Because look at what `kernel.mjs` actually hand-rolls. Then look at the column on the right.
+Because look at what `atomic.mjs` actually hand-rolls. Then look at the column on the right.
 
 | Atomic concept                          | SQLite already ships it                                  |
 |-----------------------------------------|---------------------------------------------------------|

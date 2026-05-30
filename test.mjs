@@ -14,7 +14,7 @@ const J = (tok, method, p, body, headers = {}) => fetch(base + p, {
 });
 const code = (tok, method, p, body, h) => J(tok, method, p, body, h).then((r) => r.status);
 const jsonOf = (tok, p) => J(tok, 'GET', p).then((r) => r.json());
-const start = () => spawn('node', ['kernel.mjs'], { env: { ...process.env, PORT, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '' }, stdio: 'ignore' });
+const start = () => spawn('node', ['atomic.mjs'], { env: { ...process.env, PORT, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '' }, stdio: 'ignore' });
 async function wait() { for (let i = 0; i < 50; i++) { try { await fetch(base + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); }
 
 rmSync(STORE, { recursive: true, force: true });

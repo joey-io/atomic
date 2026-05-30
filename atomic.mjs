@@ -3,7 +3,7 @@
 // One store of atoms. The schema is atoms. Identity is a token atom.
 // CRUD is the ledger. The HTTP surface is generated from the atoms.
 //
-// Dependency-free. Run: node kernel.mjs   (Node >= 18)
+// Dependency-free. Run: node atomic.mjs   (Node >= 18)
 //
 // In-memory by default; point ATOMIC_STORE at a directory for durable,
 // per-tenant, append-only persistence — replayed on boot, optionally AES-256-GCM
@@ -28,17 +28,256 @@ try {
 // Store + ledger
 // ---------------------------------------------------------------------------
 
-const readAsset = (name) => { try { return fs.readFileSync(new URL(`./${name}`, import.meta.url), 'utf8'); } catch { return ''; } };
-const CSS = readAsset('style.css');
-// the static client — one ES module per behaviour under applib/, served same-
-// origin (script-src 'self') and loaded as a module graph. Read at boot into a
-// map; APPLIB_VER busts the entry module's cache whenever any module changes.
-const APPLIB = new Map();
-try {
-  const dir = new URL('./applib/', import.meta.url);
-  for (const f of fs.readdirSync(dir)) if (f.endsWith('.js')) APPLIB.set(f, fs.readFileSync(new URL(f, dir), 'utf8'));
-} catch { /* no applib dir — the client is optional */ }
-const APPLIB_VER = [...APPLIB.values()].reduce((n, s) => n + s.length, 0);
+// The stylesheet, inlined so atomic.mjs is the whole program. Served at /style.css.
+const CSS = `/* Atomic — one small, variable-driven sheet. No classes, no ids: every rule
+   targets a semantic element. A data grid is a <table> with a <thead> (inside a
+   <figure> that scrolls); a key/value or form table is a bare <table>; a
+   repeater is a <fieldset>. The structure carries the meaning. */
+:root {
+  --font: 'Noto Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --fg: #16181d;
+  --muted: #6b7280;
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --line: #e7e9ee;
+  --line-strong: #d3d7df;
+  --head: #f3f5f8;
+  --row: #fbfcfd;
+  --accent: #2f6df6;
+  --accent-weak: #eaf1ff;
+  --radius-sm: 8px;
+  --cell: 9px 14px;
+  --gap: 10px;
+  --title: 12vw;
+  --nest: rgba(0, 0, 0, .01); /* translucent so nested figures accumulate/darken */
+  --nest-line: rgba(0, 0, 0, .1); /* figure border: same hue as --nest, heavier */
+  --asc: " ↑";
+  --desc: " ↓";
+}
+
+* { box-sizing: border-box }
+html { -webkit-text-size-adjust: 100% }
+body {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+}
+header { max-width: 1120px; margin: 0 auto; padding: 24px 24px 0 }
+h1 { margin: 0; font-size: var(--title); font-weight: 700; letter-spacing: -.02em; line-height: 1.1 }
+h1 a { color: var(--fg) }
+h1 a:hover { text-decoration: none }
+main { display: block; max-width: 1120px; margin: 0 auto; padding: 8px 24px 64px }
+nav { max-width: 1120px; margin: 0 auto; padding: 1rem 24px 8px; display: flex; gap: var(--gap); align-items: center }
+header p { margin: 0; color: var(--muted); font-size: .82rem; max-width: 80vw }
+p { margin: 14px 0 }
+small { color: var(--muted) }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em }
+
+a { color: var(--accent); text-decoration: none }
+a:hover { text-decoration: underline }
+
+/* ONE table component, everywhere. A <figure> scrolls it; every table is a grid
+   with a sortable <thead>. Same cells, same headers, same separators — no
+   variants, no exceptions. Rule #1: everything is the same. */
+figure { margin: 14px 0; overflow-x: auto; max-width: 100%; background: var(--nest); border: 1px solid var(--nest-line); border-radius: 1rem; padding-top: 1rem }
+table { width: 100%; border-collapse: collapse; background: transparent }
+th, td { text-align: left; vertical-align: top; white-space: nowrap; padding: var(--cell) }
+td { border-bottom: 1px solid var(--line) }
+thead th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: .76rem;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+}
+thead th:hover { color: var(--fg) }
+tbody tr:hover > td { background: var(--accent-weak) }
+tbody tr:last-child > td { border-bottom: 0 }
+thead th[data-dir="1"]::after { content: var(--asc); color: var(--accent) }
+thead th[data-dir="-1"]::after { content: var(--desc); color: var(--accent) }
+
+/* forms — controls and a repeater (<fieldset>) */
+label { font-weight: 500 }
+input, select, textarea {
+  font: inherit;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  min-width: 18rem;
+  max-width: 100%;
+}
+textarea { width: 100% }
+input[type="checkbox"] { min-width: 0 }
+input:focus, select:focus, textarea:focus {
+  outline: 0;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-weak);
+}
+select { cursor: pointer }
+
+button {
+  font: inherit; font-weight: 600;
+  color: #fff; background: var(--accent);
+  border: 1px solid var(--accent); border-radius: var(--radius-sm);
+  padding: 8px 16px; cursor: pointer;
+}
+button:hover { filter: brightness(.94) }
+button:active { filter: brightness(.88) }
+button[type="button"] {
+  color: var(--accent); background: var(--surface); border-color: var(--line-strong);
+  padding: 5px 12px; font-weight: 500;
+}
+button[type="button"]:hover { border-color: var(--accent); background: var(--accent-weak) }
+
+nav select { min-width: 0; max-width: 360px }
+
+fieldset {
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: var(--gap); margin: 0 0 var(--gap);
+  display: flex; flex-direction: column; gap: var(--gap); align-items: flex-start;
+}
+fieldset fieldset { background: var(--row) }
+
+/* nav actions (export CSV) sit beside the dropdown */
+nav a { font-size: .82rem; font-weight: 500 }
+
+/* the CSV import dropzone: a dashed drop target, highlighted while dragging over */
+figure[data-import] { border-style: dashed; text-align: center; color: var(--muted); padding: 18px }
+figure[data-import] p { margin: 6px 0 }
+figure[data-import] input { min-width: 0 }
+[data-over] { border-color: var(--accent); background: var(--accent-weak); color: var(--fg) }`;
+
+// Atomic — the whole client. Two behaviours, both progressive: click-to-sort on
+// any data grid, and the generated create/edit form's submit + repeater. Served
+// static and same-origin so the page can run under a strict CSP (script-src
+// 'self', no inline script). The form is data-driven: it reads its target URLs
+// from data-create / data-atom on the <form>, so this file is page-agnostic.
+// It lives here as a real function and is served as its own source via toString()
+// at request time — actual JavaScript (regexes and all), never an escaped blob.
+const CLIENT = function () {
+  function num(s) { return /^-?[\d,]+(\.\d+)?$/.test(s) ? parseFloat(s.replace(/,/g, '')) : null; }
+
+  // sortable data grids: a <table> with a <thead>, not inside a form
+  document.querySelectorAll('table').forEach(function (t) {
+    if (t.closest('form') || !t.tHead) return;
+    var body = t.tBodies[0] || t;
+    t.tHead.querySelectorAll('th').forEach(function (th, ci) {
+      th.addEventListener('click', function () {
+        var dir = th.getAttribute('data-dir') === '1' ? -1 : 1;
+        t.tHead.querySelectorAll('th').forEach(function (o) { o.removeAttribute('data-dir'); });
+        th.setAttribute('data-dir', dir);
+        var rows = Array.prototype.slice.call(body.rows);
+        rows.sort(function (a, b) {
+          var x = ((a.cells[ci] || {}).innerText || '').trim(), y = ((b.cells[ci] || {}).innerText || '').trim();
+          var nx = num(x), ny = num(y); var c = (nx !== null && ny !== null) ? nx - ny : x.localeCompare(y); return c * dir;
+        });
+        rows.forEach(function (r) { body.appendChild(r); });
+      });
+    });
+  });
+
+  // nav dropdown: jump to the selected ref. Wired here (not an inline onchange)
+  // so it runs under the strict CSP, and before the no-form early-return below so
+  // it works on read-only pages too.
+  document.querySelectorAll('select[data-nav]').forEach(function (sel) {
+    sel.addEventListener('change', function () { if (sel.value) location.href = sel.value; });
+  });
+
+  // the generated create/edit form (present only when the actor may write here)
+  var F = document.querySelector('form[data-create]');
+  if (!F) return;
+  var createUrl = F.getAttribute('data-create'), atomUrl = F.getAttribute('data-atom') || '';
+
+  function setPath(root, path, val) {
+    var ks = path.split('.'), o = root;
+    for (var i = 0; i < ks.length - 1; i++) { var k = ks[i], nn = /^[0-9]+$/.test(ks[i + 1]); if (o[k] === undefined) o[k] = nn ? [] : {}; o = o[k]; }
+    o[ks[ks.length - 1]] = val;
+  }
+
+  // list repeaters: "+ add" clones the last fieldset, renumbering its inputs
+  F.querySelectorAll('button[type="button"]').forEach(function (btn) {
+    btn.onclick = function () {
+      var box = btn.parentElement, name = box.getAttribute('data-name');
+      var items = box.querySelectorAll(':scope > fieldset'), last = items.length - 1, c = items[last].cloneNode(true);
+      c.querySelectorAll('[name]').forEach(function (el) {
+        el.name = el.name.split(name + '.' + last + '.').join(name + '.' + items.length + '.');
+        if (el.type === 'checkbox') el.checked = false; else el.value = '';
+      });
+      box.insertBefore(c, btn);
+    };
+  });
+
+  F.onsubmit = async function (e) {
+    e.preventDefault();
+    var method = e.target.querySelector('[name="$method"]').value;
+    if (method === 'IMPORT') return; // the dropzone handles the upload, not submit
+    var url = method === 'POST' ? createUrl : atomUrl;
+    var opts = { method: method, headers: { 'content-type': 'application/json' } };
+    if (method === 'DELETE') { if (!confirm('Delete ' + atomUrl + '?')) return; }
+    else {
+      var body = {}, attr = {}, bad = null;
+      e.target.querySelectorAll('[name]').forEach(function (el) {
+        var n = el.name;
+        if (n === '$method') return;
+        if (n === '$id') { if (el.value) body.id = el.value; return; }
+        if (n === '$manifest') { body.manifest = el.value; return; }
+        var val;
+        if (el.type === 'checkbox') val = el.checked;
+        else if (el.dataset.kind === 'json') { if (el.value === '') return; try { val = JSON.parse(el.value); } catch (_) { bad = n; return; } }
+        else { if (el.value === '') return; val = el.dataset.kind === 'number' ? Number(el.value) : el.value; }
+        setPath(attr, n, val);
+      });
+      if (bad) { alert('invalid JSON in ' + bad); return; }
+      body.attr = attr; opts.body = JSON.stringify(body);
+    }
+    var r = await fetch(url, opts);
+    if (r.ok) { location.href = method === 'DELETE' ? createUrl : (method === 'POST' ? createUrl : atomUrl); }
+    else { var j = await r.json(); alert(j.error || 'error'); }
+  };
+
+  // IMPORT method: reveal the template + dropzone, hide the normal create rows,
+  // and upload the dropped/picked CSV to the model (the API bulk-creates it).
+  var methodSel = F.querySelector('[name="$method"]');
+  var importRow = F.querySelector('[data-import-row]');
+  if (methodSel && importRow) {
+    var submitBtn = F.querySelector('p > button');
+    var rows = F.querySelectorAll('table tr');
+    var syncImport = function () {
+      var imp = methodSel.value === 'IMPORT';
+      importRow.hidden = !imp;
+      rows.forEach(function (tr) { if (tr !== importRow && !tr.contains(methodSel)) tr.hidden = imp; });
+      if (submitBtn) submitBtn.hidden = imp;
+    };
+    methodSel.addEventListener('change', syncImport); syncImport();
+
+    var DZ = importRow.querySelector('[data-import]'), dzUrl = DZ.getAttribute('data-import');
+    var upload = async function (file) {
+      if (!file) return;
+      var text = await file.text();
+      var resp = await fetch(dzUrl, { method: 'POST', headers: { 'content-type': 'text/csv' }, body: text });
+      var j = await resp.json().catch(function () { return {}; });
+      if (!resp.ok && j.imported === undefined) { alert(j.error || ('import failed: ' + resp.status)); return; }
+      var msg = 'Imported ' + (j.imported || 0) + ' row(s).';
+      if (j.failed && j.failed.length) msg += '\n' + j.failed.length + ' failed:\n' +
+        j.failed.slice(0, 8).map(function (f) { return (f.id || ('row ' + f.row)) + ': ' + f.error; }).join('\n');
+      alert(msg);
+      if (j.imported) location.reload();
+    };
+    ['dragenter', 'dragover'].forEach(function (ev) { DZ.addEventListener(ev, function (e) { e.preventDefault(); DZ.setAttribute('data-over', '1'); }); });
+    ['dragleave', 'dragend'].forEach(function (ev) { DZ.addEventListener(ev, function () { DZ.removeAttribute('data-over'); }); });
+    DZ.addEventListener('drop', function (e) { e.preventDefault(); DZ.removeAttribute('data-over'); upload(e.dataTransfer.files[0]); });
+    var fi = DZ.querySelector('input[type="file"]');
+    if (fi) fi.addEventListener('change', function () { upload(fi.files[0]); });
+  }
+};
+const APP = `(${CLIENT})();`; // the IIFE source served at /app.js
 const store = new Map();      // id -> atom
 let   logSeq = 0;             // ledger sequence
 const invReg = {};            // inverseName -> { sourceModel, field, targetModel }
@@ -904,7 +1143,7 @@ function page(title, body, fab, foot) {
 <header><h1><a href="/">Atomic</a></h1>${foot ? `<p>${foot}</p>` : ''}</header>
 <nav>${fab || ''}</nav>
 <main>${body}</main>
-<script type="module" src="/applib/main.js?v=${APPLIB_VER}"></script>`;
+<script src="/app.js?v=${APP.length}" defer></script>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,7 +1308,7 @@ function renderForm(modelId, atom, actor) {
   if (editing && mayWrite && canOp(actor, modelId, 'delete')) methods.push('DELETE');
   if (!methods.length) return '';
   const LABEL = { POST: 'POST · create', IMPORT: 'IMPORT · bulk CSV', PUT: 'PUT · replace', PATCH: 'PATCH · update', DELETE: 'DELETE · delete' };
-  // IMPORT mode (revealed by applib/import.js when chosen): a template to fill + a dropzone
+  // IMPORT mode (revealed by app.js when chosen): a template to fill + a dropzone
   // that POSTs the CSV to this model. The server bulk-creates it under the same
   // grants/rules as a single create. Only in create context (!editing).
   const importRow = (!editing && canOp(actor, modelId, 'create'))
@@ -1082,7 +1321,7 @@ function renderForm(modelId, atom, actor) {
     : `<tr><th>id</th><td><input name="$id" placeholder="auto"></td></tr>`)
     + `<tr><th>model</th><td><a href="/${esc(modelId)}">atom://${esc(modelId)}</a></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
-  // the form is data-driven; applib/form.js reads these targets and wires submit + repeaters
+  // the form is data-driven; /app.js reads these targets and wires submit + repeaters
   return `<form data-create="${esc('/' + modelId)}" data-atom="${editing ? esc('/' + atom.id) : ''}"><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows}${importRow}</table></figure><p><button>Submit</button></p>${suggest}</form>`;
 }
 
@@ -1237,7 +1476,7 @@ const server = http.createServer(async (req, res) => {
   // x-forwarded-proto). Drives the Secure cookie flag and the magic-link origin.
   const tls = req.socket.encrypted || (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
   // Defense-in-depth headers on every response. The CSP locks scripts to our own
-  // same-origin modules under /applib/ (no inline script anywhere), styles to our sheet
+  // same-origin /app.js (there is no inline script anywhere), styles to our sheet
   // plus Google Fonts, and connect/img/form-action to same-origin only.
   const SECURITY = { 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer' };
   const CSP = "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; "
@@ -1273,12 +1512,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path === 'style.css') {
       res.writeHead(200, { 'content-type': 'text/css', ...SECURITY }); return res.end(CSS);
     }
-    if (req.method === 'GET' && path.startsWith('applib/')) {
-      const name = path.slice('applib/'.length);     // a basename only — no traversal
-      if (/^[a-z0-9-]+\.js$/.test(name) && APPLIB.has(name)) {
-        res.writeHead(200, { 'content-type': 'text/javascript', ...SECURITY }); return res.end(APPLIB.get(name));
-      }
-      return send(404, { error: `no asset ${name}` });
+    if (req.method === 'GET' && path === 'app.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript', ...SECURITY }); return res.end(APP);
     }
 
     // --- sign-in: magic link -> tracked session cookie ---
@@ -1420,31 +1655,85 @@ const server = http.createServer(async (req, res) => {
 // ---------------------------------------------------------------------------
 // Core atoms — the substrate's own schema: the genesis identities, the core
 // model definitions, the expiration conditions/policies, and the core indexes.
-// They are NOT baked into the kernel: each is a file under seeds/core/, loaded
-// here in filename order — so the engine carries no hardcoded schema. ONE source
-// of truth, consumed two ways: bootstrap() seeds them into a fresh store;
-// migrate() ensures any an older store is missing. Schema, identity, and queries
-// are all just atoms, so they all live as data the kernel loads.
+// ONE source of truth, consumed two ways: bootstrap() seeds them into a fresh
+// store; migrate() ensures any that an older store is missing. Schema, identity,
+// and queries are all just atoms, so they all live in the same list.
 // ---------------------------------------------------------------------------
-async function coreAtoms() {
-  // each seeds/core/NN-<id>.mjs default-exports one atom; read them in order.
-  const dir = new URL('./seeds/core/', import.meta.url);
-  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.startsWith('_')).sort();
-  const atoms = [];
-  for (const f of files) {
-    const mod = await import(new URL(f, dir));
-    for (const a of [].concat(mod.default)) atoms.push(a);
-  }
-  return atoms;
+function coreAtoms() {
+  // system/seed atoms reference the 'never' policy — the substrate's own schema
+  // must not expire out from under itself
+  const lc = (by = '0', parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(), createdBy: ref(by), parent: ref(parent), expiration: 'atom://policy-never' });
+  const model = (id, label, fields, extra = {}) => ({ id, model: 'atom://model', manifest: label, attr: { label, version: 1, fields, ...extra }, lifecycle: lc('0') });
+  const atom = (id, kind, manifest, attr, by = '0') => ({ id, model: `atom://${kind}`, manifest, attr, lifecycle: lc(by) });
+  return [
+    // genesis: joey is the root authority; atom://0 is the public/anonymous
+    // identity that also describes the app (no data grants — what an
+    // unauthenticated caller sees).
+    atom('joey', 'token', 'Joey — admin', { email: 'joey@emailjoey.com', grants: [{ path: '**', mode: 'all' }] }, 'joey'),
+    atom('0', 'token', 'A data substrate where schema, data, identity, permissions, and every surface are all atoms — one organism, generated from the same core atoms and rendered on any surface.', {}, 'joey'),
+
+    // core model definitions (the kernel's own types are model atoms)
+    model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
+      indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } }),
+    model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
+      grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' } }),
+    model('grant',  'Grant',  { path: { kind: 'text', required: true },
+      mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } }),
+    model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } }),
+    model('tenant', 'Tenant', { name: { kind: 'text', required: true } }),
+    model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
+      params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } }),
+    model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
+      actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
+      at: { kind: 'datetime' }, changes: { kind: 'list' } }),
+    model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
+      createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } }),
+    // `run` names a vetted script in scripts/ — constrained to a bare basename
+    // (no slashes/dots) so it can never traverse out of the scripts directory.
+    model('hook',   'Hook',   { label: { kind: 'text' },
+      run: { kind: 'text', required: true, pattern: '^[a-z0-9][a-z0-9-]*$' },
+      grants: { kind: 'list', of: 'embed://grant' } }),
+    // a one-way schema transform: moves a model from version `from` to `to`. The
+    // model atom exists and validates; applying migrations on read is still TODO.
+    model('migration', 'Migration', { model: { kind: 'ref', to: 'atom://model' },
+      from: { kind: 'integer' }, to: { kind: 'integer' },
+      op: { kind: 'enum', values: ['rename', 'default', 'custom'] }, spec: { kind: 'json' }, run: { kind: 'text' } }),
+    model('file',   'File',   { name: { kind: 'text' }, contentType: { kind: 'text' },
+      size: { kind: 'integer' }, data: { kind: 'longtext' } }),
+    model('config', 'Config', { key: { kind: 'text', required: true }, value: { kind: 'json' } }),
+    model('plugin', 'Plugin', { name: { kind: 'text', required: true }, version: { kind: 'integer' },
+      models: { kind: 'list' }, indexes: { kind: 'list' }, handlers: { kind: 'list' } }),
+    // a condition is an atom { field, op, value } — a single reusable predicate.
+    // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
+    model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
+      op: { kind: 'enum', values: ['eq', 'ne', 'in', 'older', 'newer'] }, value: { kind: 'json' } }),
+    // a policy is a set of condition atoms; lifecycle.expiration points at one.
+    // An atom expires when ALL the policy's conditions hold (none → never expires).
+    model('policy', 'Policy', { label: { kind: 'text' },
+      conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } }),
+
+    // root expiration conditions + policies — every atom's lifecycle.expiration
+    // points at a policy; policies are made of condition atoms.
+    atom('cond-stale-3y', 'condition', 'Not updated in 3 years', { label: 'Not updated in 3 years', field: 'updatedAt', op: 'older', value: '3y' }),
+    atom('policy-never',   'policy', 'Never expires', { label: 'Never', conditions: [] }),
+    atom('policy-default', 'policy', 'Expires 3 years after last update', { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }),
+
+    // core indexes (queries are atoms too) — named <model>.<qualifier>; also the
+    // worked examples of the grammar. dotted ids route via whole-path match.
+    atom('log.byAtom', 'index', 'Full change history for one atom', { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } }, match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }),
+    atom('atom.byDate', 'index', 'Atoms across all models, newest first', { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }),
+    atom('model.all', 'index', 'Every model in the substrate', { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }),
+    atom('atom.byModel', 'index', 'Atoms of a chosen model', { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }),
+  ];
 }
 
 // ---------------------------------------------------------------------------
 // Bootstrap — fresh store: seed every core atom, then log each as genesis.
-// Demo tenants A / B / C / D are loaded from seeds/seed-*.mjs (POSTed through the
-// API as the admin) so they never bloat the kernel.
+// Demo tenants A / B / C / D are loaded from seeds/seed-*.mjs (POSTed through the API
+// as the admin) so they never bloat the kernel.
 // ---------------------------------------------------------------------------
-async function bootstrap() {
-  for (const a of await coreAtoms()) seed(a);
+function bootstrap() {
+  for (const a of coreAtoms()) seed(a);
   buildInverse();
   // genesis ledger: every seeded atom is itself a logged change — everything is logged
   for (const a of [...store.values()]) {
@@ -1459,8 +1748,8 @@ async function bootstrap() {
 // and backfills lifecycle.expiration on atoms that predate the field. A fresh
 // store is seeded by bootstrap instead; the append-only log + replay means a
 // live store can always be evolved forward.
-async function migrate() {
-  const core = await coreAtoms();
+function migrate() {
+  const core = coreAtoms();
   let added = 0, refreshed = 0;
   for (const a of core) {
     if (!store.has(a.id)) { seed(a); added++; continue; }
@@ -1494,7 +1783,7 @@ async function migrate() {
 }
 
 // ---------------------------------------------------------------------------
-// Governance — `node kernel.mjs --audit` (or `npm run audit`). A self-check over
+// Governance — `node atomic.mjs --audit` (or `npm run audit`). A self-check over
 // the loaded store, in the spirit of a fsck: it asserts the substrate's own
 // invariants and exits non-zero on any finding, so it slots into CI / a cron.
 // Point it at a real store with ATOMIC_STORE=… (and ATOMIC_KEY=… if encrypted).
@@ -1564,9 +1853,9 @@ function audit() {
 if (loadAll()) {                 // durable store on disk -> replay it
   buildInverse();
   logSeq = [...store.values()].reduce((m, a) => a.id.startsWith('log-') ? Math.max(m, +a.id.slice(4) || 0) : m, 0);
-  await migrate();               // evolve an older store forward (idempotent)
+  migrate();                     // evolve an older store forward (idempotent)
 } else {
-  await bootstrap();             // fresh -> seed (and persist, if ATOMIC_STORE is set)
+  bootstrap();                   // fresh -> seed (and persist, if ATOMIC_STORE is set)
 }
 
 if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens
