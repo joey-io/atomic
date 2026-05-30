@@ -939,7 +939,7 @@ function navSelect(actor, current) {
   const opt = (a) => `<option value="/${esc(a.id)}"${a.id === current ? ' selected' : ''}>atom://${esc(a.id)}</option>`;
   const indexes = all.filter((a) => a.model === 'atom://index' && (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over)))).map(opt).join('');
   const models = all.filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map(opt).join('');
-  return `<select onchange="if(this.value)location.href=this.value"><option value="/">atom://0</option>`
+  return `<select data-nav><option value="/">atom://0</option>`
     + (indexes ? `<optgroup label="indexes">${indexes}</optgroup>` : '')
     + (models ? `<optgroup label="models">${models}</optgroup>` : '')
     + `</select>`;

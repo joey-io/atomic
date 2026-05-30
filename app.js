@@ -25,6 +25,13 @@
     });
   });
 
+  // nav dropdown: jump to the selected ref. Wired here (not an inline onchange)
+  // so it runs under the strict CSP, and before the no-form early-return below so
+  // it works on read-only pages too.
+  document.querySelectorAll('select[data-nav]').forEach(function (sel) {
+    sel.addEventListener('change', function () { if (sel.value) location.href = sel.value; });
+  });
+
   // the generated create/edit form (present only when the actor may write here)
   var F = document.querySelector('form[data-create]');
   if (!F) return;
