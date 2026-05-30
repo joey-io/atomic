@@ -166,13 +166,43 @@ function findByIdentity(modelId, attr, modelAtom) {
 // Tokens, grants, redaction
 // ---------------------------------------------------------------------------
 
-function actorFromReq(req, url) {
+const magic = new Map(); // one-time sign-in codes: code -> { token, exp }
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('='); if (i < 0) continue;
+    out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+// The actor is resolved from a tracked session (cookie) or a bearer token.
+// An unauthenticated request resolves to atom://0 — the anonymous identity,
+// which can read the app descriptor but holds no data grants.
+function actorFromReq(req, cookies) {
   const auth = req.headers['authorization'] || '';
-  const m = auth.match(/^Bearer\s+(.+)$/i);
+  const m = auth.match(/^Bearer\s+(.+)$/i);              // integrations present a token directly
   if (m && store.has(m[1])) return getAtom(m[1]);
-  const qt = url?.searchParams.get('token');   // browsers can't set headers on navigation
-  if (qt && store.has(qt)) return getAtom(qt);
-  return getAtom('anon');
+  const sid = cookies['atomic_session'];                 // browsers carry a session the kernel tracks
+  if (sid && store.has(sid)) {
+    const s = store.get(sid);
+    if (s.model === 'atom://session' && s.lifecycle.status === 'active' &&
+        (!s.attr.expiresAt || s.attr.expiresAt > now()) && store.has(refId(s.attr.token)))
+      return getAtom(refId(s.attr.token));
+  }
+  return getAtom('0'); // atom://0 — the anonymous identity (no data grants)
+}
+
+// A session is an atom too — it binds a cookie id to the token it authenticates.
+function newSession(tokenId) {
+  const id = `sess-${randomUUID().slice(0, 8)}`;
+  seed({
+    id, model: 'atom://session', manifest: `session for ${tokenId}`,
+    attr: { token: ref(tokenId), createdAt: now(), expiresAt: new Date(Date.now() + 7 * 864e5).toISOString() },
+    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(), createdBy: ref(tokenId) },
+  });
+  return id;
 }
 
 const grantsOf = (actor) => actor.attr?.grants || [];
@@ -385,19 +415,47 @@ table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 8px;text-
 th{background:#f6f6f6}h1{font-size:1.1rem}</style><h1>${esc(title)}</h1>${body}`;
 }
 
-function renderTable(modelId, atoms, token) {
+function renderTable(modelId, atoms) {
   const m = getAtom(modelId);
   const cols = m.attr.display?.row || Object.keys(m.attr.fields || {});
-  const q = token ? `?as=html&token=${esc(token)}` : '?as=html';
   const head = ['id', ...cols].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
-    `<tr><td><a href="/${esc(a.id)}${q}">${esc(a.id)}</a></td>` +
+    `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td>` +
     cols.map((c) => `<td>${cell(a.attr?.[c])}</td>`).join('') + '</tr>').join('');
   return `<table><tr>${head}</tr>${rows}</table>`;
 }
 
-// add form generated from the model's field kinds; POSTs JSON with the caller's token
-function renderForm(modelId, token) {
+// atom://0 as the public, JSON-LD-shaped description of the app
+function appDescriptor(origin) {
+  const a = getAtom('0');
+  const cat = (m) => [...store.values()].filter((x) => x.model === m)
+    .map((x) => ({ '@id': ref(x.id), name: x.attr.label || x.id, url: `${origin}/${x.id}` }));
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'WebAPI',
+    '@id': 'atom://0',
+    name: a.attr.name || 'Atomic',
+    description: a.attr.description || '',
+    provider: 'atom://joey',
+    models: cat('atom://model'),
+    indexes: cat('atom://index'),
+    potentialAction: { '@type': 'AuthenticateAction', target: `${origin}/auth`, method: 'magic-link' },
+  };
+}
+
+function renderApp(d) {
+  const li = (xs) => xs.map((x) => `<li>${esc(x.name)} <code>${esc(x['@id'])}</code></li>`).join('');
+  return page(d.name, `<p>${esc(d.description)}</p>
+<h1>Types</h1><ul>${li(d.models)}</ul>
+<h1>Queries</h1><ul>${li(d.indexes)}</ul>
+<h1>Sign in</h1><form method="post" action="/auth">
+<p><label>email <input name="email" type="email" placeholder="amy@acme.com"></label></p>
+<button>Send magic link</button></form>
+<p><small>demo: <code>amy@acme.com</code> (admin) · <code>view@acme.com</code> (read-only contacts)</small></p>`);
+}
+
+// add form generated from the model's field kinds; POSTs JSON with the session cookie
+function renderForm(modelId) {
   const m = getAtom(modelId);
   const inputs = Object.entries(m.attr.fields || {})
     .filter(([, d]) => typeof d === 'object')
@@ -412,26 +470,25 @@ function renderForm(modelId, token) {
     }).join('');
   return `<h1>Add ${esc(m.attr.label || modelId)}</h1><form id="add">${inputs}<button>Create</button></form>
 <script>
-var tok=${JSON.stringify(token || '')};
 document.getElementById('add').onsubmit=async function(e){e.preventDefault();var attr={};
 e.target.querySelectorAll('[name]').forEach(function(el){
   if(el.type==='checkbox'){attr[el.name]=el.checked;return;}
   if(el.value==='')return;
   attr[el.name]=(el.dataset.kind==='number'||el.dataset.kind==='integer')?Number(el.value):el.value;});
-var r=await fetch('/'+${JSON.stringify(modelId)},{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+tok},body:JSON.stringify({attr:attr})});
+var r=await fetch('/'+${JSON.stringify(modelId)},{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({attr:attr})});
 if(r.ok){location.reload();}else{var j=await r.json();alert(j.error||'error');}};
 </script>`;
 }
 
-function renderModelPage(modelId, atoms, actor, token) {
+function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
-  const form = canCreate(actor, modelId) ? renderForm(modelId, token) : '';
-  return page(`${m.attr.label || modelId} — ${atoms.length}`, renderTable(modelId, atoms, token) + form);
+  const form = canCreate(actor, modelId) ? renderForm(modelId) : '';
+  return page(`${m.attr.label || modelId} — ${atoms.length}`, renderTable(modelId, atoms) + form);
 }
 
-function renderIndexPage(indexAtom, atoms, token) {
+function renderIndexPage(indexAtom, atoms) {
   return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`,
-    renderTable(refId(indexAtom.attr.over), atoms, token));
+    renderTable(refId(indexAtom.attr.over), atoms));
 }
 
 function renderAtom(atom) {
@@ -440,13 +497,12 @@ function renderAtom(atom) {
   return page(atom.manifest || atom.id, `<table>${rows}</table>`);
 }
 
-function renderHome(h, token) {
-  const q = token ? `&token=${esc(token)}` : '';
+function renderHome(h) {
   const models = h.models.map((m) =>
-    `<li><a href="/${m.id}?as=html${q}">${esc(m.label)}</a> <code>/${m.id}</code></li>`).join('');
+    `<li><a href="/${m.id}">${esc(m.label)}</a> <code>atom://${m.id}</code></li>`).join('');
   const idx = h.indexes.map((i) =>
-    `<li><a href="/${i.id}?as=html${q}">${esc(i.label)}</a> <small>over ${esc(i.over)}</small></li>`).join('');
-  return page('Atomic', `<p>actor <code>${esc(h.actor)}</code> · ${h.atoms} atoms · ${h.ledger} in the ledger</p>
+    `<li><a href="/${i.id}">${esc(i.label)}</a> <small>over ${esc(i.over)}</small></li>`).join('');
+  return page('Atomic', `<p>signed in as <code>${esc(h.actor)}</code> · ${h.atoms} atoms · ${h.ledger} in the ledger · <a href="/auth/logout">sign out</a></p>
 <h1>Models</h1><ul>${models || '<li><em>none visible</em></li>'}</ul>
 <h1>Indexes</h1><ul>${idx || '<li><em>none visible</em></li>'}</ul>`);
 }
@@ -458,7 +514,12 @@ function renderHome(h, token) {
 function readBody(req) {
   return new Promise((resolve) => {
     let b = ''; req.on('data', (c) => (b += c));
-    req.on('end', () => resolve(b ? JSON.parse(b) : {}));
+    req.on('end', () => {
+      const ct = req.headers['content-type'] || '';
+      if (!b) return resolve({});
+      if (ct.includes('x-www-form-urlencoded')) return resolve(Object.fromEntries(new URLSearchParams(b)));
+      try { resolve(JSON.parse(b)); } catch { resolve(Object.fromEntries(new URLSearchParams(b))); }
+    });
   });
 }
 
@@ -467,24 +528,59 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(code, { 'content-type': html ? 'text/html' : 'application/json' });
     res.end(html ? val : JSON.stringify(val, null, 2));
   };
+  const redirect = (location, setCookie) => {
+    const h = { location }; if (setCookie) h['set-cookie'] = setCookie;
+    res.writeHead(302, h); res.end();
+  };
   try {
     const url = new URL(req.url, 'http://x');
-    const actor = actorFromReq(req, url);
-    const token = actor.id !== 'anon' ? actor.id : '';
+    const cookies = parseCookies(req);
+    const origin = `http://${req.headers.host || 'localhost'}`;
     const path = decodeURIComponent(url.pathname).replace(/^\//, '');
     const wantsHtml = (req.headers.accept || '').includes('text/html') ||
                       url.searchParams.get('as') === 'html';
 
-    // POST /auth — magic link (stubbed: returns the bearer to use)
+    // --- sign-in: magic link -> tracked session cookie ---
     if (req.method === 'POST' && path === 'auth') {
       const { email } = await readBody(req);
-      const tok = [...store.values()].find(
-        (a) => a.model === 'atom://token' && a.attr.email === email);
+      const tok = [...store.values()].find((a) => a.model === 'atom://token' && a.attr.email === email);
       if (!tok) return send(404, { error: 'no token for that email' });
-      return send(200, { link: `${url.origin}/?session=${tok.id}`, use: `Authorization: Bearer ${tok.id}` });
+      const code = randomUUID();
+      magic.set(code, { token: tok.id, exp: Date.now() + 15 * 60000 });
+      const link = `${origin}/auth/verify?code=${code}`;
+      if (wantsHtml) return send(200, page('Check your email',
+        `<p>Magic link for <code>${esc(email)}</code> — normally emailed, shown here for the demo:</p>
+<p><a href="${link}">${esc(link)}</a></p>`), true);
+      return send(200, { link });
+    }
+    if (req.method === 'GET' && path === 'auth/verify') {
+      const code = url.searchParams.get('code');
+      const rec = code && magic.get(code);
+      if (!rec || rec.exp < Date.now()) return send(401, { error: 'invalid or expired link' });
+      magic.delete(code);
+      const sid = newSession(rec.token);
+      return redirect('/', `atomic_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`);
+    }
+    if (req.method === 'GET' && path === 'auth/logout') {
+      const sid = cookies['atomic_session'];
+      if (sid && store.has(sid)) store.get(sid).lifecycle.status = 'retired';
+      return redirect('/', 'atomic_session=; Path=/; Max-Age=0');
     }
 
+    const actor = actorFromReq(req, cookies);
+    const isAnon = actor.id === '0';
     const [head, ...segs] = path.split('.');
+
+    // anonymous caller -> the app describes itself at the root (atom://0, JSON-LD)
+    if (req.method === 'GET' && path === '' && isAnon) {
+      const d = appDescriptor(origin);
+      return send(200, wantsHtml ? renderApp(d) : d, wantsHtml);
+    }
+    // no anonymous access to anything else: browsers land on the descriptor, APIs get 401
+    if (isAnon) {
+      if (wantsHtml) return redirect('/');
+      return send(401, { error: 'authenticate: POST /auth { email } or Authorization: Bearer <token>' });
+    }
 
     if (req.method === 'GET') {
       if (path === '') {
@@ -497,7 +593,7 @@ const server = http.createServer(async (req, res) => {
           .map((a) => ({ id: a.id, label: a.attr.label || a.id, over: a.attr.over, url: `/${a.id}` }));
         const home = { atomic: 'minimal kernel', actor: ref(actor.id),
           atoms: store.size, ledger: logSeq, models, indexes };
-        if (wantsHtml) return send(200, renderHome(home, token), true);
+        if (wantsHtml) return send(200, renderHome(home), true);
         return send(200, home);
       }
       const headAtom = getAtom(head);
@@ -505,11 +601,11 @@ const server = http.createServer(async (req, res) => {
       let result;
       if (headAtom.model === 'atom://index') {
         const atoms = runIndex(headAtom, url.search, actor);
-        if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, token), true);
+        if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms), true);
         result = atoms;
       } else if (headAtom.model === 'atom://model' && segs.length === 0) {
         const atoms = listModel(head, q, actor);
-        if (wantsHtml) return send(200, renderModelPage(head, atoms, actor, token), true);
+        if (wantsHtml) return send(200, renderModelPage(head, atoms, actor), true);
         result = atoms;
       } else if (segs.length) result = traverse(headAtom, segs);
       else {
@@ -542,10 +638,14 @@ function bootstrap() {
   });
 
   // genesis: joey -> atom://0 -> core models
-  seed({ id: 'joey', model: 'atom://token', manifest: 'Joey (founding operator)',
+  // joey is the root authority; atom://0 is the public/anonymous identity that
+  // also describes the app (no data grants — it is what an unauthenticated caller sees).
+  seed({ id: 'joey', model: 'atom://token', manifest: 'Joey (founding operator, root authority)',
     attr: { grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('joey') });
-  seed({ id: '0', model: 'atom://token', manifest: 'Root token',
-    attr: { grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('joey') });
+  seed({ id: '0', model: 'atom://token', manifest: 'Atomic (public root + anonymous identity)',
+    attr: { name: 'Atomic',
+      description: 'A data substrate where schema, data, identity, and the UI surface are all atoms.',
+      grants: [] }, lifecycle: lc('joey') });
 
   // core model definitions (the kernel's own types are model atoms)
   model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
@@ -558,6 +658,8 @@ function bootstrap() {
   model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
     actor: { kind: 'ref', to: 'atom://token' }, at: { kind: 'datetime' }, changes: { kind: 'list' } });
   model('team',   'Team',   { name: { kind: 'text', required: true } });
+  model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
+    createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } });
 
   // CRM models
   model('company', 'Company', {
@@ -602,14 +704,6 @@ function bootstrap() {
       grants: [{ path: 'contact.name', mode: 'read' }, { path: 'contact.title', mode: 'read' }] }, lifecycle: lc('0') });
   seed({ id: 'tok-outreach', model: 'atom://token', manifest: 'Outreach integration',
     attr: { tenant: 'atom://acme', grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy') });
-  seed({ id: 'anon', model: 'atom://token', manifest: 'Anonymous public caller',
-    attr: { grants: [
-      { path: 'company.*', mode: 'read' },
-      { path: 'contact.*', mode: 'read' },
-      { path: 'deal.*', mode: 'read' },
-      { path: 'registration.*', mode: 'write' },
-    ] }, lifecycle: lc('0') });
-
   // demo records — so the live instance has data to navigate (in-memory: reseeded each start)
   seed({ id: 'northwind', model: 'atom://company', manifest: 'Northwind Traders, enterprise account',
     attr: { name: 'Northwind Traders', domain: 'northwind.com',
