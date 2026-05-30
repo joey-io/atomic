@@ -679,6 +679,13 @@ const server = http.createServer(async (req, res) => {
         if (wantsHtml) return send(200, renderHome(home), true);
         return send(200, home);
       }
+      // atom://atom is the universal type — every atom, newest first
+      if (head === 'atom' && segs.length === 0) {
+        const atoms = sortBy([...store.values()].filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
+          .map((a) => redact(actor, a));
+        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms)), true);
+        return send(200, atoms);
+      }
       const headAtom = getAtom(head);
       const q = parseQuery(url.search);
       let result;
