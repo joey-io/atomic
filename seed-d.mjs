@@ -3,12 +3,12 @@
 // the master bedroom, the two kids share the hall bathroom, and everyone uses the
 // family room — as first-class, queryable edges. Run: node seed-d.mjs
 //
-// Earle is one of the two adults; he also gets an open-login token (atom://earle,
-// earled@me.com) so he can one-click into the house from the homepage and read it.
+// Billy is one of the two adults; he also gets an open-login token (atom://billy,
+// j@a-gnt.com) so he can one-click into the house from the homepage and read it.
 import { tenant, model, token, atom, index, A } from './seed-lib.mjs';
 
 // raw PATCH (update) as the admin token — used by lockToHouse() to install the
-// graph-gated write rules and Earle's house anchor after the data exists.
+// graph-gated write rules and Billy's house anchor after the data exists.
 const BASE = process.env.ATOMIC_BASE || 'http://localhost:3040';
 const TOK = process.env.ATOMIC_TOKEN || 'joey';
 async function patch(id, attr) {
@@ -125,8 +125,8 @@ await atom('room', 'd-rm-kitchen', T, { name: 'Kitchen',        kind: 'kitchen',
 await atom('room', 'd-rm-bath-m',  T, { name: 'Master Bath',    kind: 'bathroom', shared: true, house: A('d-house') }, 'Master Bath');
 await atom('room', 'd-rm-bath-h',  T, { name: 'Hall Bath',      kind: 'bathroom', shared: true, house: A('d-house') }, 'Hall Bath');
 
-// residents: 2 adults (Earle + Robin share the master) + 2 kids (own bedrooms)
-await atom('resident', 'd-res-earle', T, { name: 'Earle Henderson', role: 'adult', age: 41, house: A('d-house'), bedroom: A('d-rm-master') }, 'Earle Henderson');
+// residents: 2 adults (Billy + Robin share the master) + 2 kids (own bedrooms)
+await atom('resident', 'd-res-billy', T, { name: 'Billy Henderson', role: 'adult', age: 41, house: A('d-house'), bedroom: A('d-rm-master') }, 'Billy Henderson');
 await atom('resident', 'd-res-robin', T, { name: 'Robin Henderson', role: 'adult', age: 39, house: A('d-house'), bedroom: A('d-rm-master') }, 'Robin Henderson');
 await atom('resident', 'd-res-maya',  T, { name: 'Maya Henderson',  role: 'child', age: 11, house: A('d-house'), bedroom: A('d-rm-maya') },  'Maya Henderson');
 await atom('resident', 'd-res-theo',  T, { name: 'Theo Henderson',  role: 'child', age: 8,  house: A('d-house'), bedroom: A('d-rm-theo') },  'Theo Henderson');
@@ -136,12 +136,12 @@ await atom('resident', 'd-res-theo',  T, { name: 'Theo Henderson',  role: 'child
 //   • everyone uses the kitchen       → usage.byRoom(d-rm-kitchen) == 4
 //   • the two adults use the master bath
 //   • the two kids SHARE the hall bath → usage.byRoom(d-rm-bath-h) == 2 (both kids)
-const EVERYONE = ['d-res-earle', 'd-res-robin', 'd-res-maya', 'd-res-theo'];
+const EVERYONE = ['d-res-billy', 'd-res-robin', 'd-res-maya', 'd-res-theo'];
 let u = 0;
 const use = (res, room, purpose) => atom('usage', `d-use-${++u}`, T, { resident: A(res), room: A(room), purpose }, `${res} → ${room}`);
 for (const r of EVERYONE) await use(r, 'd-rm-family', 'gather');
 for (const r of EVERYONE) await use(r, 'd-rm-kitchen', 'meals');
-await use('d-res-earle', 'd-rm-bath-m', 'wash');
+await use('d-res-billy', 'd-rm-bath-m', 'wash');
 await use('d-res-robin', 'd-rm-bath-m', 'wash');
 await use('d-res-maya',  'd-rm-bath-h', 'wash');   // the two kids
 await use('d-res-theo',  'd-rm-bath-h', 'wash');   // share the hall bathroom
@@ -160,12 +160,12 @@ const things = [
   ['Dishwasher', 'appliance', 'd-rm-kitchen', null],
   ['Dining Table', 'furniture', 'd-rm-kitchen', null],
   ['Cookware Set', 'kitchenware', 'd-rm-kitchen', null],
-  // master bedroom (Earle + Robin)
+  // master bedroom (Billy + Robin)
   ['Queen Bed', 'furniture', 'd-rm-master', null],
-  ["Earle's Dresser", 'furniture', 'd-rm-master', 'd-res-earle'],
+  ["Billy's Dresser", 'furniture', 'd-rm-master', 'd-res-billy'],
   ["Robin's Dresser", 'furniture', 'd-rm-master', 'd-res-robin'],
   ['Reading Lamp', 'decor', 'd-rm-master', 'd-res-robin'],
-  ["Earle's Laptop", 'electronics', 'd-rm-master', 'd-res-earle'],
+  ["Billy's Laptop", 'electronics', 'd-rm-master', 'd-res-billy'],
   // Maya's room
   ['Twin Bed', 'furniture', 'd-rm-maya', 'd-res-maya'],
   ['Study Desk', 'furniture', 'd-rm-maya', 'd-res-maya'],
@@ -187,7 +187,7 @@ for (const [name, category, room, owner] of things)
     { name, category, room: A(room), ...(owner ? { owner: A(owner) } : {}) }, name);
 
 // ---------------------------------------------------------------------------
-// Earle's access — Earle OWNS the house. His open-login token (one-click on the
+// Billy's access — Billy OWNS the house. His open-login token (one-click on the
 // homepage) gets FULL write, but only inside his own house's ref tree:
 //   • read  everything in his tenant (**),
 //   • update his house atom (house.**),
@@ -196,7 +196,7 @@ for (const [name, category, room, owner] of things)
 //     atoms whose ref path resolves back to his house (atom://d-house).
 // The grant says WHICH OPS; the rule says WHICH ATOMS (the house ref tree).
 // ---------------------------------------------------------------------------
-await token('earle', 'd', { email: 'earled@me.com', login: 'open', grants: [
+await token('billy', 'd', { email: 'j@a-gnt.com', login: 'open', grants: [
   { path: '**',           mode: 'read'   },
   { path: 'house.**',     mode: 'update' },
   { path: 'room.**',      mode: 'all'    },
@@ -205,16 +205,16 @@ await token('earle', 'd', { email: 'earled@me.com', login: 'open', grants: [
   { path: 'usage.**',     mode: 'all'    },
 ] });
 
-// lockToHouse(): anchor Earle to his house, then install the graph-gated write
+// lockToHouse(): anchor Billy to his house, then install the graph-gated write
 // rules — run LAST, after all data exists. Once the rules are on, only a token
 // whose `actor.house` matches may write the tree (joey, with no house, is
 // intentionally locked out of household writes; re-running the seed unlocks via
 // setRules('true') above, rebuilds, and re-locks here).
 async function lockToHouse() {
-  // anchor the root's `home` to itself, and Earle to the house. Re-assert Earle's
+  // anchor the root's `home` to itself, and Billy to the house. Re-assert Billy's
   // tree-scoped grants too — idempotent even if the token pre-existed broader.
   await patch('d-house', { home: A('d-house') });
-  await patch('earle', { house: A('d-house'), grants: [
+  await patch('billy', { house: A('d-house'), grants: [
     { path: '**',           mode: 'read'   },
     { path: 'house.**',     mode: 'update' },
     { path: 'room.**',      mode: 'all'    },
@@ -233,4 +233,4 @@ async function lockToHouse() {
 }
 await lockToHouse();
 
-console.log(`seed-d: Household — 1 house, 7 rooms, 4 residents, ${b} belongings, ${u} usage edges; open-login atom://earle (earled@me.com) — full write gated to his house ref tree`);
+console.log(`seed-d: Household — 1 house, 7 rooms, 4 residents, ${b} belongings, ${u} usage edges; open-login atom://billy (j@a-gnt.com) — full write gated to his house ref tree`);
