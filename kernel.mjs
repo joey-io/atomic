@@ -277,6 +277,17 @@ function visible(actor, atom) {
   return at === null || ut === null || at === ut;
 }
 
+// ---------------------------------------------------------------------------
+// Sharded store seam. getStore(actor).all() yields the atoms in the actor's
+// scope: the global (core) atoms plus its own tenant's. Every multi-atom read
+// goes through here, so the tenant boundary lives in one place. In this kernel
+// it filters a single in-memory Map; a sharded build swaps this for one store
+// per tenant (e.g. SQLite/LMDB opened lazily, with the core models replicated).
+// ---------------------------------------------------------------------------
+function getStore(actor) {
+  return { all: () => [...store.values()].filter((a) => visible(actor, a)) };
+}
+
 function redact(actor, atom) {
   if (atom.id === '0') return atom; // the public root atom — the address everyone sees
   const modelId = refId(atom.model);
@@ -452,8 +463,8 @@ function sortBy(atoms, sort) {
 }
 
 function listModel(modelId, q, actor) {
-  let atoms = [...store.values()].filter(
-    (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired' && visible(actor, a));
+  let atoms = getStore(actor).all().filter(
+    (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired');
   for (const f of q.filters) atoms = atoms.filter((a) => passes(a, f));
   atoms = sortBy(atoms, q.sort);
   return atoms.map((a) => redact(actor, a));
@@ -464,8 +475,8 @@ function runIndex(indexAtom, search, actor) {
   const all = over === 'atom';                 // pseudo-model atom://atom = every atom
   const params = new URLSearchParams(search);
   const match = indexAtom.attr.match || {};
-  let atoms = [...store.values()].filter((a) =>
-    a.lifecycle?.status !== 'retired' && visible(actor, a) &&
+  let atoms = getStore(actor).all().filter((a) =>
+    a.lifecycle?.status !== 'retired' &&
     (all ? a.model !== 'atom://log' : a.model === ref(over)));
   for (const [field, cond] of Object.entries(match)) {
     if (typeof cond === 'string' && cond.startsWith('params.')) {
@@ -602,8 +613,9 @@ function renderForm(modelId, atom, actor) {
   const fieldRows = Object.entries(m.attr.fields || {})
     .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(k, def, cur[k])}</td></tr>`).join('');
   // a datalist per model — its atoms (atom://) plus embed://<model> — for any ref at any depth
-  const suggest = [...store.values()].filter((a) => a.model === 'atom://model').map((mm) =>
-    `<datalist id="refs-${esc(mm.id)}">${[...store.values()].filter((a) => a.model === ref(mm.id) && a.lifecycle?.status !== 'retired')
+  const scope = getStore(actor).all();
+  const suggest = scope.filter((a) => a.model === 'atom://model').map((mm) =>
+    `<datalist id="refs-${esc(mm.id)}">${scope.filter((a) => a.model === ref(mm.id) && a.lifecycle?.status !== 'retired')
       .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}<option value="embed://${esc(mm.id)}"></option></datalist>`).join('');
   // the methods this actor may run here, from its grants (the auth schema)
   const methods = [];
@@ -662,8 +674,8 @@ function peerSelect(peers, current) {
 // peers = siblings in the tree: atoms sharing this atom's parent, visible to the actor
 const peersOf = (atom, actor) => {
   const parent = atom.lifecycle?.parent;
-  return [...store.values()]
-    .filter((a) => a.lifecycle?.parent === parent && a.lifecycle?.status !== 'retired' && visible(actor, a))
+  return getStore(actor).all()
+    .filter((a) => a.lifecycle?.parent === parent && a.lifecycle?.status !== 'retired')
     .map((a) => ({ id: a.id, label: a.manifest || a.attr?.name || a.attr?.label || a.id }));
 };
 
@@ -699,8 +711,8 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
       return `<tr><th>${esc(name)}</th><td>${input}</td></tr>`;
     }).join('');
     const targets = [...new Set(Object.values(params).filter((d) => d.kind === 'ref' && d.to).map((d) => refId(d.to)))];
-    const lists = targets.map((t) => `<datalist id="refs-${esc(t)}">${[...store.values()]
-      .filter((a) => a.model === ref(t) && a.lifecycle?.status !== 'retired' && visible(actor, a))
+    const lists = targets.map((t) => `<datalist id="refs-${esc(t)}">${getStore(actor).all()
+      .filter((a) => a.model === ref(t) && a.lifecycle?.status !== 'retired')
       .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}</datalist>`).join('');
     form = `<form method="get" action="/${esc(indexAtom.id)}"><div class="tw"><table class="form">${rows}</table></div><p><button>Run</button></p>${lists}</form>`;
   }
@@ -804,7 +816,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET') {
       // atom://atom is the universal type — every atom, newest first
       if (head === 'atom' && segs.length === 0) {
-        const atoms = sortBy([...store.values()].filter((a) => a.lifecycle?.status !== 'retired' && visible(actor, a)), '-createdAt')
+        const atoms = sortBy(getStore(actor).all().filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
           .map((a) => redact(actor, a));
         if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), peerSelect(peersOf(getAtom('0'), actor), '')), true);
         return send(200, atoms);
