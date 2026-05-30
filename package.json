@@ -7,7 +7,7 @@
     "start": "node kernel.mjs",
     "test": "node test.mjs",
     "audit": "node kernel.mjs --audit",
-    "seed": "node seed-a.mjs && node seed-b.mjs && node seed-c.mjs && node seed-d.mjs"
+    "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
   },
   "license": "MIT"
 }

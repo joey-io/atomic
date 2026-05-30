@@ -1,5 +1,5 @@
 // Demo C — a hybrid: both a (small) fundraising operation and an advocacy
-// program in one tenant, reusing the same models. Run: node seed-c.mjs
+// program in one tenant, reusing the same models. Run: node seeds/seed-c.mjs
 import { tenant, defineModels, defineStates, atom, addr, A } from './seed-lib.mjs';
 
 await defineModels();

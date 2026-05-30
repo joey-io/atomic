@@ -30,7 +30,15 @@ try {
 
 const readAsset = (name) => { try { return fs.readFileSync(new URL(`./${name}`, import.meta.url), 'utf8'); } catch { return ''; } };
 const CSS = readAsset('style.css');
-const APP = readAsset('app.js'); // the static client, served same-origin so the page runs under a strict CSP
+// the static client — one ES module per behaviour under applib/, served same-
+// origin (script-src 'self') and loaded as a module graph. Read at boot into a
+// map; APPLIB_VER busts the entry module's cache whenever any module changes.
+const APPLIB = new Map();
+try {
+  const dir = new URL('./applib/', import.meta.url);
+  for (const f of fs.readdirSync(dir)) if (f.endsWith('.js')) APPLIB.set(f, fs.readFileSync(new URL(f, dir), 'utf8'));
+} catch { /* no applib dir — the client is optional */ }
+const APPLIB_VER = [...APPLIB.values()].reduce((n, s) => n + s.length, 0);
 const store = new Map();      // id -> atom
 let   logSeq = 0;             // ledger sequence
 const invReg = {};            // inverseName -> { sourceModel, field, targetModel }
@@ -896,7 +904,7 @@ function page(title, body, fab, foot) {
 <header><h1><a href="/">Atomic</a></h1>${foot ? `<p>${foot}</p>` : ''}</header>
 <nav>${fab || ''}</nav>
 <main>${body}</main>
-<script src="/app.js?v=${APP.length}" defer></script>`;
+<script type="module" src="/applib/main.js?v=${APPLIB_VER}"></script>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1069,7 @@ function renderForm(modelId, atom, actor) {
   if (editing && mayWrite && canOp(actor, modelId, 'delete')) methods.push('DELETE');
   if (!methods.length) return '';
   const LABEL = { POST: 'POST · create', IMPORT: 'IMPORT · bulk CSV', PUT: 'PUT · replace', PATCH: 'PATCH · update', DELETE: 'DELETE · delete' };
-  // IMPORT mode (revealed by app.js when chosen): a template to fill + a dropzone
+  // IMPORT mode (revealed by applib/import.js when chosen): a template to fill + a dropzone
   // that POSTs the CSV to this model. The server bulk-creates it under the same
   // grants/rules as a single create. Only in create context (!editing).
   const importRow = (!editing && canOp(actor, modelId, 'create'))
@@ -1074,7 +1082,7 @@ function renderForm(modelId, atom, actor) {
     : `<tr><th>id</th><td><input name="$id" placeholder="auto"></td></tr>`)
     + `<tr><th>model</th><td><a href="/${esc(modelId)}">atom://${esc(modelId)}</a></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
-  // the form is data-driven; /app.js reads these targets and wires submit + repeaters
+  // the form is data-driven; applib/form.js reads these targets and wires submit + repeaters
   return `<form data-create="${esc('/' + modelId)}" data-atom="${editing ? esc('/' + atom.id) : ''}"><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows}${importRow}</table></figure><p><button>Submit</button></p>${suggest}</form>`;
 }
 
@@ -1229,7 +1237,7 @@ const server = http.createServer(async (req, res) => {
   // x-forwarded-proto). Drives the Secure cookie flag and the magic-link origin.
   const tls = req.socket.encrypted || (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
   // Defense-in-depth headers on every response. The CSP locks scripts to our own
-  // same-origin /app.js (there is no inline script anywhere), styles to our sheet
+  // same-origin modules under /applib/ (no inline script anywhere), styles to our sheet
   // plus Google Fonts, and connect/img/form-action to same-origin only.
   const SECURITY = { 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer' };
   const CSP = "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; "
@@ -1265,8 +1273,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path === 'style.css') {
       res.writeHead(200, { 'content-type': 'text/css', ...SECURITY }); return res.end(CSS);
     }
-    if (req.method === 'GET' && path === 'app.js') {
-      res.writeHead(200, { 'content-type': 'text/javascript', ...SECURITY }); return res.end(APP);
+    if (req.method === 'GET' && path.startsWith('applib/')) {
+      const name = path.slice('applib/'.length);     // a basename only — no traversal
+      if (/^[a-z0-9-]+\.js$/.test(name) && APPLIB.has(name)) {
+        res.writeHead(200, { 'content-type': 'text/javascript', ...SECURITY }); return res.end(APPLIB.get(name));
+      }
+      return send(404, { error: `no asset ${name}` });
     }
 
     // --- sign-in: magic link -> tracked session cookie ---
@@ -1408,85 +1420,31 @@ const server = http.createServer(async (req, res) => {
 // ---------------------------------------------------------------------------
 // Core atoms — the substrate's own schema: the genesis identities, the core
 // model definitions, the expiration conditions/policies, and the core indexes.
-// ONE source of truth, consumed two ways: bootstrap() seeds them into a fresh
-// store; migrate() ensures any that an older store is missing. Schema, identity,
-// and queries are all just atoms, so they all live in the same list.
+// They are NOT baked into the kernel: each is a file under seeds/core/, loaded
+// here in filename order — so the engine carries no hardcoded schema. ONE source
+// of truth, consumed two ways: bootstrap() seeds them into a fresh store;
+// migrate() ensures any an older store is missing. Schema, identity, and queries
+// are all just atoms, so they all live as data the kernel loads.
 // ---------------------------------------------------------------------------
-function coreAtoms() {
-  // system/seed atoms reference the 'never' policy — the substrate's own schema
-  // must not expire out from under itself
-  const lc = (by = '0', parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(), createdBy: ref(by), parent: ref(parent), expiration: 'atom://policy-never' });
-  const model = (id, label, fields, extra = {}) => ({ id, model: 'atom://model', manifest: label, attr: { label, version: 1, fields, ...extra }, lifecycle: lc('0') });
-  const atom = (id, kind, manifest, attr, by = '0') => ({ id, model: `atom://${kind}`, manifest, attr, lifecycle: lc(by) });
-  return [
-    // genesis: joey is the root authority; atom://0 is the public/anonymous
-    // identity that also describes the app (no data grants — what an
-    // unauthenticated caller sees).
-    atom('joey', 'token', 'Joey — admin', { email: 'joey@emailjoey.com', grants: [{ path: '**', mode: 'all' }] }, 'joey'),
-    atom('0', 'token', 'A data substrate where schema, data, identity, permissions, and every surface are all atoms — one organism, generated from the same core atoms and rendered on any surface.', {}, 'joey'),
-
-    // core model definitions (the kernel's own types are model atoms)
-    model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
-      indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } }),
-    model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
-      grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' } }),
-    model('grant',  'Grant',  { path: { kind: 'text', required: true },
-      mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } }),
-    model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } }),
-    model('tenant', 'Tenant', { name: { kind: 'text', required: true } }),
-    model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
-      params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } }),
-    model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
-      actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
-      at: { kind: 'datetime' }, changes: { kind: 'list' } }),
-    model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
-      createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } }),
-    // `run` names a vetted script in scripts/ — constrained to a bare basename
-    // (no slashes/dots) so it can never traverse out of the scripts directory.
-    model('hook',   'Hook',   { label: { kind: 'text' },
-      run: { kind: 'text', required: true, pattern: '^[a-z0-9][a-z0-9-]*$' },
-      grants: { kind: 'list', of: 'embed://grant' } }),
-    // a one-way schema transform: moves a model from version `from` to `to`. The
-    // model atom exists and validates; applying migrations on read is still TODO.
-    model('migration', 'Migration', { model: { kind: 'ref', to: 'atom://model' },
-      from: { kind: 'integer' }, to: { kind: 'integer' },
-      op: { kind: 'enum', values: ['rename', 'default', 'custom'] }, spec: { kind: 'json' }, run: { kind: 'text' } }),
-    model('file',   'File',   { name: { kind: 'text' }, contentType: { kind: 'text' },
-      size: { kind: 'integer' }, data: { kind: 'longtext' } }),
-    model('config', 'Config', { key: { kind: 'text', required: true }, value: { kind: 'json' } }),
-    model('plugin', 'Plugin', { name: { kind: 'text', required: true }, version: { kind: 'integer' },
-      models: { kind: 'list' }, indexes: { kind: 'list' }, handlers: { kind: 'list' } }),
-    // a condition is an atom { field, op, value } — a single reusable predicate.
-    // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
-    model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
-      op: { kind: 'enum', values: ['eq', 'ne', 'in', 'older', 'newer'] }, value: { kind: 'json' } }),
-    // a policy is a set of condition atoms; lifecycle.expiration points at one.
-    // An atom expires when ALL the policy's conditions hold (none → never expires).
-    model('policy', 'Policy', { label: { kind: 'text' },
-      conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } }),
-
-    // root expiration conditions + policies — every atom's lifecycle.expiration
-    // points at a policy; policies are made of condition atoms.
-    atom('cond-stale-3y', 'condition', 'Not updated in 3 years', { label: 'Not updated in 3 years', field: 'updatedAt', op: 'older', value: '3y' }),
-    atom('policy-never',   'policy', 'Never expires', { label: 'Never', conditions: [] }),
-    atom('policy-default', 'policy', 'Expires 3 years after last update', { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }),
-
-    // core indexes (queries are atoms too) — named <model>.<qualifier>; also the
-    // worked examples of the grammar. dotted ids route via whole-path match.
-    atom('log.byAtom', 'index', 'Full change history for one atom', { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } }, match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }),
-    atom('atom.byDate', 'index', 'Atoms across all models, newest first', { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }),
-    atom('model.all', 'index', 'Every model in the substrate', { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }),
-    atom('atom.byModel', 'index', 'Atoms of a chosen model', { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }),
-  ];
+async function coreAtoms() {
+  // each seeds/core/NN-<id>.mjs default-exports one atom; read them in order.
+  const dir = new URL('./seeds/core/', import.meta.url);
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.startsWith('_')).sort();
+  const atoms = [];
+  for (const f of files) {
+    const mod = await import(new URL(f, dir));
+    for (const a of [].concat(mod.default)) atoms.push(a);
+  }
+  return atoms;
 }
 
 // ---------------------------------------------------------------------------
 // Bootstrap — fresh store: seed every core atom, then log each as genesis.
-// Demo tenants A / B / C / D are loaded from seed-*.mjs (POSTed through the API
-// as the admin) so they never bloat the kernel.
+// Demo tenants A / B / C / D are loaded from seeds/seed-*.mjs (POSTed through the
+// API as the admin) so they never bloat the kernel.
 // ---------------------------------------------------------------------------
-function bootstrap() {
-  for (const a of coreAtoms()) seed(a);
+async function bootstrap() {
+  for (const a of await coreAtoms()) seed(a);
   buildInverse();
   // genesis ledger: every seeded atom is itself a logged change — everything is logged
   for (const a of [...store.values()]) {
@@ -1501,8 +1459,8 @@ function bootstrap() {
 // and backfills lifecycle.expiration on atoms that predate the field. A fresh
 // store is seeded by bootstrap instead; the append-only log + replay means a
 // live store can always be evolved forward.
-function migrate() {
-  const core = coreAtoms();
+async function migrate() {
+  const core = await coreAtoms();
   let added = 0, refreshed = 0;
   for (const a of core) {
     if (!store.has(a.id)) { seed(a); added++; continue; }
@@ -1606,9 +1564,9 @@ function audit() {
 if (loadAll()) {                 // durable store on disk -> replay it
   buildInverse();
   logSeq = [...store.values()].reduce((m, a) => a.id.startsWith('log-') ? Math.max(m, +a.id.slice(4) || 0) : m, 0);
-  migrate();                     // evolve an older store forward (idempotent)
+  await migrate();               // evolve an older store forward (idempotent)
 } else {
-  bootstrap();                   // fresh -> seed (and persist, if ATOMIC_STORE is set)
+  await bootstrap();             // fresh -> seed (and persist, if ATOMIC_STORE is set)
 }
 
 if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens

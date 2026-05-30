@@ -1,7 +1,7 @@
 // Demo D — a household: a 3-bedroom house, every room, all the stuff inside it,
 // and the people who live there. Models the real sharing rules — two adults share
 // the master bedroom, the two kids share the hall bathroom, and everyone uses the
-// family room — as first-class, queryable edges. Run: node seed-d.mjs
+// family room — as first-class, queryable edges. Run: node seeds/seed-d.mjs
 //
 // Billy is one of the two adults; he also gets an open-login token (atom://billy,
 // j@a-gnt.com) so he can one-click into the house from the homepage and read it.
