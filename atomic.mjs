@@ -3,12 +3,13 @@
 // One store of atoms. The schema is atoms. Identity is a token atom.
 // CRUD is the ledger. The HTTP surface is generated from the atoms.
 //
-// Dependency-free. Run: node atomic.mjs   (Node >= 18)
+// Dependency-free. Run: node atomic.mjs   (Node >= 22.5 for node:sqlite; >= 24 unflagged)
 //
-// In-memory by default; point ATOMIC_STORE at a directory for durable,
-// per-tenant, append-only persistence — replayed on boot, optionally AES-256-GCM
-// encrypted at rest. It implements the load-bearing model from the README; a few
-// deeper paths remain marked TODO (migration-on-read, rule-predicate breadth).
+// In-memory by default; point ATOMIC_STORE at a directory for durable, indexed,
+// ACID persistence in embedded SQLite (node:sqlite) — authoritative on disk,
+// optionally AES-256-GCM encrypted at rest. It implements the full load-bearing
+// model from the README: CRUD, grants, tenancy, hooks, lazy expiration, and lazy
+// schema migration (version-bump rewrite on read).
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -329,30 +330,45 @@ function buildInverse() {
   }
 }
 
-function inverseList(targetId, inv) {
+function inverseList(targetId, inv, actor) {
   const out = [];
   for (const a of store.query({ model: ref(inv.sourceModel) })) {
-    if (a.lifecycle?.status !== 'retired' && a.attr?.[inv.field] === ref(targetId))
+    if (a.lifecycle?.status !== 'retired' && a.attr?.[inv.field] === ref(targetId)
+        && (!actor || canSee(actor, a.id)))     // an actor-scoped read only sees backlinks it may open
       out.push(ref(a.id));
   }
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Path resolution: read across fields, edges, and inverse edges
+// Path resolution: read across fields, edges, and inverse edges. When an `actor`
+// is supplied (the HTTP read path), every ref hop and every attribute read is
+// gated exactly like the whole-atom view — a path can never reach an atom the
+// actor can't open, nor a field it can't read. Omit the actor (rule evaluation)
+// to traverse ungated, as the system.
 // ---------------------------------------------------------------------------
 
-const deref = (node) => (isRef(node) ? getAtom(refId(node)) : node);
+const deref = (node, actor) => {
+  if (!isRef(node)) return node;
+  const a = getAtom(refId(node));
+  if (actor && !canSee(actor, a.id)) throw new Err(404, `no atom ${refId(node)}`); // can't cross into an unreadable/foreign atom
+  return a;
+};
 
-function readField(node, seg) {
+function readField(node, seg, actor) {
   if (node == null) throw new Err(404, `null before .${seg}`);
-  if (Array.isArray(node)) return node.map((n) => readField(deref(n), seg));
+  if (Array.isArray(node)) return node.map((n) => readField(deref(n, actor), seg, actor));
   if (isAtomObj(node)) {
-    if (node.attr && seg in node.attr) return node.attr[seg];
+    if (node.attr && seg in node.attr) {
+      // per-attribute read grant — the same redaction the whole-atom view applies,
+      // so a path can't reach an attribute the actor couldn't see directly.
+      if (actor && !canRead(actor, `${refId(node.model)}.${seg}`)) throw new Err(404, `no field .${seg} on ${node.id}`);
+      return node.attr[seg];
+    }
     if (node.lifecycle && typeof node.lifecycle === 'object' && seg in node.lifecycle)
       return node.lifecycle[seg];
     const inv = invReg[seg];
-    if (inv && inv.targetModel === refId(node.model)) return inverseList(node.id, inv);
+    if (inv && inv.targetModel === refId(node.model)) return inverseList(node.id, inv, actor);
     // virtual `.tenant` edge: every atom's nearest tenant ancestor, as a ref (or
     // null at the global root). Lets rules read `actor.tenant` / `atom.tenant`
     // without a stored field. Only a fallback — a real `tenant` attr wins above.
@@ -363,10 +379,10 @@ function readField(node, seg) {
   throw new Err(404, `cannot read .${seg} of a scalar`);
 }
 
-function traverse(start, segs) {
+function traverse(start, segs, actor) {
   if (segs.length > 16) throw new Err(400, 'path exceeds traversal budget'); // budget/cycle guard
   let node = start;
-  for (const seg of segs) node = readField(deref(node), seg);
+  for (const seg of segs) node = readField(deref(node, actor), seg, actor);
   return node; // final value left un-dereferenced (a ref stays a ref)
 }
 
@@ -502,8 +518,13 @@ function actorFromReq(req, cookies) {
   const auth = req.headers['authorization'] || '';
   const m = auth.match(/^Bearer\s+(.+)$/i);              // integrations present a token directly
   // a bearer credential must resolve to a TOKEN atom — never any other atom kind,
-  // so e.g. `Bearer northwind` (a company id) can't be presented as an identity.
-  if (m && store.has(m[1])) { const t = getAtom(m[1]); if (t.model === 'atom://token') return t; }
+  // so e.g. `Bearer northwind` (a company id) can't be presented as an identity —
+  // and the token must still be live: retiring or expiring a token revokes it (the
+  // session path below already checks this; the Bearer path must too).
+  if (m && store.has(m[1])) {
+    const t = getAtom(m[1]);
+    if (t.model === 'atom://token' && t.lifecycle?.status !== 'retired' && !isExpired(t)) return t;
+  }
   const sid = cookies['atomic_session'];                 // browsers carry a session the kernel tracks
   if (sid && store.has(sid)) {
     const s = store.get(sid);
@@ -588,13 +609,24 @@ const canRead = (actor, target) => allows(actor, target, 'read');
 const readableAtom = (actor, a) =>
   a.lifecycle?.status !== 'retired' && canOp(actor, refId(a.model), 'read') && ruleOk(actor, a, 'read');
 
-// Attenuation: a token may only be issued with grants that are a subset of the
-// issuer's own — it can never grant more than it holds.
+// Attenuation: a token (or hook) may only be issued with grants that are a subset
+// of the issuer's own — it can never grant more than it holds. This covers BOTH
+// inline `grants` AND `roles`: a role confers its grants on every token that wears
+// it, so a referenced role must be visible to the issuer and hold nothing beyond
+// the issuer's own — otherwise roles would be an attenuation bypass (mint a `**`
+// role, then wear it). Runs on every token/hook create and update.
 function attenuate(actor, modelId, attr) {
-  if (!['token', 'hook'].includes(modelId) || !Array.isArray(attr.grants)) return;
-  for (const cg of attr.grants)
-    if (!grantsOf(actor).some((g) => grantMatch(g.path, cg.path) && permits(g.mode, cg.mode)))
-      throw new Err(403, `cannot grant ${cg.mode} ${cg.path}: it exceeds your own grants`);
+  if (!['token', 'hook'].includes(modelId)) return;
+  const within = (cg) => grantsOf(actor).some((g) => grantMatch(g.path, cg.path) && permits(g.mode, cg.mode));
+  for (const cg of (Array.isArray(attr.grants) ? attr.grants : []))
+    if (!within(cg)) throw new Err(403, `cannot grant ${cg.mode} ${cg.path}: it exceeds your own grants`);
+  for (const r of (Array.isArray(attr.roles) ? attr.roles : [])) {
+    const role = store.get(isRef(r) ? refId(r) : r);
+    if (!role || role.model !== 'atom://role') throw new Err(400, `not a role: ${r}`);
+    if (!visible(actor, role)) throw new Err(403, `cannot wear role ${r} (out of scope)`);
+    for (const cg of (role.attr.grants || []))
+      if (!within(cg)) throw new Err(403, `cannot wear role ${r}: it grants ${cg.mode} ${cg.path} beyond your own`);
+  }
 }
 
 // A model's rules.read/write are path-expression predicates evaluated against
@@ -878,7 +910,12 @@ function create(modelId, body, actor) {
   if (!canOp(actor, modelId, 'create') || !fields.every((f) => allows(actor, `${modelId}.${f}`, 'create')))
     throw new Err(403, `${actor.id} cannot create ${modelId}`);
 
-  // POST creates. An explicit id that already exists is a conflict — never clobber.
+  // POST creates. An explicit id must be a safe slug — it becomes a URL path and is
+  // rendered into HTML/links, so reject anything with HTML/URL metacharacters or
+  // whitespace (allow letters, digits, and . _ - @ : so dotted index ids and
+  // `model@1-2` migration ids still work). An id that already exists is a conflict.
+  if (body.id && !/^[A-Za-z0-9._@:-]+$/.test(String(body.id)))
+    throw new Err(400, `invalid id "${body.id}" — use letters, digits, and . _ - @ :`);
   if (body.id && store.has(body.id))
     throw new Err(409, `atom ${body.id} exists — PATCH /${body.id} to update, PUT /${body.id} to replace`);
 
@@ -1111,6 +1148,93 @@ function isExpired(atom) {
   if (!Array.isArray(conds) || !conds.length) return false;   // no conditions → never
   return conds.every((c) => evalCondition(atom, store.get(isRef(c) ? refId(c) : c)));
 }
+
+// ---------------------------------------------------------------------------
+// Schema evolution (lazy, like expiration). Each model carries a `version`;
+// every atom records the `modelVersion` it was written under. A `migration` atom
+// is a one-way step that moves a model from version `from` to `to` — `rename` and
+// `default` are applied by the kernel from `spec`; `custom` runs a vetted handler
+// in scripts/. When an atom is behind its model, the kernel applies the chain of
+// migrations in order, returns the current shape, and rewrites the record forward
+// (persist + a `migrate` log entry). An atom already at the current version is a
+// single integer comparison and a no-op. The sweep runs on read (single atom), on
+// every schema change (a model write or a new migration), and to completion on boot.
+// ---------------------------------------------------------------------------
+const _migs = { gen: -1, byModel: new Map() };
+function migrationsByModel() {                          // modelId -> migrations, ordered by `from`
+  if (_migs.gen === storeGen) return _migs.byModel;
+  const byModel = new Map();
+  for (const m of store.query({ model: 'atom://migration' })) {
+    if (m.lifecycle?.status === 'retired') continue;
+    const mid = isRef(m.attr.model) ? refId(m.attr.model) : m.attr.model;
+    if (!mid) continue;
+    if (!byModel.has(mid)) byModel.set(mid, []);
+    byModel.get(mid).push(m);
+  }
+  for (const list of byModel.values()) list.sort((a, b) => (a.attr.from ?? 0) - (b.attr.from ?? 0));
+  _migs.gen = storeGen; _migs.byModel = byModel;
+  return byModel;
+}
+
+// apply one migration to an attr bag, returning the next attr (never mutates input)
+async function applyMigration(attr, mig) {
+  const op = mig.attr.op, spec = mig.attr.spec || {};
+  const out = { ...attr };
+  if (op === 'rename') {
+    const { from, to } = spec;
+    if (from && to && from in out) { out[to] = out[from]; delete out[from]; }
+  } else if (op === 'default') {
+    const { field, value } = spec;
+    if (field && out[field] === undefined) out[field] = value;
+  } else if (op === 'custom') {
+    const run = String(mig.attr.run || '');
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(run)) { console.error(`migration ${mig.id}: unsafe run "${run}" — skipped`); return out; }
+    try {
+      const mod = await import(new URL(`./scripts/${run}.mjs`, import.meta.url));
+      const next = await mod.default(out, { migration: mig, getAtom, refId, ref });
+      return (next && typeof next === 'object' && !Array.isArray(next)) ? next : out;
+    } catch (e) { console.error(`migration ${mig.id} (${run}):`, e.message); return out; }
+  }
+  return out;
+}
+
+// bring one atom forward to its model's current version (in place + persisted).
+// Applies only the contiguous chain that starts at the atom's modelVersion, so a
+// gap in the migration steps stops the walk rather than skipping a version.
+async function bringForward(atom) {
+  if (!atom?.lifecycle || typeof atom.lifecycle !== 'object') return atom;
+  const model = store.get(refId(atom.model));
+  if (!model || model.model !== 'atom://model') return atom;
+  const target = model.attr.version || 1;
+  let v = atom.lifecycle.modelVersion || 1;
+  if (v >= target) return atom;
+  const chain = migrationsByModel().get(refId(atom.model)) || [];
+  const before = { ...atom.attr };
+  let attr = atom.attr, changed = false;
+  for (const mig of chain) {
+    const from = mig.attr.from ?? 0, to = mig.attr.to ?? 0;
+    // only the next contiguous step, and it must STRICTLY advance toward target —
+    // a from==to (or to<from) migration is ignored, so it can't loop forever
+    // re-applying and rewriting on every read.
+    if (from !== v || to <= v || to > target) continue;
+    attr = await applyMigration(attr, mig);
+    v = to; changed = true;
+  }
+  if (!changed) return atom;            // nothing applicable — leave the version as-is
+  atom.attr = attr;
+  atom.lifecycle.modelVersion = v;      // modelVersion is the schema clock; the user-write `version` is untouched
+  persist(atom);
+  logIt(atom.id, 'migrate', '0', changeset(before, attr));
+  return atom;
+}
+
+// sweep every atom of one model forward (a model write or new migration triggers this)
+async function sweepModel(modelId) {
+  if (!migrationsByModel().get(modelId)?.length) return;
+  for (const a of store.query({ model: ref(modelId) })) await bringForward(a);
+}
+// sweep every model that has migrations — the boot "background job", run to completion
+async function sweepAll() { for (const modelId of migrationsByModel().keys()) await sweepModel(modelId); }
 
 function passes(atom, f) {
   const v = fieldVal(atom, f.field);
@@ -1346,30 +1470,33 @@ function renderForm(modelId, atom, actor) {
   const cur = atom?.attr || {};
   const json = (name, v) => `<textarea name="${esc(name)}" data-kind="json" rows="3">${v === undefined ? '' : esc(JSON.stringify(v, null, 2))}</textarea>`;
   // recursive: scalars -> inputs, ref -> autocomplete, object/embed -> nested
-  // sub-table, list with a declared item type (`of`) -> a repeater
-  function control(name, def, v) {
-    if (typeof def === 'string' && def.startsWith('embed://')) return embed(name, def.slice('embed://'.length), v || {});
+  // sub-table, list with a declared item type (`of`) -> a repeater. `depth` guards
+  // against a self- or mutually-embedding model (e.g. `self: embed://self`) blowing
+  // the stack: past the limit, the field falls back to a raw JSON textarea.
+  function control(name, def, v, depth = 0) {
+    if (depth > 8) return json(name, v);
+    if (typeof def === 'string' && def.startsWith('embed://')) return embed(name, def.slice('embed://'.length), v || {}, depth);
     if (def.kind === 'enum')
       return `<select name="${esc(name)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
     if (def.kind === 'boolean')
       return `<input type="checkbox" name="${esc(name)}"${v ? ' checked' : ''}>`;
     if (def.kind === 'ref' && def.to)
       return `<input name="${esc(name)}" data-kind="ref" list="refs-${esc(refId(def.to))}" value="${v === undefined ? '' : esc(v)}" placeholder="atom://… or embed://…">`;
-    if (def.kind === 'list' && def.of) return repeater(name, def.of, Array.isArray(v) ? v : []);
+    if (def.kind === 'list' && def.of) return repeater(name, def.of, Array.isArray(v) ? v : [], depth);
     if (def.kind === 'json' || def.kind === 'map' || def.kind === 'list') return json(name, v);
     if (def.kind === 'integer' || def.kind === 'number')
       return `<input type="number" name="${esc(name)}" data-kind="number" value="${v === undefined ? '' : esc(v)}">`;
     return `<input type="text" name="${esc(name)}" data-kind="text" value="${v === undefined ? '' : esc(v)}">`;
   }
-  function embed(name, subId, obj) {
+  function embed(name, subId, obj, depth = 0) {
     const sm = getAtom(subId);
     const rows = Object.entries(sm.attr.fields || {})
-      .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(name + '.' + k, def, obj?.[k])}</td></tr>`).join('');
+      .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(name + '.' + k, def, obj?.[k], depth + 1)}</td></tr>`).join('');
     return `<figure><table>${rows}</table></figure>`;
   }
-  function repeater(name, ofDef, arr) {
+  function repeater(name, ofDef, arr, depth = 0) {
     const items = arr.length ? arr : [undefined];
-    const blocks = items.map((it, i) => `<fieldset>${control(name + '.' + i, ofDef, it)}</fieldset>`).join('');
+    const blocks = items.map((it, i) => `<fieldset>${control(name + '.' + i, ofDef, it, depth + 1)}</fieldset>`).join('');
     return `<fieldset data-name="${esc(name)}">${blocks}<button type="button">+ add</button></fieldset>`;
   }
   const wop = editing ? 'update' : 'create';
@@ -1495,7 +1622,7 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
   if (pg && atoms.length) {
     const last = atoms[atoms.length - 1];
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
-    body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
+    body += `<p><a href="/${esc(indexAtom.id)}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
   // the index's own create/edit form — POST a new report on the model page, or
   // PATCH/PUT/DELETE one you own here (renderForm gates by grant + the write rule)
@@ -1543,16 +1670,29 @@ function renderAtom(atom, actor) {
 // HTTP surface — one address space, data or rendered view
 // ---------------------------------------------------------------------------
 
-function readBody(req) {
-  return new Promise((resolve) => {
-    let b = ''; req.on('data', (c) => (b += c));
-    req.on('end', () => {
-      const ct = req.headers['content-type'] || '';
-      if (!b) return resolve({});
-      if (ct.includes('x-www-form-urlencoded')) return resolve(Object.fromEntries(new URLSearchParams(b)));
-      try { resolve(JSON.parse(b)); } catch { resolve(Object.fromEntries(new URLSearchParams(b))); }
+// Read the raw request body, capped — a single request can never buffer more than
+// MAX_BODY into memory (an unauthenticated POST /auth reads a body too), so a large
+// or slow upload is rejected with 413 instead of exhausting the process.
+const MAX_BODY = 8 * 1024 * 1024;
+function readRaw(req) {
+  return new Promise((resolve, reject) => {
+    let b = '', len = 0, done = false;
+    req.on('data', (c) => {
+      if (done) return;             // already over the cap — ignore the rest, don't buffer it
+      len += c.length;
+      if (len > MAX_BODY) { done = true; reject(new Err(413, 'request body too large')); return; }
+      b += c;
     });
+    req.on('end', () => { if (!done) { done = true; resolve(b); } });
+    req.on('error', (e) => { if (!done) { done = true; reject(e); } });
   });
+}
+async function readBody(req) {
+  const b = await readRaw(req);
+  const ct = req.headers['content-type'] || '';
+  if (!b) return {};
+  if (ct.includes('x-www-form-urlencoded')) return Object.fromEntries(new URLSearchParams(b));
+  try { return JSON.parse(b); } catch { return Object.fromEntries(new URLSearchParams(b)); }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1705,10 +1845,16 @@ const server = http.createServer(async (req, res) => {
         if (as === 'csv') return sendCsv(`${head}.csv`, atomsCsv(head, atoms));
         if (wantsHtml) return send(200, renderModelPage(head, atoms, actor, url.search), true);
         result = atoms;
-      } else if (segs.length) result = traverse(headAtom, segs);
+      } else if (segs.length) {
+        // a dotted path is a read like any other: gate the head atom, then traverse
+        // under the actor so every hop and field honors scope + grants + rules.
+        if (!canSee(actor, head)) throw new Err(404, `no atom ${head}`);
+        result = traverse(headAtom, segs, actor);
+      }
       else {
         if (!visible(actor, headAtom) || !canOp(actor, refId(headAtom.model), 'read') || !ruleOk(actor, headAtom, 'read'))
           throw new Err(404, `no atom ${head}`);
+        await bringForward(headAtom);             // lazy schema evolution: behind atoms are migrated on read
         const a = redact(actor, headAtom);
         if (wantsHtml) return send(200, renderAtom(a, actor), true);
         result = a;
@@ -1720,15 +1866,17 @@ const server = http.createServer(async (req, res) => {
       // IMPORT (bulk create) — POST a CSV body, or a JSON array, to a model. Each
       // row/element runs through create() under the caller's own grants and rules.
       if ((req.headers['content-type'] || '').includes('csv')) {
-        const text = await new Promise((r) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => r(b)); });
+        const text = await readRaw(req);  // capped — a CSV import can't exhaust memory either
         return send(200, await bulkCreate(head, csvToBodies(head, text), actor));
       }
       const body = await readBody(req);
       if (Array.isArray(body)) return send(200, await bulkCreate(head, body, actor));
-      const a = create(head, body, actor); await runHooks(a, 'create'); return send(201, a);
+      const a = create(head, body, actor); await runHooks(a, 'create');
+      if (a.model === 'atom://migration') await sweepModel(refId(a.attr.model)); // a new migration brings its model's atoms forward
+      return send(201, a);
     }
-    if (req.method === 'PUT') { const a = replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); return send(200, a); }
-    if (req.method === 'PATCH') { const a = update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); return send(200, a); }
+    if (req.method === 'PUT') { const a = replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); if (a.model === 'atom://model') await sweepModel(a.id); return send(200, a); }
+    if (req.method === 'PATCH') { const a = update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); if (a.model === 'atom://model') await sweepModel(a.id); return send(200, a); }
     if (req.method === 'DELETE') { const a = retire(head, actor); await runHooks(a, 'delete'); return send(200, a); }
     return send(405, { error: 'method not allowed' });
   } catch (e) {
@@ -1757,10 +1905,11 @@ function coreAtoms() {
     atom('0', 'token', 'A data substrate where schema, data, identity, permissions, and every surface are all atoms — one organism, generated from the same core atoms and rendered on any surface.', {}, 'joey'),
 
     // core model definitions (the kernel's own types are model atoms)
-    model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
+    model('model',  'Model',  { label: { kind: 'text' }, version: { kind: 'integer', default: 1 },
+      fields: { kind: 'map', required: true },
       indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } }),
     model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
-      grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' } }),
+      grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list', of: { kind: 'ref', to: 'atom://role' } } }),
     model('grant',  'Grant',  { path: { kind: 'text', required: true },
       mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } }),
     model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } }),
@@ -1778,10 +1927,12 @@ function coreAtoms() {
       run: { kind: 'text', required: true, pattern: '^[a-z0-9][a-z0-9-]*$' },
       grants: { kind: 'list', of: 'embed://grant' } }),
     // a one-way schema transform: moves a model from version `from` to `to`. The
-    // model atom exists and validates; applying migrations on read is still TODO.
+    // kernel applies the chain on read and rewrites records forward (see bringForward):
+    // `rename`/`default` from `spec`, `custom` via a vetted scripts/<run>.mjs handler.
     model('migration', 'Migration', { model: { kind: 'ref', to: 'atom://model' },
       from: { kind: 'integer' }, to: { kind: 'integer' },
-      op: { kind: 'enum', values: ['rename', 'default', 'custom'] }, spec: { kind: 'json' }, run: { kind: 'text' } }),
+      op: { kind: 'enum', values: ['rename', 'default', 'custom'] }, spec: { kind: 'json' },
+      run: { kind: 'text', pattern: '^[a-z0-9][a-z0-9-]*$' } }),
     model('file',   'File',   { name: { kind: 'text' }, contentType: { kind: 'text' },
       size: { kind: 'integer' }, data: { kind: 'longtext' } }),
     model('config', 'Config', { key: { kind: 'text', required: true }, value: { kind: 'json' } }),
@@ -1832,7 +1983,7 @@ function bootstrap() {
 // and backfills lifecycle.expiration on atoms that predate the field. A fresh
 // store is seeded by bootstrap instead; the append-only log + replay means a
 // live store can always be evolved forward.
-function migrate() {
+async function migrate() {
   const core = coreAtoms();
   let added = 0, refreshed = 0;
   for (const a of core) {
@@ -1863,7 +2014,10 @@ function migrate() {
     }
   }
   buildInverse();
-  if (added || refreshed || n) console.log(`migrate: +${added} core atoms, refreshed ${refreshed} core models, backfilled expiration on ${n}`);
+  // schema evolution: bring every atom of a migrated model up to the current
+  // version — the "background job, run to completion on boot" (README).
+  const sgBefore = storeGen; await sweepAll(); const migrated = storeGen > sgBefore;
+  if (added || refreshed || n || migrated) console.log(`migrate: +${added} core atoms, refreshed ${refreshed} core models, backfilled expiration on ${n}, applied schema migrations`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1919,7 +2073,7 @@ function audit() {
   // every ledger entry is well-formed: a known op, with a subject + actor.
   // (Global contiguity is NOT an invariant — tenants are independent shards a
   //  node may carry or drop, which legitimately gaps the global log counter.)
-  const OPS = new Set(['genesis', 'create', 'merge', 'update', 'replace', 'delete', 'hook']);
+  const OPS = new Set(['genesis', 'create', 'merge', 'update', 'replace', 'delete', 'hook', 'migrate']);
   report('every ledger entry is well-formed', atoms.filter((a) => a.model === 'atom://log')
     .filter((a) => !OPS.has(a.attr?.op) || !isRef(a.attr?.atom) || !isRef(a.attr?.actor))
     .map((a) => `${a.id}: op=${a.attr?.op}`));
@@ -1937,14 +2091,14 @@ function audit() {
 if (loadAll()) {                 // durable store on disk -> replay it
   buildInverse();
   logSeq = [...store.values()].reduce((m, a) => a.id.startsWith('log-') ? Math.max(m, +a.id.slice(4) || 0) : m, 0);
-  migrate();                     // evolve an older store forward (idempotent)
+  await migrate();               // evolve an older store forward (idempotent): core atoms + schema migrations
 } else {
   bootstrap();                   // fresh -> seed (and persist, if ATOMIC_STORE is set)
 }
 
 if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens
 
-const PORT = process.env.PORT || 7777;
+const PORT = process.env.PORT || 3040; // matches the seeds' default base and the documented live port
 server.listen(PORT, () => {
   console.log(`atomic kernel on http://localhost:${PORT}  (${store.size} atoms${ROOT ? `, persisted -> ${ROOT}` : ', in-memory'})`);
 });
