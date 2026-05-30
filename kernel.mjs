@@ -551,7 +551,11 @@ function create(modelId, body, actor) {
   let parentId = tenantOf(actor) || '0';
   if (body.parent && isRef(body.parent)) {
     const target = getAtom(refId(body.parent));
-    if (tenantOf(actor) !== null && !visible(actor, target))
+    // a non-superuser may only place an atom within its OWN tenant — not into
+    // another tenant, and not into the global scope (parent atom://0, which is
+    // world-visible). Only a tenant-less superuser (root) provisions across or
+    // above tenants. (visible() allows global, so check tenant equality here.)
+    if (tenantOf(actor) !== null && tenantOf(target) !== tenantOf(actor))
       throw new Err(403, `${actor.id} cannot place into ${body.parent}`);
     parentId = refId(body.parent);
   }
@@ -1286,6 +1290,7 @@ const server = http.createServer(async (req, res) => {
     // path match on a real atom wins over dot-path traversal of atom://atom.
     if (req.method === 'GET' && path && store.has(path) && getAtom(path).model === 'atom://index') {
       const ix = getAtom(path);
+      if (!visible(actor, ix)) throw new Err(404, `no atom ${path}`); // can't run an index outside your tenant
       const atoms = runIndex(ix, url.search, actor);
       if (as === 'csv') return sendCsv(`${ix.id}.csv`, atomsCsv(refId(ix.attr.over) === 'atom' ? null : refId(ix.attr.over), atoms));
       if (wantsHtml) return send(200, renderIndexPage(ix, atoms, actor, Object.fromEntries(url.searchParams)), true);
@@ -1304,6 +1309,7 @@ const server = http.createServer(async (req, res) => {
       const q = parseQuery(url.search);
       let result;
       if (headAtom.model === 'atom://index') {
+        if (!visible(actor, headAtom)) throw new Err(404, `no atom ${head}`); // can't run an index outside your tenant
         const atoms = runIndex(headAtom, url.search, actor);
         if (as === 'csv') return sendCsv(`${headAtom.id}.csv`, atomsCsv(refId(headAtom.attr.over) === 'atom' ? null : refId(headAtom.attr.over), atoms));
         if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
