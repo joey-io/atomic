@@ -696,8 +696,9 @@ function renderIndexPage(indexAtom, atoms, actor) {
 
 function renderAtom(atom, actor) {
   const modelId = refId(atom.model);
-  const body = `<p>id <code>${esc(atom.id)}</code> · model ${atomValue(atom.model)} · v${atom.lifecycle?.version ?? ''} · ${esc(atom.lifecycle?.status || '')}</p>`
-    + renderFields(atom.attr || {}) + renderForm(modelId, atom, actor);
+  // the UI mirrors the schema: render the whole atom — id, model, manifest,
+  // attr, lifecycle — through the same recursive component
+  const body = renderFields(atom) + renderForm(modelId, atom, actor);
   return page(atom.manifest || atom.id, body, peerSelect(peersOf(atom, actor), atom.id));
 }
 
@@ -769,7 +770,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path === '') {
       const a = getAtom('0');
       if (!wantsHtml) return send(200, a);
-      let body = `<p>id <code>0</code> · model ${atomValue(a.model)}</p>` + renderFields(a.attr || {});
+      let body = renderFields(a);
       body += isAnon ? sessionForm()
         : `<p>signed in as ${atomValue(ref(actor.id))} · <a href="/auth/logout">sign out</a></p>`;
       return send(200, page(a.manifest || 'atom://0', body, peerSelect(peersOf(a, actor), '')), true);
