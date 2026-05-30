@@ -1,20 +1,124 @@
+/* Atomic — one small, variable-driven sheet. No classes, no ids: every rule
+   targets a semantic element. A data grid is a <table> with a <thead> (inside a
+   <figure> that scrolls); a key/value or form table is a bare <table>; a
+   repeater is a <fieldset>. The structure carries the meaning. */
 :root {
-  --border: 1px solid #ddd;
-  --pad: 4px 10px;
-  --col-max: 80vw;
+  --font: 'Noto Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --fg: #16181d;
+  --muted: #6b7280;
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --line: #e7e9ee;
+  --line-strong: #d3d7df;
+  --head: #f3f5f8;
+  --row: #fbfcfd;
+  --accent: #2f6df6;
+  --accent-weak: #eaf1ff;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --cell: 9px 14px;
+  --gap: 10px;
   --asc: " ↑";
   --desc: " ↓";
 }
-.tw { overflow-x: auto; max-width: 100% }
-table { border-collapse: collapse }
-td, th {
-  border: var(--border);
-  padding: var(--pad);
-  text-align: left;
-  white-space: nowrap;
+
+* { box-sizing: border-box }
+html { -webkit-text-size-adjust: 100% }
+body {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
 }
-th { cursor: pointer }
-th[data-dir="1"]::after { content: var(--asc) }
-th[data-dir="-1"]::after { content: var(--desc) }
-form table th { text-align: right; cursor: default }
-form table th::after { content: "" }
+main { display: block; max-width: 1120px; margin: 0 auto; padding: 8px 24px 64px }
+nav { max-width: 1120px; margin: 0 auto; padding: 20px 24px 8px; display: flex; gap: var(--gap); align-items: center }
+p { margin: 14px 0 }
+small { color: var(--muted) }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em }
+
+a { color: var(--accent); text-decoration: none }
+a:hover { text-decoration: underline }
+
+/* a <figure> is the scroll container for any table */
+figure { margin: 14px 0; overflow-x: auto; max-width: 100% }
+table { width: 100%; border-collapse: separate; border-spacing: 0; background: transparent }
+th, td { text-align: left; vertical-align: top; white-space: nowrap }
+
+/* key/value + form tables (a bare <table>, no <thead>) read as label : value */
+table:not(:has(thead)) th {
+  text-align: right; width: 1%; white-space: nowrap;
+  color: var(--muted); font-weight: 500; padding: 6px 14px 6px 0;
+}
+table:not(:has(thead)) td { padding: 6px 0 }
+
+/* data grids (a <table> with a <thead>) get the bordered, sortable card look */
+table:has(thead) {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+table:has(thead) th, table:has(thead) td { padding: var(--cell); border-bottom: 1px solid var(--line) }
+table:has(thead) thead th {
+  background: var(--head);
+  color: var(--muted);
+  font-weight: 600;
+  font-size: .76rem;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--line-strong);
+  cursor: pointer;
+  user-select: none;
+}
+table:has(thead) thead th:hover { color: var(--fg) }
+table:has(thead) tbody tr:nth-child(even) > td { background: var(--row) }
+table:has(thead) tbody tr:hover > td { background: var(--accent-weak) }
+table:has(thead) tbody tr:last-child > td { border-bottom: 0 }
+thead th[data-dir="1"]::after { content: var(--asc); color: var(--accent) }
+thead th[data-dir="-1"]::after { content: var(--desc); color: var(--accent) }
+
+/* forms — controls and a repeater (<fieldset>) */
+label { font-weight: 500 }
+input, select, textarea {
+  font: inherit;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  min-width: 18rem;
+  max-width: 100%;
+}
+textarea { width: 100% }
+input[type="checkbox"] { min-width: 0 }
+input:focus, select:focus, textarea:focus {
+  outline: 0;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-weak);
+}
+select { cursor: pointer }
+
+button {
+  font: inherit; font-weight: 600;
+  color: #fff; background: var(--accent);
+  border: 1px solid var(--accent); border-radius: var(--radius-sm);
+  padding: 8px 16px; cursor: pointer;
+}
+button:hover { filter: brightness(.94) }
+button:active { filter: brightness(.88) }
+button[type="button"] {
+  color: var(--accent); background: var(--surface); border-color: var(--line-strong);
+  padding: 5px 12px; font-weight: 500;
+}
+button[type="button"]:hover { border-color: var(--accent); background: var(--accent-weak) }
+
+nav select { min-width: 0; max-width: 360px }
+
+fieldset {
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: var(--gap); margin: 0 0 var(--gap);
+  display: flex; flex-direction: column; gap: var(--gap); align-items: flex-start;
+}
+fieldset fieldset { background: var(--row) }

@@ -722,29 +722,33 @@ function renderFields(map, actor) {
     const cell = (k === 'id' && typeof v === 'string' && !isRef(v)) ? link(actor, v) : atomValue(v, actor);
     return `<tr><th>${esc(k)}</th><td>${cell}</td></tr>`;
   }).join('');
-  return `<div class="tw"><table>${rows}</table></div>`;
+  return `<figure><table>${rows}</table></figure>`;
 }
 
 function page(title, body, fab) {
   return `<!doctype html><meta charset=utf8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/style.css?v=${CSS.length}">
-<p>${fab || ''}</p>
-${body}
+<nav>${fab || ''}</nav>
+<main>${body}</main>
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
- if(t.closest('form'))return;
- t.querySelectorAll('th').forEach(function(th,ci){
+ if(t.closest('form')||!t.tHead)return; // only data grids (with a thead) sort
+ var body=t.tBodies[0]||t;
+ t.tHead.querySelectorAll('th').forEach(function(th,ci){
   th.addEventListener('click',function(){
    var dir=th.getAttribute('data-dir')==='1'?-1:1;
-   t.querySelectorAll('th').forEach(function(o){o.removeAttribute('data-dir');});
+   t.tHead.querySelectorAll('th').forEach(function(o){o.removeAttribute('data-dir');});
    th.setAttribute('data-dir',dir);
-   var rows=Array.prototype.slice.call(t.rows).filter(function(r){return r.querySelector('td');});
+   var rows=Array.prototype.slice.call(body.rows);
    rows.sort(function(a,b){var x=((a.cells[ci]||{}).innerText||'').trim(),y=((b.cells[ci]||{}).innerText||'').trim();
     var nx=num(x),ny=num(y);var c=(nx!==null&&ny!==null)?nx-ny:x.localeCompare(y);return c*dir;});
-   rows.forEach(function(r){t.appendChild(r);});});});});
+   rows.forEach(function(r){body.appendChild(r);});});});});
 })();
 </script>`;
 }
@@ -756,7 +760,7 @@ function renderTable(modelId, atoms, actor) {
   const rows = atoms.map((a) =>
     `<tr><td>${link(actor, a.id)}</td>` +
     cols.map((c) => `<td>${atomValue(a.attr?.[c], actor)}</td>`).join('') + '</tr>').join('');
-  return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
+  return `<figure><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></figure>`;
 }
 
 // a form to create a session (sign in) — a session is itself an atom
@@ -794,12 +798,12 @@ function renderForm(modelId, atom, actor) {
     const sm = getAtom(subId);
     const rows = Object.entries(sm.attr.fields || {})
       .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(name + '.' + k, def, obj?.[k])}</td></tr>`).join('');
-    return `<table class="form sub">${rows}</table>`;
+    return `<table>${rows}</table>`;
   }
   function repeater(name, ofDef, arr) {
     const items = arr.length ? arr : [undefined];
-    const blocks = items.map((it, i) => `<div class="item">${control(name + '.' + i, ofDef, it)}</div>`).join('');
-    return `<div class="list" data-name="${esc(name)}">${blocks}</div><button type="button" class="addItem">+ add</button>`;
+    const blocks = items.map((it, i) => `<fieldset>${control(name + '.' + i, ofDef, it)}</fieldset>`).join('');
+    return `<fieldset data-name="${esc(name)}">${blocks}<button type="button">+ add</button></fieldset>`;
   }
   const wop = editing ? 'update' : 'create';
   const fieldRows = Object.entries(m.attr.fields || {})
@@ -823,20 +827,21 @@ function renderForm(modelId, atom, actor) {
     : `<tr><th>id</th><td><input name="$id" placeholder="auto"></td></tr>`)
     + `<tr><th>model</th><td><a href="/${esc(modelId)}">atom://${esc(modelId)}</a></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
-  return `<form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p>${suggest}</form>
+  return `<form><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows}</table></figure><p><button>Submit</button></p>${suggest}</form>
 <script>
+var F=document.querySelector('form select[name="$method"]').closest('form');
 function setPath(root,path,val){var ks=path.split('.'),o=root;
  for(var i=0;i<ks.length-1;i++){var k=ks[i],nn=/^[0-9]+$/.test(ks[i+1]);if(o[k]===undefined)o[k]=nn?[]:{};o=o[k];}
  o[ks[ks.length-1]]=val;}
-document.querySelectorAll('.addItem').forEach(function(btn){btn.onclick=function(){
- var box=btn.previousElementSibling,name=box.getAttribute('data-name');
- var items=box.querySelectorAll(':scope > .item'),last=items.length-1,c=items[last].cloneNode(true);
+F.querySelectorAll('button[type="button"]').forEach(function(btn){btn.onclick=function(){
+ var box=btn.parentElement,name=box.getAttribute('data-name');
+ var items=box.querySelectorAll(':scope > fieldset'),last=items.length-1,c=items[last].cloneNode(true);
  c.querySelectorAll('[name]').forEach(function(el){
   el.name=el.name.split(name+'.'+last+'.').join(name+'.'+items.length+'.');
   if(el.type==='checkbox')el.checked=false;else el.value='';});
- box.appendChild(c);};});
+ box.insertBefore(c,btn);};});
 var createUrl=${JSON.stringify('/' + modelId)}, atomUrl=${JSON.stringify(editing ? '/' + atom.id : '')};
-document.getElementById('f').onsubmit=async function(e){e.preventDefault();
+F.onsubmit=async function(e){e.preventDefault();
 var method=e.target.querySelector('[name="$method"]').value;
 var url=method==='POST'?createUrl:atomUrl;
 var opts={method:method,headers:{'content-type':'application/json'}};
@@ -884,7 +889,7 @@ function renderCrossTable(atoms, actor) {
   const rows = atoms.map((a) =>
     `<tr><td>${link(actor, a.id)}</td><td>${atomValue(a.model, actor)}</td>` +
     `<td>${esc(a.manifest || '')}</td><td>${esc(a.lifecycle?.createdAt || '')}</td></tr>`).join('');
-  return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
+  return `<figure><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></figure>`;
 }
 
 function renderIndexPage(indexAtom, atoms, actor, values = {}) {
@@ -907,7 +912,7 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
     const lists = targets.map((t) => `<datalist id="refs-${esc(t)}">${getStore(actor).all()
       .filter((a) => a.model === ref(t) && a.lifecycle?.status !== 'retired')
       .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}</datalist>`).join('');
-    form = `<form method="get" action="/${esc(indexAtom.id)}"><div class="tw"><table class="form">${rows}</table></div><p><button>Run</button></p>${lists}</form>`;
+    form = `<form method="get" action="/${esc(indexAtom.id)}"><figure><table>${rows}</table></figure><p><button>Run</button></p>${lists}</form>`;
   }
   let body = form + (over === 'atom' ? renderCrossTable(atoms, actor) : renderTable(over, atoms, actor));
   const pg = indexAtom.attr.page;
@@ -941,7 +946,7 @@ function renderRefMap(rows, actor) {
   const head = ['referenced by', 'model', 'via'].map((c) => `<th>${esc(c)}</th>`).join('');
   const body = rows.slice(0, 200).map((r) =>
     `<tr><td>${link(actor, r.id)}</td><td>${atomValue('atom://' + r.model, actor)}</td><td>${esc(r.via)}</td></tr>`).join('');
-  return `<p>referenced by — ${rows.length}</p><div class="tw"><table><tr>${head}</tr>${body}</table></div>`;
+  return `<p>referenced by — ${rows.length}</p><figure><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></figure>`;
 }
 
 function renderAtom(atom, actor) {
