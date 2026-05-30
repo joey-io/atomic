@@ -616,7 +616,7 @@ function page(title, body, fab) {
 <style>
 .tw{overflow-x:auto;max-width:100%}
 table{border-collapse:collapse}
-td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap}
+td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap;max-width:80vw;overflow:hidden;text-overflow:ellipsis}
 th{cursor:pointer}th[data-dir="1"]::after{content:" ↑"}th[data-dir="-1"]::after{content:" ↓"}
 form table th{text-align:right;cursor:default}form table th::after{content:""}
 </style>
