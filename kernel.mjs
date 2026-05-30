@@ -166,10 +166,12 @@ function findByIdentity(modelId, attr, modelAtom) {
 // Tokens, grants, redaction
 // ---------------------------------------------------------------------------
 
-function actorFromReq(req) {
+function actorFromReq(req, url) {
   const auth = req.headers['authorization'] || '';
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (m && store.has(m[1])) return getAtom(m[1]);
+  const qt = url?.searchParams.get('token');   // browsers can't set headers on navigation
+  if (qt && store.has(qt)) return getAtom(qt);
   return getAtom('anon');
 }
 
@@ -194,6 +196,15 @@ function grantMatch(gpath, target) {
 const canRead  = (actor, target) => grantsOf(actor).some((x) => grantMatch(x.path, target));
 const canWrite = (actor, target) =>
   grantsOf(actor).some((x) => x.mode === 'write' && grantMatch(x.path, target));
+
+// can the actor touch anything under this top-level name (a model or index id)?
+const canTouch = (actor, name) =>
+  grantsOf(actor).some((x) => { const s = x.path.split('.')[0]; return s === name || s === '*' || s === '**'; });
+
+// can the actor create atoms of this model (a write grant covering it)?
+const canCreate = (actor, modelId) =>
+  grantsOf(actor).some((x) =>
+    x.mode === 'write' && (() => { const s = x.path.split('.')[0]; return s === modelId || s === '*' || s === '**'; })());
 
 function redact(actor, atom) {
   const modelId = refId(atom.model);
@@ -374,20 +385,70 @@ table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 8px;text-
 th{background:#f6f6f6}h1{font-size:1.1rem}</style><h1>${esc(title)}</h1>${body}`;
 }
 
-function renderModelTable(modelId, atoms) {
+function renderTable(modelId, atoms, token) {
   const m = getAtom(modelId);
   const cols = m.attr.display?.row || Object.keys(m.attr.fields || {});
+  const q = token ? `?as=html&token=${esc(token)}` : '?as=html';
   const head = ['id', ...cols].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
-    `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td>` +
+    `<tr><td><a href="/${esc(a.id)}${q}">${esc(a.id)}</a></td>` +
     cols.map((c) => `<td>${cell(a.attr?.[c])}</td>`).join('') + '</tr>').join('');
-  return page(`${m.attr.label || modelId} — ${atoms.length}`, `<table><tr>${head}</tr>${rows}</table>`);
+  return `<table><tr>${head}</tr>${rows}</table>`;
+}
+
+// add form generated from the model's field kinds; POSTs JSON with the caller's token
+function renderForm(modelId, token) {
+  const m = getAtom(modelId);
+  const inputs = Object.entries(m.attr.fields || {})
+    .filter(([, d]) => typeof d === 'object')
+    .map(([k, def]) => {
+      if (def.kind === 'enum')
+        return `<p><label>${esc(k)} <select name="${esc(k)}">${def.values.map((v) => `<option>${esc(v)}</option>`).join('')}</select></label></p>`;
+      if (def.kind === 'boolean')
+        return `<p><label><input type="checkbox" name="${esc(k)}"> ${esc(k)}</label></p>`;
+      const type = (def.kind === 'integer' || def.kind === 'number') ? 'number' : 'text';
+      const ph = def.kind === 'ref' ? ' placeholder="atom://…"' : '';
+      return `<p><label>${esc(k)} <input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}"${ph}></label></p>`;
+    }).join('');
+  return `<h1>Add ${esc(m.attr.label || modelId)}</h1><form id="add">${inputs}<button>Create</button></form>
+<script>
+var tok=${JSON.stringify(token || '')};
+document.getElementById('add').onsubmit=async function(e){e.preventDefault();var attr={};
+e.target.querySelectorAll('[name]').forEach(function(el){
+  if(el.type==='checkbox'){attr[el.name]=el.checked;return;}
+  if(el.value==='')return;
+  attr[el.name]=(el.dataset.kind==='number'||el.dataset.kind==='integer')?Number(el.value):el.value;});
+var r=await fetch('/'+${JSON.stringify(modelId)},{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+tok},body:JSON.stringify({attr:attr})});
+if(r.ok){location.reload();}else{var j=await r.json();alert(j.error||'error');}};
+</script>`;
+}
+
+function renderModelPage(modelId, atoms, actor, token) {
+  const m = getAtom(modelId);
+  const form = canCreate(actor, modelId) ? renderForm(modelId, token) : '';
+  return page(`${m.attr.label || modelId} — ${atoms.length}`, renderTable(modelId, atoms, token) + form);
+}
+
+function renderIndexPage(indexAtom, atoms, token) {
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`,
+    renderTable(refId(indexAtom.attr.over), atoms, token));
 }
 
 function renderAtom(atom) {
   const rows = Object.entries(atom.attr || {})
     .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${cell(v)}</td></tr>`).join('');
   return page(atom.manifest || atom.id, `<table>${rows}</table>`);
+}
+
+function renderHome(h, token) {
+  const q = token ? `&token=${esc(token)}` : '';
+  const models = h.models.map((m) =>
+    `<li><a href="/${m.id}?as=html${q}">${esc(m.label)}</a> <code>/${m.id}</code></li>`).join('');
+  const idx = h.indexes.map((i) =>
+    `<li><a href="/${i.id}?as=html${q}">${esc(i.label)}</a> <small>over ${esc(i.over)}</small></li>`).join('');
+  return page('Atomic', `<p>actor <code>${esc(h.actor)}</code> · ${h.atoms} atoms · ${h.ledger} in the ledger</p>
+<h1>Models</h1><ul>${models || '<li><em>none visible</em></li>'}</ul>
+<h1>Indexes</h1><ul>${idx || '<li><em>none visible</em></li>'}</ul>`);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,8 +468,9 @@ const server = http.createServer(async (req, res) => {
     res.end(html ? val : JSON.stringify(val, null, 2));
   };
   try {
-    const actor = actorFromReq(req);
     const url = new URL(req.url, 'http://x');
+    const actor = actorFromReq(req, url);
+    const token = actor.id !== 'anon' ? actor.id : '';
     const path = decodeURIComponent(url.pathname).replace(/^\//, '');
     const wantsHtml = (req.headers.accept || '').includes('text/html') ||
                       url.searchParams.get('as') === 'html';
@@ -426,16 +488,28 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET') {
       if (path === '') {
-        const models = [...store.values()].filter((a) => a.model === 'atom://model').map((a) => a.id);
-        return send(200, { atomic: 'minimal kernel', models, ledger: `${logSeq} entries` });
+        const models = [...store.values()]
+          .filter((a) => a.model === 'atom://model' && canTouch(actor, a.id))
+          .map((a) => ({ id: a.id, label: a.attr.label || a.id, url: `/${a.id}` }));
+        const indexes = [...store.values()]
+          .filter((a) => a.model === 'atom://index' &&
+            (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over))))
+          .map((a) => ({ id: a.id, label: a.attr.label || a.id, over: a.attr.over, url: `/${a.id}` }));
+        const home = { atomic: 'minimal kernel', actor: ref(actor.id),
+          atoms: store.size, ledger: logSeq, models, indexes };
+        if (wantsHtml) return send(200, renderHome(home, token), true);
+        return send(200, home);
       }
       const headAtom = getAtom(head);
       const q = parseQuery(url.search);
       let result;
-      if (headAtom.model === 'atom://index') result = runIndex(headAtom, url.search, actor);
-      else if (headAtom.model === 'atom://model' && segs.length === 0) {
+      if (headAtom.model === 'atom://index') {
+        const atoms = runIndex(headAtom, url.search, actor);
+        if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, token), true);
+        result = atoms;
+      } else if (headAtom.model === 'atom://model' && segs.length === 0) {
         const atoms = listModel(head, q, actor);
-        if (wantsHtml) return send(200, renderModelTable(head, atoms), true);
+        if (wantsHtml) return send(200, renderModelPage(head, atoms, actor, token), true);
         result = atoms;
       } else if (segs.length) result = traverse(headAtom, segs);
       else {
@@ -530,6 +604,21 @@ function bootstrap() {
     attr: { tenant: 'atom://acme', grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy') });
   seed({ id: 'anon', model: 'atom://token', manifest: 'Anonymous public caller',
     attr: { grants: [{ path: 'registration.*', mode: 'write' }] }, lifecycle: lc('0') });
+
+  // demo records — so the live instance has data to navigate (in-memory: reseeded each start)
+  seed({ id: 'northwind', model: 'atom://company', manifest: 'Northwind Traders, enterprise account',
+    attr: { name: 'Northwind Traders', domain: 'northwind.com',
+      hq: { street: '500 Market St', city: 'Seattle', state: 'WA', zip: '98101', country: 'US' },
+      owner: 'atom://tok-amy', tier: 'enterprise' }, lifecycle: lc('tok-amy') });
+  seed({ id: 'jane', model: 'atom://contact', manifest: 'Jane Roe, VP Eng at Northwind',
+    attr: { name: 'Jane Roe', email: 'jane@northwind.com', title: 'VP Engineering', company: 'atom://northwind' },
+    lifecycle: lc('tok-amy') });
+  seed({ id: 'john', model: 'atom://contact', manifest: 'John Vega, CFO at Northwind',
+    attr: { name: 'John Vega', email: 'john@northwind.com', title: 'CFO', company: 'atom://northwind' },
+    lifecycle: lc('tok-amy') });
+  seed({ id: 'deal-9001', model: 'atom://deal', manifest: 'Northwind platform expansion',
+    attr: { name: 'Platform expansion', amount: 120000, stage: 'qualified', company: 'atom://northwind', owner: 'atom://tok-amy' },
+    lifecycle: lc('tok-amy') });
 
   buildInverse();
 }
