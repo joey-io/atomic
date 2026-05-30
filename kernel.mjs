@@ -471,7 +471,6 @@ function page(title, body, fab) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <style>
-body{margin:1.25rem;font-family:system-ui,sans-serif}
 .tw{overflow-x:auto;max-width:100%}
 table{border-collapse:collapse}
 td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap}
