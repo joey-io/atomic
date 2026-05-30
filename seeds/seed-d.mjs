@@ -97,9 +97,12 @@ async function ensureSchema() {
   await patch('house', { fields: {
     name: { kind: 'text', required: true }, address: { kind: 'text' },
     bedrooms: { kind: 'integer' }, home: { kind: 'ref', to: 'atom://house' } } });
+  // mirror the core token model (so re-seeding never downgrades it) and add the
+  // household `house` anchor. roles carries its item type so the form renders the
+  // ref repeater, matching the kernel's own definition.
   await patch('token', { fields: {
     email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
-    grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' },
+    grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list', of: { kind: 'ref', to: 'atom://role' } },
     house: { kind: 'ref', to: 'atom://house' } } });
 }
 async function setRules(write) { for (const m of HOUSEHOLD) await patch(m, { rules: { write } }); }
