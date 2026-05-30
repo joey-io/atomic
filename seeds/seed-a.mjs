@@ -1,5 +1,5 @@
 // Demo A — a PAC: 100 fundraising transactions to 20 people, a reporting chain
-// via `manager` refs, across 3 regions. Run: node seed-a.mjs
+// via `manager` refs, across 3 regions. Run: node seeds/seed-a.mjs
 import { tenant, defineModels, atom, index, A } from './seed-lib.mjs';
 
 await defineModels();

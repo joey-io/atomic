@@ -4,10 +4,10 @@
   "description": "Atomic — a data substrate where schema, data, identity, and the UI surface are all atoms.",
   "type": "module",
   "scripts": {
-    "start": "node kernel.mjs",
+    "start": "node atomic.mjs",
     "test": "node test.mjs",
-    "audit": "node kernel.mjs --audit",
-    "seed": "node seed-a.mjs && node seed-b.mjs && node seed-c.mjs && node seed-d.mjs"
+    "audit": "node atomic.mjs --audit",
+    "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
   },
   "license": "MIT"
 }

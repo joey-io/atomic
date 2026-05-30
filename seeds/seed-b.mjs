@@ -1,5 +1,5 @@
 // Demo B — an advocacy program: stories shared by advocates from districts that
-// each reference an elected official. Run: node seed-b.mjs
+// each reference an elected official. Run: node seeds/seed-b.mjs
 import { tenant, defineModels, defineStates, atom, token, hook, role, addr, A } from './seed-lib.mjs';
 
 await defineModels();
