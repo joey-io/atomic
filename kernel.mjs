@@ -246,7 +246,8 @@ function actorFromReq(req, cookies) {
     const s = store.get(sid);
     if (s.model === 'atom://session' && s.lifecycle.status === 'active' &&
         (!s.attr.expiresAt || s.attr.expiresAt > now()) && store.has(refId(s.attr.token)))
-      return getAtom(refId(s.attr.token));
+      // a transient copy carrying the session id — never mutate the stored atom
+      return { ...getAtom(refId(s.attr.token)), _session: sid };
   }
   return getAtom('0'); // atom://0 — the anonymous identity (no data grants)
 }
@@ -354,6 +355,7 @@ function tenantOf(atom) {
 }
 // a global atom is visible to all; otherwise the actor must share its tenant
 function visible(actor, atom) {
+  if (isExpired(atom)) return false;          // lazy expiry: past its policy → invisible
   const at = tenantOf(atom), ut = tenantOf(actor);
   return at === null || ut === null || at === ut;
 }
@@ -409,12 +411,13 @@ function redact(actor, atom) {
 // Write path: create / update / delete  (every write appends to the ledger)
 // ---------------------------------------------------------------------------
 
-function logIt(atomId, op, actorId, changes) {
+function logIt(atomId, op, actorId, changes, sessionId) {
   const id = `log-${++logSeq}`;
   const subj = store.get(atomId);
   seed({
     id, model: 'atom://log', manifest: `${op} ${atomId}`,
-    attr: { atom: ref(atomId), op, actor: ref(actorId), at: now(), changes },
+    attr: { atom: ref(atomId), op, actor: ref(actorId),
+      ...(sessionId ? { session: ref(sessionId) } : {}), at: now(), changes },
     lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(),
       createdBy: ref(actorId), parent: ref(subj ? (tenantOf(subj) || '0') : '0') },
   });
@@ -451,7 +454,7 @@ function create(modelId, body, actor) {
     existing.lifecycle.updatedAt = now();
     existing.lifecycle.updatedBy = ref(actor.id);
     persist(existing);
-    logIt(existing.id, 'merge', actor.id, changeset(before, existing.attr));
+    logIt(existing.id, 'merge', actor.id, changeset(before, existing.attr), actor._session);
     return existing;
   }
 
@@ -472,7 +475,8 @@ function create(modelId, body, actor) {
     lifecycle: {
       status: 'active', version: 1,
       modelVersion: modelAtom.attr.version || 1,
-      createdAt: now(), createdBy: ref(actor.id), parent: ref(parentId),
+      createdAt: now(), updatedAt: now(), createdBy: ref(actor.id), parent: ref(parentId),
+      expiration: ref('policy-default'),          // default policy: expire 3y after last update
       ...(body.hooks ? { hooks: body.hooks } : {}), // hooks registered on this atom
     },
   };
@@ -480,7 +484,7 @@ function create(modelId, body, actor) {
     throw new Err(403, `write rule denies create of ${modelId}`);
   seed(atom);
   if (modelId === 'model') buildInverse(); // a new model may declare inverse edges
-  logIt(id, 'create', actor.id, changeset({}, attr));
+  logIt(id, 'create', actor.id, changeset({}, attr), actor._session);
   return atom;
 }
 
@@ -503,7 +507,7 @@ function update(id, body, actor, ifMatch) {
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
   persist(atom);
-  logIt(id, 'update', actor.id, changeset(before, atom.attr));
+  logIt(id, 'update', actor.id, changeset(before, atom.attr), actor._session);
   return atom;
 }
 
@@ -526,7 +530,7 @@ function replace(id, body, actor, ifMatch) {
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
   persist(atom);
-  logIt(id, 'replace', actor.id, changeset(before, atom.attr));
+  logIt(id, 'replace', actor.id, changeset(before, atom.attr), actor._session);
   return atom;
 }
 
@@ -600,7 +604,7 @@ function retire(id, actor) {
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
   persist(atom);
-  logIt(id, 'delete', actor.id, [{ path: 'status', from: 'active', to: 'retired' }]);
+  logIt(id, 'delete', actor.id, [{ path: 'status', from: 'active', to: 'retired' }], actor._session);
   return atom;
 }
 
@@ -622,8 +626,56 @@ function parseQuery(search) {
   return { filters, sort, as };
 }
 
-// read a sortable/filterable value from attr, falling back to lifecycle (createdAt, ...)
-const fieldVal = (a, key) => (a.attr && key in a.attr) ? a.attr[key] : a.lifecycle?.[key];
+// read a sortable/filterable value from attr, falling back to lifecycle
+// (createdAt, ...) then the atom's own top-level fields (model, manifest, id)
+const fieldVal = (a, key) =>
+  (a.attr && key in a.attr) ? a.attr[key]
+  : (a.lifecycle && key in a.lifecycle) ? a.lifecycle[key]
+  : a[key];
+
+// ---------------------------------------------------------------------------
+// Expiration (lazy, non-destructive). Every atom's lifecycle.expiration is a ref
+// to a policy atom; a policy is a set of condition atoms. An atom is expired when
+// ALL of its policy's conditions hold (a policy with no conditions never expires).
+// A condition is itself an atom { field, op, value } — the default policy carries
+// one: older(updatedAt, 3y), i.e. not touched in three years. Expired atoms are
+// just filtered out of every read by visible() — nothing is mutated, so editing
+// the atom (which bumps updatedAt) or its policy brings it straight back.
+// ---------------------------------------------------------------------------
+function parseDuration(s) {
+  const m = /^(\d+)\s*(y|mo|w|d)$/.exec(String(s || '').trim());
+  if (!m) return null;
+  const n = +m[1];
+  const days = m[2] === 'y' ? 365 * n : m[2] === 'mo' ? 30 * n : m[2] === 'w' ? 7 * n : n;
+  return days * 864e5;
+}
+// does a single condition atom hold for this atom?
+function evalCondition(atom, cond) {
+  if (!cond?.attr) return false;
+  const { field, op, value } = cond.attr;
+  const v = fieldVal(atom, field);
+  switch (op) {
+    case 'eq': return v === value;
+    case 'ne': return v !== value;
+    case 'in': return Array.isArray(value) && value.includes(v);
+    case 'older': case 'newer': {           // date `field` vs a duration before now
+      const ms = parseDuration(value);
+      const base = v || atom.lifecycle?.createdAt;
+      if (ms == null || !base) return false;
+      const elapsed = Date.parse(base) + ms < Date.now();
+      return op === 'older' ? elapsed : !elapsed;
+    }
+    default: return false;
+  }
+}
+function isExpired(atom) {
+  const exp = atom?.lifecycle?.expiration;
+  if (!exp) return false;
+  const pol = store.get(isRef(exp) ? refId(exp) : exp);
+  const conds = pol?.attr?.conditions;
+  if (!Array.isArray(conds) || !conds.length) return false;   // no conditions → never
+  return conds.every((c) => evalCondition(atom, store.get(isRef(c) ? refId(c) : c)));
+}
 
 function passes(atom, f) {
   const v = fieldVal(atom, f.field);
@@ -669,11 +721,11 @@ function runIndex(indexAtom, search, actor) {
   for (const [field, cond] of Object.entries(match)) {
     if (typeof cond === 'string' && cond.startsWith('params.')) {
       const val = params.get(cond.slice('params.'.length));
-      atoms = atoms.filter((a) => a.attr?.[field] === val);
+      atoms = atoms.filter((a) => fieldVal(a, field) === val);
     } else if (cond && typeof cond === 'object' && Array.isArray(cond.in)) {
-      atoms = atoms.filter((a) => cond.in.includes(a.attr?.[field]));
+      atoms = atoms.filter((a) => cond.in.includes(fieldVal(a, field)));
     } else {
-      atoms = atoms.filter((a) => a.attr?.[field] === cond);
+      atoms = atoms.filter((a) => fieldVal(a, field) === cond);
     }
   }
   for (const s of indexAtom.attr.sort || []) {
@@ -768,7 +820,7 @@ function renderTable(modelId, atoms, actor) {
 // a form to create a session (sign in) — a session is itself an atom
 function sessionForm() {
   const open = [...store.values()].filter((a) => a.model === 'atom://token' && a.attr.login === 'open');
-  const items = open.map((t) => `<li><a href="/auth/open?token=${esc(t.id)}">demo as Advocacy Website Token</a></li>`).join('');
+  const items = open.map((t) => `<li><a href="/auth/open?token=${esc(t.id)}">atom://${esc(t.id)}</a></li>`).join('');
   return `<form method="post" action="/auth"><p><input name="email" type="email" placeholder="you@example.com" required></p><p><button>send magic link</button></p></form>
 ${open.length ? `<ul>${items}</ul>` : ''}`;
 }
@@ -865,17 +917,16 @@ if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:at
 </script>`;
 }
 
-// the top nav: a select of the models and indexes the actor can reach, by id
+// the top nav: indexes the actor can reach, then every model it can touch below.
 function navSelect(actor, current) {
-  const all = getStore(actor).all();
+  const all = getStore(actor).all().filter((a) => a.lifecycle?.status !== 'retired');
   const opt = (a) => `<option value="/${esc(a.id)}"${a.id === current ? ' selected' : ''}>atom://${esc(a.id)}</option>`;
-  const models = all.filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map(opt).join('');
   const indexes = all.filter((a) => a.model === 'atom://index' && (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over)))).map(opt).join('');
-  const sel = `<select onchange="if(this.value)location.href=this.value"><option value="/">atom://0</option>`
-    + (models ? `<optgroup label="models">${models}</optgroup>` : '')
+  const models = all.filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map(opt).join('');
+  return `<select onchange="if(this.value)location.href=this.value"><option value="/">atom://0</option>`
     + (indexes ? `<optgroup label="indexes">${indexes}</optgroup>` : '')
+    + (models ? `<optgroup label="models">${models}</optgroup>` : '')
     + `</select>`;
-  return sel;
 }
 
 // the signed-in footer: identity + sign out, shown on every page once authed
@@ -1076,6 +1127,15 @@ const server = http.createServer(async (req, res) => {
       return send(401, { error: 'authenticate: POST /auth { email } or Authorization: Bearer <token>' });
     }
 
+    // an atom id may itself contain dots (index ids like 'atom.byDate'); a whole-
+    // path match on a real atom wins over dot-path traversal of atom://atom.
+    if (req.method === 'GET' && path && store.has(path) && getAtom(path).model === 'atom://index') {
+      const ix = getAtom(path);
+      const atoms = runIndex(ix, url.search, actor);
+      if (wantsHtml) return send(200, renderIndexPage(ix, atoms, actor, Object.fromEntries(url.searchParams)), true);
+      return send(200, atoms);
+    }
+
     if (req.method === 'GET') {
       // atom://atom is the universal type — every atom, newest first
       if (head === 'atom' && segs.length === 0) {
@@ -1121,7 +1181,9 @@ const server = http.createServer(async (req, res) => {
 // ---------------------------------------------------------------------------
 
 function bootstrap() {
-  const lc = (by, parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), createdBy: ref(by), parent: ref(parent) });
+  // system/seed atoms reference the 'never' policy — the substrate's own schema
+  // must not expire out from under itself
+  const lc = (by, parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(), createdBy: ref(by), parent: ref(parent), expiration: 'atom://policy-never' });
   const model = (id, label, fields, extra = {}) => seed({
     id, model: 'atom://model', manifest: label,
     attr: { label, version: 1, fields, ...extra }, lifecycle: lc('0'),
@@ -1149,19 +1211,45 @@ function bootstrap() {
   model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
     params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } });
   model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
-    actor: { kind: 'ref', to: 'atom://token' }, at: { kind: 'datetime' }, changes: { kind: 'list' } });
+    actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
+    at: { kind: 'datetime' }, changes: { kind: 'list' } });
   model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
     createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } });
   model('hook',   'Hook',   { label: { kind: 'text' }, run: { kind: 'text', required: true },
     grants: { kind: 'list', of: 'embed://grant' } });
+  // a condition is an atom { field, op, value } — a single reusable predicate.
+  // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
+  model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
+    op: { kind: 'enum', values: ['eq', 'ne', 'in', 'older', 'newer'] }, value: { kind: 'json' } });
+  // a policy is a set of condition atoms; lifecycle.expiration points at one.
+  // An atom expires when ALL the policy's conditions hold (none → never expires).
+  model('policy', 'Policy', { label: { kind: 'text' },
+    conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } });
 
-  // core indexes (queries are atoms too)
-  seed({ id: 'atomLog', model: 'atom://index', manifest: 'Full change history for one atom',
-    attr: { label: 'Atom log', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } },
+  // root expiration conditions + policies — every atom's lifecycle.expiration
+  // points at a policy; policies are made of condition atoms.
+  seed({ id: 'cond-stale-3y', model: 'atom://condition', manifest: 'Not updated in 3 years',
+    attr: { label: 'Not updated in 3 years', field: 'updatedAt', op: 'older', value: '3y' }, lifecycle: lc('0') });
+  seed({ id: 'policy-never',   model: 'atom://policy', manifest: 'Never expires',
+    attr: { label: 'Never', conditions: [] }, lifecycle: lc('0') });
+  seed({ id: 'policy-default', model: 'atom://policy', manifest: 'Expires 3 years after last update',
+    attr: { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }, lifecycle: lc('0') });
+
+  // core indexes (queries are atoms too) — named <model>.<qualifier>; also the
+  // worked examples of the grammar. dotted ids route via whole-path match.
+  seed({ id: 'log.byAtom', model: 'atom://index', manifest: 'Full change history for one atom',
+    attr: { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } },
       match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }, lifecycle: lc('0') });
-  seed({ id: 'recent', model: 'atom://index', manifest: 'Recent atoms across all models',
-    attr: { label: 'Recent', over: 'atom://atom', sort: [{ createdAt: 'desc' }],
+  seed({ id: 'atom.byDate', model: 'atom://index', manifest: 'Atoms across all models, newest first',
+    attr: { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }],
       page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }, lifecycle: lc('0') });
+  // the catalog of every model (a 'root index of models')
+  seed({ id: 'model.all', model: 'atom://index', manifest: 'Every model in the substrate',
+    attr: { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }, lifecycle: lc('0') });
+  // atoms by model — pick a model, list its atoms (match on the top-level model field)
+  seed({ id: 'atom.byModel', model: 'atom://index', manifest: 'Atoms of a chosen model',
+    attr: { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } },
+      match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }, lifecycle: lc('0') });
   // Demo tenants A / B / C are loaded from seed-a.mjs / seed-b.mjs / seed-c.mjs
   // (POSTed through the API as the admin) so they never bloat the kernel.
 
@@ -1175,9 +1263,42 @@ function bootstrap() {
   }
 }
 
+// Migration hook — runs on every durable load. Idempotently ensures the current
+// core atoms exist, so a store written by an earlier kernel gains anything added
+// since, and backfills lifecycle.expiration on atoms that predate the field. We
+// don't always need it (a fresh store is seeded by bootstrap), but the append-only
+// log + replay means a live store can always be evolved forward.
+function migrate() {
+  const lc0 = () => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(),
+    createdBy: ref('0'), parent: ref('0'), expiration: 'atom://policy-never' });
+  const ensure = (a) => { if (!store.has(a.id)) seed(a); };
+  ensure({ id: 'condition', model: 'atom://model', manifest: 'Condition', attr: { label: 'Condition', version: 1,
+    fields: { label: { kind: 'text' }, field: { kind: 'text', required: true }, op: { kind: 'enum', values: ['eq','ne','in','older','newer'] }, value: { kind: 'json' } } }, lifecycle: lc0() });
+  ensure({ id: 'policy', model: 'atom://model', manifest: 'Policy', attr: { label: 'Policy', version: 1,
+    fields: { label: { kind: 'text' }, conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } } }, lifecycle: lc0() });
+  ensure({ id: 'cond-stale-3y', model: 'atom://condition', manifest: 'Not updated in 3 years',
+    attr: { label: 'Not updated in 3 years', field: 'updatedAt', op: 'older', value: '3y' }, lifecycle: lc0() });
+  ensure({ id: 'policy-never', model: 'atom://policy', manifest: 'Never expires', attr: { label: 'Never', conditions: [] }, lifecycle: lc0() });
+  ensure({ id: 'policy-default', model: 'atom://policy', manifest: 'Expires 3 years after last update', attr: { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }, lifecycle: lc0() });
+  ensure({ id: 'log.byAtom', model: 'atom://index', manifest: 'Full change history for one atom', attr: { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } }, match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }, lifecycle: lc0() });
+  ensure({ id: 'atom.byDate', model: 'atom://index', manifest: 'Atoms across all models, newest first', attr: { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }, lifecycle: lc0() });
+  ensure({ id: 'model.all', model: 'atom://index', manifest: 'Every model in the substrate', attr: { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }, lifecycle: lc0() });
+  ensure({ id: 'atom.byModel', model: 'atom://index', manifest: 'Atoms of a chosen model', attr: { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }, lifecycle: lc0() });
+  let n = 0;
+  for (const a of store.values()) {
+    if (a.lifecycle && typeof a.lifecycle === 'object' && !a.lifecycle.expiration) {
+      a.lifecycle.expiration = tenantOf(a) === null ? 'atom://policy-never' : 'atom://policy-default';
+      persist(a); n++;
+    }
+  }
+  buildInverse();
+  if (n) console.log(`migrate: backfilled expiration on ${n} atoms`);
+}
+
 if (loadAll()) {                 // durable store on disk -> replay it
   buildInverse();
   logSeq = [...store.values()].reduce((m, a) => a.id.startsWith('log-') ? Math.max(m, +a.id.slice(4) || 0) : m, 0);
+  migrate();                     // evolve an older store forward (idempotent)
 } else {
   bootstrap();                   // fresh -> seed (and persist, if ATOMIC_STORE is set)
 }

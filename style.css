@@ -39,6 +39,19 @@ header { max-width: 1120px; margin: 0 auto; padding: 24px 24px 0 }
 h1 { margin: 0; padding-bottom: 1rem; font-size: var(--title); font-weight: 700; letter-spacing: -.02em; line-height: 1.1 }
 h1 a { color: var(--fg) }
 h1 a:hover { text-decoration: none }
+/* the atom mark — a small ASCII atom drawn to the right of the logo */
+h1 a::after {
+  content: " .---. \A( (o) )\A '---' ";
+  white-space: pre;
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: .5em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .18em;
+  line-height: 1.05;
+  font-weight: 400;
+  color: var(--accent);
+}
 main { display: block; max-width: 1120px; margin: 0 auto; padding: 8px 24px 64px }
 nav { max-width: 1120px; margin: 0 auto; padding: 6px 24px 8px; display: flex; gap: var(--gap); align-items: center }
 footer { max-width: 1120px; margin: 0 auto; padding: 16px 24px 32px; color: var(--muted); font-size: .82rem; display: flex; gap: var(--gap); align-items: center; border-top: 1px solid var(--line) }
@@ -52,7 +65,7 @@ a:hover { text-decoration: underline }
 /* ONE table component, everywhere. A <figure> scrolls it; every table is a grid
    with a sortable <thead>. Same cells, same headers, same separators — no
    variants, no exceptions. Rule #1: everything is the same. */
-figure { margin: 14px 0; overflow-x: auto; max-width: 100%; background: var(--nest); border: 1px solid var(--nest-line); border-radius: 1rem; padding: 1rem }
+figure { margin: 14px 0; overflow-x: auto; max-width: 100%; background: var(--nest); border: 1px solid var(--nest-line); border-radius: 1rem; padding-top: 1rem }
 table { width: 100%; border-collapse: collapse; background: transparent }
 th, td { text-align: left; vertical-align: top; white-space: nowrap; padding: var(--cell) }
 td { border-bottom: 1px solid var(--line) }

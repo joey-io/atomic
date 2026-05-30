@@ -5,8 +5,8 @@ import { tenant, defineModels, atom, index, A } from './seed-lib.mjs';
 await defineModels();
 await tenant('a', 'Demo A — PAC');
 
-// an index over people, filtered by region
-await index('peopleByRegion', 'People by region', 'atom://person',
+// an index over people, filtered by region — named <model>.<qualifier>
+await index('person.byRegion', 'Person by region', 'atom://person',
   { region: { kind: 'ref', to: 'atom://region' } }, { region: 'params.region' }, [{ name: 'asc' }]);
 
 const T = 'a';
