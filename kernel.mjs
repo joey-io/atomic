@@ -333,6 +333,15 @@ function create(modelId, body, actor) {
     return existing;
   }
 
+  // by default an atom is born into the creator's tenant; an authorized caller
+  // may place it under a chosen parent (e.g. root provisioning a new tenant)
+  let parentId = tenantOf(actor) || '0';
+  if (body.parent && isRef(body.parent)) {
+    const target = getAtom(refId(body.parent));
+    if (tenantOf(actor) !== null && !visible(actor, target))
+      throw new Err(403, `${actor.id} cannot place into ${body.parent}`);
+    parentId = refId(body.parent);
+  }
   const id = body.id || randomUUID().slice(0, 8);
   const atom = {
     id, model: ref(modelId),
@@ -341,8 +350,7 @@ function create(modelId, body, actor) {
     lifecycle: {
       status: 'active', version: 1,
       modelVersion: modelAtom.attr.version || 1,
-      createdAt: now(), createdBy: ref(actor.id),
-      parent: ref(tenantOf(actor) || '0'), // born into the creator's tenant
+      createdAt: now(), createdBy: ref(actor.id), parent: ref(parentId),
     },
   };
   seed(atom);
@@ -651,13 +659,18 @@ function peerSelect(peers, current) {
     .concat(peers.map((p) => `<option value="/${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.id)} — ${esc(p.label)}</option>`)).join('');
   return `<select onchange="if(this.value)location.href=this.value">${opts}</select>`;
 }
-const modelPeers = (actor) => [...store.values()].filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map((a) => ({ id: a.id, label: a.attr.label || a.id }));
-const indexPeers = (actor) => [...store.values()].filter((a) => a.model === 'atom://index' && (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over)))).map((a) => ({ id: a.id, label: a.attr.label || a.id }));
+// peers = siblings in the tree: atoms sharing this atom's parent, visible to the actor
+const peersOf = (atom, actor) => {
+  const parent = atom.lifecycle?.parent;
+  return [...store.values()]
+    .filter((a) => a.lifecycle?.parent === parent && a.lifecycle?.status !== 'retired' && visible(actor, a))
+    .map((a) => ({ id: a.id, label: a.manifest || a.attr?.name || a.attr?.label || a.id }));
+};
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
-    renderForm(modelId, null, actor) + renderTable(modelId, atoms), peerSelect(modelPeers(actor), modelId));
+    renderForm(modelId, null, actor) + renderTable(modelId, atoms), peerSelect(peersOf(m, actor), modelId));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -678,16 +691,14 @@ function renderIndexPage(indexAtom, atoms, actor) {
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
     body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, peerSelect(indexPeers(actor), indexAtom.id));
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, peerSelect(peersOf(indexAtom, actor), indexAtom.id));
 }
 
 function renderAtom(atom, actor) {
   const modelId = refId(atom.model);
   const body = `<p>id <code>${esc(atom.id)}</code> · model ${atomValue(atom.model)} · v${atom.lifecycle?.version ?? ''} · ${esc(atom.lifecycle?.status || '')}</p>`
     + renderFields(atom.attr || {}) + renderForm(modelId, atom, actor);
-  const peers = [...store.values()].filter((a) => a.model === atom.model && a.lifecycle?.status !== 'retired' && visible(actor, a))
-    .map((a) => ({ id: a.id, label: a.manifest || a.attr?.name || a.id }));
-  return page(atom.manifest || atom.id, body, peerSelect(peers, atom.id));
+  return page(atom.manifest || atom.id, body, peerSelect(peersOf(atom, actor), atom.id));
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +772,7 @@ const server = http.createServer(async (req, res) => {
       let body = `<p>id <code>0</code> · model ${atomValue(a.model)}</p>` + renderFields(a.attr || {});
       body += isAnon ? sessionForm()
         : `<p>signed in as ${atomValue(ref(actor.id))} · <a href="/auth/logout">sign out</a></p>`;
-      return send(200, page(a.manifest || 'atom://0', body, peerSelect(modelPeers(actor), '')), true);
+      return send(200, page(a.manifest || 'atom://0', body, peerSelect(peersOf(a, actor), '')), true);
     }
     // no anonymous access beyond the root
     if (isAnon) {
@@ -774,7 +785,7 @@ const server = http.createServer(async (req, res) => {
       if (head === 'atom' && segs.length === 0) {
         const atoms = sortBy([...store.values()].filter((a) => a.lifecycle?.status !== 'retired' && visible(actor, a)), '-createdAt')
           .map((a) => redact(actor, a));
-        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), peerSelect(modelPeers(actor), '')), true);
+        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), peerSelect(peersOf(getAtom('0'), actor), '')), true);
         return send(200, atoms);
       }
       const headAtom = getAtom(head);
