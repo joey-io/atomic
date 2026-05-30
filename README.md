@@ -305,8 +305,9 @@ The kernel serves the address space under one host. `atom://<ref>` maps to `http
 |`GET /<id>`          |read an atom                                                       |
 |`GET /<id>.<path>`   |read across a path                                                 |
 |`GET /<model>?<query>`|run a query, return the result set                                |
-|`POST /<model>`      |create an atom of that model from a JSON body                      |
-|`PATCH /<id>`        |update an atom; the `If-Match` header carries the version read     |
+|`POST /<model>`      |create an atom of that model (conflict if an explicit id exists)   |
+|`PUT /<id>`          |replace an atom's `attr` wholesale, keeping its id and provenance   |
+|`PATCH /<id>`        |partially update an atom; the `If-Match` header carries the version|
 |`DELETE /<id>`       |retire an atom (set `lifecycle.status`)                            |
 
 A model is created the same way as any record: `POST /model` with the model definition as the body. An index is created with `POST /index`. Defining a type and creating a record are the same operation on different models.

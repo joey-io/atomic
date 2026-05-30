@@ -272,6 +272,10 @@ function create(modelId, body, actor) {
   if (!fields.every((f) => canWrite(actor, `${modelId}.${f}`)))
     throw new Err(403, `${actor.id} cannot write ${modelId}`);
 
+  // POST creates. An explicit id that already exists is a conflict — never clobber.
+  if (body.id && store.has(body.id))
+    throw new Err(409, `atom ${body.id} exists — PATCH /${body.id} to update, PUT /${body.id} to replace`);
+
   const attr = validate(modelId, body.attr || {});
 
   // identity dedup -> merge instead of duplicate
@@ -319,6 +323,25 @@ function update(id, body, actor, ifMatch) {
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
   logIt(id, 'update', actor.id, changeset(before, atom.attr));
+  return atom;
+}
+
+// PUT — replace an existing atom's attr wholesale (idempotent), keeping its
+// id and provenance (createdAt/createdBy). PATCH merges; PUT replaces.
+function replace(id, body, actor, ifMatch) {
+  const atom = getAtom(id);
+  const modelId = refId(atom.model);
+  const fields = Object.keys(body.attr || {});
+  if (!fields.every((f) => canWrite(actor, `${modelId}.${f}`)))
+    throw new Err(403, `${actor.id} cannot write ${modelId}`);
+  if (ifMatch != null && Number(ifMatch) !== atom.lifecycle.version)
+    throw new Err(409, `version conflict: have ${atom.lifecycle.version}, sent ${ifMatch}`);
+  const before = { ...atom.attr };
+  atom.attr = validate(modelId, body.attr || {});
+  atom.lifecycle.version++;
+  atom.lifecycle.updatedAt = now();
+  atom.lifecycle.updatedBy = ref(actor.id);
+  logIt(id, 'replace', actor.id, changeset(before, atom.attr));
   return atom;
 }
 
@@ -707,6 +730,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST') return send(201, create(head, await readBody(req), actor));
+    if (req.method === 'PUT')
+      return send(200, replace(head, await readBody(req), actor, req.headers['if-match']));
     if (req.method === 'PATCH')
       return send(200, update(head, await readBody(req), actor, req.headers['if-match']));
     if (req.method === 'DELETE') return send(200, retire(head, actor));
