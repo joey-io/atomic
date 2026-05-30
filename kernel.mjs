@@ -639,7 +639,7 @@ function page(title, body, fab) {
   return `<!doctype html><meta charset=utf8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/style.css?v=${CSS.length}">
 <p>${fab || ''}</p>
 ${body}
 <script>
