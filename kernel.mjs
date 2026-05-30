@@ -465,7 +465,7 @@ function renderFields(map) {
   return `<div class="tw"><table>${rows}</table></div>`;
 }
 
-function page(title, body) {
+function page(title, body, fab) {
   return `<!doctype html><meta charset=utf8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
@@ -485,13 +485,12 @@ form table th:hover{background:none}form table th::after{content:""}
 form table td{width:100%}form .tw{display:inline-block;border:0}
 .list{display:block}.item{border:1px solid #eee;border-radius:4px;padding:4px 6px;margin:3px 0}
 table.form.sub{margin:0;border:0}.addItem{margin-top:4px}
-.fab{position:fixed;left:50%;bottom:1rem;transform:translateX(-50%);z-index:9;
-text-decoration:none;line-height:1;background:#111;color:#fff;border-radius:999px;
-max-width:90vw;display:flex;align-items:center;gap:.5rem;padding:.6rem 1.1rem;
-box-shadow:0 2px 8px rgba(0,0,0,.25)}.fab:hover{background:#000}
-.fab .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}body{padding-bottom:5rem}</style>
+select.fab{position:fixed;left:50%;bottom:1rem;transform:translateX(-50%);z-index:9;
+font:inherit;background:#111;color:#fff;border:0;border-radius:999px;padding:.6rem 1.2rem;
+max-width:250px;box-shadow:0 2px 8px rgba(0,0,0,.25);cursor:pointer}
+body{padding-bottom:5rem}</style>
 ${body}
-<a class="fab" href="/" title="Atomic — home">⚛ <span class="t">${esc(title)}</span></a>
+${fab || peerSelect(modelPeers(), '')}
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
@@ -540,8 +539,8 @@ function appDescriptor(origin) {
 function renderApp(d) {
   const li = (xs) => xs.map((x) => `<li>${esc(x.name)} <code>${esc(x['@id'])}</code></li>`).join('');
   return page(d.name, `<p>${esc(d.description)}</p>
-<h1>Types</h1><ul>${li(d.models)}</ul>
-<h1>Queries</h1><ul>${li(d.indexes)}</ul>
+<h1>Models</h1><ul>${li(d.models)}</ul>
+<h1>Indexes</h1><ul>${li(d.indexes)}</ul>
 <h1>Sign in</h1>
 <p><button data-email="amy@acme.com">Sign in as Amy (admin)</button>
 <button data-email="view@acme.com">Sign in as View (read-only contacts)</button></p>
@@ -648,10 +647,19 @@ if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:at
 </script>`;
 }
 
+// the FAB: a floating select of the current route's peers, plus a home option
+function peerSelect(peers, current) {
+  const opts = [`<option value="/">⚛ atom://0</option>`]
+    .concat(peers.map((p) => `<option value="/${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.label)}</option>`)).join('');
+  return `<select class="fab" onchange="if(this.value)location.href=this.value">${opts}</select>`;
+}
+const modelPeers = () => [...store.values()].filter((a) => a.model === 'atom://model').map((a) => ({ id: a.id, label: a.attr.label || a.id }));
+const indexPeers = () => [...store.values()].filter((a) => a.model === 'atom://index').map((a) => ({ id: a.id, label: a.attr.label || a.id }));
+
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
-    renderForm(modelId, null, actor) + renderTable(modelId, atoms));
+    renderForm(modelId, null, actor) + renderTable(modelId, atoms), peerSelect(modelPeers(), modelId));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -672,14 +680,16 @@ function renderIndexPage(indexAtom, atoms) {
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
     body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body);
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, peerSelect(indexPeers(), indexAtom.id));
 }
 
 function renderAtom(atom, actor) {
   const modelId = refId(atom.model);
   const body = `<p>id <code>${esc(atom.id)}</code> · model ${atomValue(atom.model)} · v${atom.lifecycle?.version ?? ''} · ${esc(atom.lifecycle?.status || '')}</p>`
     + renderFields(atom.attr || {}) + renderForm(modelId, atom, actor);
-  return page(atom.manifest || atom.id, body);
+  const peers = [...store.values()].filter((a) => a.model === atom.model && a.lifecycle?.status !== 'retired')
+    .map((a) => ({ id: a.id, label: a.manifest || a.attr?.name || a.id }));
+  return page(atom.manifest || atom.id, body, peerSelect(peers, atom.id));
 }
 
 function renderHome(h) {
