@@ -649,7 +649,7 @@ if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:at
 
 // the FAB: a floating select of the current route's peers, plus a home option
 function peerSelect(peers, current) {
-  const opts = [`<option value="/">⚛ atom://0</option>`]
+  const opts = [`<option value="/">atom://0</option>`]
     .concat(peers.map((p) => `<option value="/${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.label)}</option>`)).join('');
   return `<select class="fab" onchange="if(this.value)location.href=this.value">${opts}</select>`;
 }
