@@ -1,23 +1,23 @@
 # Atomic
 
-Traditionally, interfaces are built on top of schema. Atomic makes them one: define a model, and its API, queries, permissions, and UI come from that definition.
+Atomic stores data and its definitions as one kind of record. A model defines a type. Its API, queries, permissions, and rendering come from that definition. There is no separate ORM, API layer, or UI configuration.
 
-Atomic is a data substrate for graph-relational, queryable stores such as CRM. Every record is an atom, including the schema that defines other records. Relationships are typed edges. Queries, constraints, permissions, rendering, and migrations are stored as atoms and run by one kernel.
+Atomic is a data substrate for graph-relational, queryable stores such as a CRM. Every record is an atom. The schema that defines other records is also made of atoms. Relationships are typed edges. Queries, constraints, permissions, and migrations are atoms and run by one kernel.
 
 ## Primitives
 
-Atomic is built from six concepts:
+Atomic has six concepts:
 
 1. **Atom** — a record: `{ id, model, manifest, attr, lifecycle }`.
-1. **Model** — defines a type’s fields, indexes, display, and rules.
-1. **Index** — a query or constraint over a model’s fields.
-1. **Path** — a dotted expression for reading across fields and edges.
+1. **Model** — defines a type's fields, indexes, and rules. It validates an atom's `attr` on write.
+1. **Index** — a stored query or constraint over a model's atoms.
+1. **Path** — a dotted expression that reads across fields and edges.
 1. **Logic** — a rule or transform, written as a path expression or a handler.
 1. **Log** — an append-only record of every change.
 
 ## Atom
 
-Every record has the same five fields.
+An atom is a raw data record. Every atom has the same five fields.
 
 ```json
 {
@@ -43,17 +43,19 @@ Every record has the same five fields.
 
 |Field      |Definition                                                                                            |
 |-----------|------------------------------------------------------------------------------------------------------|
-|`id`       |Unique, opaque, immutable identifier. The reference route is `atom://id`.                             |
-|`model`    |Reference to the model atom that defines this record’s type.                                          |
-|`manifest` |Free-text description. Set through CRUD; full-text indexed.                                           |
-|`attr`     |The record’s values, shaped by its model. `ref` values are edges.                                     |
+|`id`       |Unique, opaque, immutable identifier. The reference route is `atom://id`.                              |
+|`model`    |A pointer to the model atom that defines this record's type. This pointer is the record's identity.   |
+|`manifest` |Free-text description. Set through CRUD. Full-text indexed.                                            |
+|`attr`     |The record's values. The model validates them. `ref` values are edges.                                |
 |`lifecycle`|Kernel-managed: `status`, `version` (write count), `modelVersion`, and created/updated actor and time.|
 
-`id` is opaque and never changes, so references remain valid when data changes. Domain timestamps such as `closedAt` go in `attr`; `lifecycle` holds operational metadata only.
+`id` is opaque and never changes. References stay valid when data changes. Domain timestamps such as `closedAt` go in `attr`. `lifecycle` holds operational metadata only.
 
 ## Model
 
-A model is an atom that defines a type. It lists the type’s fields, indexes, display layouts, and rules. The kernel’s own types — `model`, `index`, `hook`, `migration`, `token`, `config`, `file`, `log`, `plugin`, `tenant` — are themselves model atoms.
+A model is an atom that defines a type. It lists the type's fields, indexes, and rules. The kernel's own types — `model`, `index`, `hook`, `migration`, `token`, `config`, `file`, `log`, `plugin`, `tenant` — are themselves model atoms.
+
+An atom names its model with the `model` pointer. The kernel uses that pointer to decide which rules, indexes, and migrations apply. On every write, the kernel validates the atom's `attr` against the model's `fields`. Validation is schema validation: it checks field kinds, `required`, `unique`, enum values, and defaults. A model is a Zod schema in this sense. The pointer answers "what type is this atom"; the schema answers "is this atom valid."
 
 ```json
 {
@@ -78,10 +80,10 @@ A model is an atom that defines a type. It lists the type’s fields, indexes, d
       "indexes": {
         "kind": "map"
       },
-      "display": {
+      "rules": {
         "kind": "json"
       },
-      "rules": {
+      "display": {
         "kind": "json"
       },
       "behavior": {
@@ -95,12 +97,6 @@ A model is an atom that defines a type. It lists the type’s fields, indexes, d
         ],
         "role": "identity"
       }
-    },
-    "display": {
-      "row": [
-        "label",
-        "id"
-      ]
     },
     "behavior": {
       "mutable": true,
@@ -121,12 +117,12 @@ A model is an atom that defines a type. It lists the type’s fields, indexes, d
 
 ## References
 
-Two reference schemes appear in a model’s field definitions:
+A model's field definitions use two reference schemes:
 
-- **`atom://x`** — an edge to a standalone atom `x`. Stored as a live link; reads see `x`’s current values.
-- **`embed://x`** — inline the fields of model `x` here. Resolved when the schema compiles. The field’s values are stored in the parent record’s `attr` and validated against `x`; they carry no `id` or `lifecycle`.
+- **`atom://x`** — an edge to a standalone atom `x`. Stored as a live link. Reads see `x`'s current values.
+- **`embed://x`** — inline the fields of model `x` here. Resolved when the schema compiles. The values are stored in the parent record's `attr` and validated against `x`. They carry no `id` or `lifecycle`.
 
-`embed://` appears only in model definitions, never in stored records. A record holds resolved values, not the `embed://` string. Any model can be embedded by referencing it with `embed://`; the same model may also be used as a standalone atom elsewhere via `atom://`.
+`embed://` appears only in model definitions, never in stored records. A record holds resolved values, not the `embed://` string. Any model can be embedded by referencing it with `embed://`. The same model can also be used as a standalone atom elsewhere via `atom://`.
 
 Use `atom://` when the target is a record that exists on its own and may be shared (a company, a user). Use `embed://` for a field group that belongs to one parent and is not shared (an address).
 
@@ -164,29 +160,29 @@ Use `atom://` when the target is a record that exists on its own and may be shar
 
 ## Graph
 
-An `atom://` field is an edge. With `inverse` set, the kernel maintains the reverse edge automatically, so both directions are queryable. A path is a dotted expression that reads across edges and nested values:
+An `atom://` field is an edge. With `inverse` set, the kernel maintains the reverse edge automatically. Both directions are queryable. A path is a dotted expression that reads across edges and nested values:
 
 ```
 deal.company.owner.team
 ```
 
-Paths are used in filters, indexes, rules, display, and exports. Traversal follows these rules:
+Paths are used in filters, indexes, rules, and exports. Traversal follows these rules:
 
-- References may form cycles. Traversal tracks visited atoms and stops when it revisits one; there is no fixed depth limit.
+- References may form cycles. Traversal tracks visited atoms and stops when it revisits one. There is no fixed depth limit.
 - Each traversal runs under a budget (time, atoms visited, result size). Callers may raise the budget.
 - A reference to a missing atom is an error, not a null.
 - Resolved references are cached and invalidated when the target changes.
 
 ## Index
 
-An index is a query or constraint over a model’s fields. It declares `over`, `params`, `match`, `sort`, `returns`, and a `role`:
+An index is a stored query or constraint over a model's atoms. It declares `over`, `params`, `match`, `sort`, `returns`, and a `role`:
 
 - `filter` / `sort`: a parameterized query.
 - `unique`: rejects a write that would duplicate the key.
 - `identity`: a unique key used to detect duplicates on create.
 - `inverse`: the reverse side of an `atom://` edge, exposed as a field on the target.
 
-The `unique` and `inverse` field modifiers are shorthand for indexes. An index is run by referencing it with parameters:
+The `unique` and `inverse` field modifiers are shorthand for indexes. An index runs when referenced with parameters:
 
 ```
 atom://openDeals?company=atom://northwind
@@ -226,27 +222,29 @@ atom://openDeals?company=atom://northwind
 }
 ```
 
-## Display
+## Rendering
 
-A model’s `display` defines how its records render: `row` for tables, `detail` for a single record, `board` for grouped views. The kernel generates the UI from these definitions. A dashboard is a set of saved indexes plus their display layouts.
+A client renders an atom from its model's field kinds. Each kind has a default rendering: `text` is a text cell, `enum` is a fixed set of values, `ref` is a link to another atom, `datetime` is a date, `boolean` is a toggle. No extra definition is needed to render or edit any atom.
+
+A model may add an optional `display` attr to curate the default: which fields appear, in what order, and how they group. `row` curates tables, `detail` curates a single record, `board` groups records into columns. `display` is a hint. When it is absent, the client renders from field kinds. A dashboard is a set of saved indexes plus optional display hints.
 
 ## Correctness
 
-**Identity and deduplication.** On create, the kernel checks the model’s `identity` indexes. If a record with the same key exists, the write is merged into it (per `behavior.merge`) instead of inserting a duplicate. The `id` is not used for matching. By default `id` is a generated surrogate; `behavior.addressing: content` derives `id` from the identity key and is allowed only for immutable, single-key models.
+**Identity and deduplication.** On create, the kernel checks the model's `identity` indexes. If a record with the same key exists, the write is merged into it (per `behavior.merge`) instead of inserting a duplicate. The `id` is not used for matching. By default `id` is a generated surrogate. `behavior.addressing: content` derives `id` from the identity key and is allowed only for immutable, single-key models.
 
-**Concurrency.** A write carries the `lifecycle.version` it read. The kernel commits the write only if the stored version is unchanged; otherwise it returns a conflict for the caller to retry. A model may opt into last-writer-wins.
+**Concurrency.** A write carries the `lifecycle.version` it read. The kernel commits the write only if the stored version is unchanged. Otherwise it returns a conflict for the caller to retry. A model may opt into last-writer-wins.
 
-**Provenance.** The log records every change at field level: actor, time, old value, new value. A field’s full history is its log entries. Audit and point-in-time queries read the same log. Values computed on read are not stored; values that are audited or billed are written so they are indexed, logged, and fixed at write time.
+**Provenance.** The log records every change at field level: actor, time, old value, new value. A field's full history is its log entries. Audit and point-in-time queries read the same log. Values computed on read are not stored. Values that are audited or billed are written so they are indexed, logged, and fixed at write time.
 
-**Permissions.** A model’s `rules` hold `read` and `write` predicates, written as path expressions. A predicate that is false, errors, or exceeds its traversal budget denies access. Access is never granted by default.
+**Permissions.** A model's `rules` hold `read` and `write` predicates, written as path expressions. A predicate that is false, errors, or exceeds its traversal budget denies access. Access is never granted by default.
 
 ## Schema evolution
 
-Each model has a `version`. Adding an optional field does not change it; existing records stay valid. A breaking change (rename, retype, new required field, removal, or identity change) increments `version` and ships a `migration` atom, which is immutable and applies in one direction only.
+Each model has a `version`. Adding an optional field does not change it. Existing records stay valid. A breaking change (rename, retype, new required field, removal, or identity change) increments `version` and ships a `migration` atom. A migration is immutable and applies in one direction only.
 
 Each record stores the `modelVersion` it was written under. When a record is behind the current version, the kernel applies the migrations in order on read and returns the current shape. The record is rewritten to the new shape on its next write. A background job rewrites records that are never otherwise written.
 
-`op: rename` and `op: default` are applied by the kernel from `spec`. `op: custom` runs a named handler. A field is fully migrated only after the background job completes; run it to completion before filtering, searching, or billing on that field.
+`op: rename` and `op: default` are applied by the kernel from `spec`. `op: custom` runs a named handler. A field is fully migrated only after the background job completes. Run it to completion before filtering, searching, or billing on that field.
 
 ```json
 {
@@ -266,7 +264,7 @@ Each record stores the `modelVersion` it was written under. When a record is beh
 
 ## Example: CRM
 
-Three models define a CRM. `contact` and `deal` hold an `atom://company` edge; the `inverse` on each edge makes `company.contacts` and `company.deals` queryable without a separate declaration. `company.owner` is an `atom://user` edge used by the contact write rule. `company.hq` embeds an address with `embed://address`.
+Three models define a CRM. `contact` and `deal` hold an `atom://company` edge. The `inverse` on each edge makes `company.contacts` and `company.deals` queryable without a separate declaration. `company.owner` is an `atom://user` edge used by the contact write rule. `company.hq` embeds an address with `embed://address`. The models below show optional `display` hints; the kernel would render them from field kinds without those hints.
 
 ### Models
 
