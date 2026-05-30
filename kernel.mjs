@@ -512,8 +512,7 @@ function renderTable(modelId, atoms) {
 
 // a form to create a session (sign in) — a session is itself an atom
 function sessionForm() {
-  return `<h2>create a session</h2>
-<p><button data-email="amy@acme.com">amy@acme.com (admin)</button>
+  return `<p><button data-email="amy@acme.com">amy@acme.com (admin)</button>
 <button data-email="view@acme.com">view@acme.com (read-only)</button></p>
 <form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com"> <button>send magic link</button></p></form>
 <script>document.querySelectorAll('button[data-email]').forEach(function(b){b.onclick=async function(){
@@ -574,8 +573,7 @@ function renderForm(modelId, atom, actor) {
     : `<tr><th>id</th><td><input name="$id" placeholder="auto"></td></tr>`)
     + `<tr><th>model</th><td><code>atom://${esc(modelId)}</code></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
-  return `<h1>${editing ? 'Edit' : 'New ' + esc(m.attr.label || modelId)}</h1>
-<form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p>${suggest}</form>
+  return `<form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p>${suggest}</form>
 <script>
 function setPath(root,path,val){var ks=path.split('.'),o=root;
  for(var i=0;i<ks.length-1;i++){var k=ks[i],nn=/^[0-9]+$/.test(ks[i+1]);if(o[k]===undefined)o[k]=nn?[]:{};o=o[k];}
