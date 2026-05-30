@@ -4,7 +4,8 @@
   "description": "Atomic — a data substrate where schema, data, identity, and the UI surface are all atoms.",
   "type": "module",
   "scripts": {
-    "start": "node kernel.mjs"
+    "start": "node kernel.mjs",
+    "test": "node test.mjs"
   },
   "license": "MIT"
 }

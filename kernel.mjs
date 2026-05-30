@@ -10,6 +10,8 @@
 // the spec goes deeper (rule predicates, migrations, embed validation depth).
 
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ function getAtom(id) {
 const isAtomObj = (n) => n && typeof n === 'object' && 'model' in n && 'attr' in n;
 
 // Put an atom straight into the store (bootstrap / seed — bypasses checks).
-function seed(atom) { store.set(atom.id, atom); return atom; }
+function seed(atom) { store.set(atom.id, atom); persist(atom); return atom; }
 
 // ---------------------------------------------------------------------------
 // Inverse-edge registry (built from model atoms)
@@ -92,6 +94,7 @@ function readField(node, seg) {
 }
 
 function traverse(start, segs) {
+  if (segs.length > 16) throw new Err(400, 'path exceeds traversal budget'); // budget/cycle guard
   let node = start;
   for (const seg of segs) node = readField(deref(node), seg);
   return node; // final value left un-dereferenced (a ref stays a ref)
@@ -259,6 +262,41 @@ const canTouch = (actor, name) =>
   grantsOf(actor).some((x) => { const s = x.path.split('.')[0]; return s === name || s === '*' || s === '**'; });
 const canRead = (actor, target) => allows(actor, target, 'read');
 
+// Attenuation: a token may only be issued with grants that are a subset of the
+// issuer's own — it can never grant more than it holds.
+function attenuate(actor, modelId, attr) {
+  if (modelId !== 'token' || !Array.isArray(attr.grants)) return;
+  for (const cg of attr.grants)
+    if (!grantsOf(actor).some((g) => grantMatch(g.path, cg.path) && permits(g.mode, cg.mode)))
+      throw new Err(403, `cannot grant ${cg.mode} ${cg.path}: it exceeds your own grants`);
+}
+
+// A model's rules.read/write are path-expression predicates evaluated against
+// the actor and the atom. A safe evaluator — no eval: only literals, equality,
+// and path reads. Anything it can't parse denies (access is never granted by error).
+function resolveSide(s, actor, atom) {
+  s = s.trim();
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (/^'.*'$/.test(s) || /^".*"$/.test(s)) return s.slice(1, -1);
+  if (s.startsWith('atom://')) return s;
+  const segs = s.split('.');
+  let base = atom;
+  if (segs[0] === 'actor') { base = actor; segs.shift(); }
+  try { return segs.length ? traverse(base, segs) : (base && base.id ? ref(base.id) : base); }
+  catch { return undefined; }
+}
+function evalRule(pred, actor, atom) {
+  if (pred == null || pred === 'true' || pred === true) return true;
+  if (pred === 'false' || pred === false) return false;
+  const m = String(pred).match(/^(.+?)\s*(==|!=)\s*(.+)$/);
+  if (!m) return false;
+  const l = resolveSide(m[1], actor, atom), r = resolveSide(m[3], actor, atom);
+  return m[2] === '==' ? l === r : l !== r;
+}
+const ruleOk = (actor, atom, which) =>
+  evalRule(getAtom(refId(atom.model)).attr.rules?.[which], actor, atom);
+
 // the tenant is the parent atom: an atom's tenant is its nearest tenant ancestor
 // (walk lifecycle.parent). Global atoms (the core models) have none.
 function tenantOf(atom) {
@@ -288,6 +326,32 @@ function getStore(actor) {
   return { all: () => [...store.values()].filter((a) => visible(actor, a)) };
 }
 
+// ---------------------------------------------------------------------------
+// Durability. Each tenant is a shard on disk: an append-only NDJSON log under
+// ATOMIC_STORE/<tenant>/log.ndjson. State is the fold of the log, replayed on
+// boot. Per-tenant files give physical isolation (a node serves one tenant's
+// file); unset ATOMIC_STORE keeps the kernel pure in-memory (the demo).
+// ---------------------------------------------------------------------------
+const ROOT = process.env.ATOMIC_STORE || null;
+const shardOf = (atom) => tenantOf(atom) || '_global';
+function persist(atom) {
+  if (!ROOT) return;
+  const dir = path.join(ROOT, shardOf(atom));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, 'log.ndjson'), JSON.stringify(atom) + '\n');
+}
+function loadAll() {
+  if (!ROOT || !fs.existsSync(ROOT)) return false;
+  let n = 0;
+  for (const shard of fs.readdirSync(ROOT)) {
+    const f = path.join(ROOT, shard, 'log.ndjson');
+    if (!fs.existsSync(f)) continue;
+    for (const line of fs.readFileSync(f, 'utf8').split('\n'))
+      if (line.trim()) { const a = JSON.parse(line); store.set(a.id, a); n++; }
+  }
+  return n > 0;
+}
+
 function redact(actor, atom) {
   if (atom.id === '0') return atom; // the public root atom — the address everyone sees
   const modelId = refId(atom.model);
@@ -304,10 +368,12 @@ function redact(actor, atom) {
 
 function logIt(atomId, op, actorId, changes) {
   const id = `log-${++logSeq}`;
+  const subj = store.get(atomId);
   seed({
     id, model: 'atom://log', manifest: `${op} ${atomId}`,
     attr: { atom: ref(atomId), op, actor: ref(actorId), at: now(), changes },
-    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(), createdBy: ref(actorId) },
+    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(),
+      createdBy: ref(actorId), parent: ref(subj ? (tenantOf(subj) || '0') : '0') },
   });
 }
 
@@ -330,6 +396,7 @@ function create(modelId, body, actor) {
     throw new Err(409, `atom ${body.id} exists — PATCH /${body.id} to update, PUT /${body.id} to replace`);
 
   const attr = validate(modelId, body.attr || {});
+  attenuate(actor, modelId, attr);
 
   // identity dedup -> merge instead of duplicate
   const existing = findByIdentity(modelId, attr, modelAtom);
@@ -340,6 +407,7 @@ function create(modelId, body, actor) {
     existing.lifecycle.version++;
     existing.lifecycle.updatedAt = now();
     existing.lifecycle.updatedBy = ref(actor.id);
+    persist(existing);
     logIt(existing.id, 'merge', actor.id, changeset(before, existing.attr));
     return existing;
   }
@@ -364,6 +432,8 @@ function create(modelId, body, actor) {
       createdAt: now(), createdBy: ref(actor.id), parent: ref(parentId),
     },
   };
+  if (!evalRule(modelAtom.attr.rules?.write, actor, atom))
+    throw new Err(403, `write rule denies create of ${modelId}`);
   seed(atom);
   if (modelId === 'model') buildInverse(); // a new model may declare inverse edges
   logIt(id, 'create', actor.id, changeset({}, attr));
@@ -382,9 +452,12 @@ function update(id, body, actor, ifMatch) {
 
   const before = { ...atom.attr };
   atom.attr = validate(modelId, { ...atom.attr, ...body.attr });
+  attenuate(actor, modelId, atom.attr);
+  if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies update of ${modelId}`);
   atom.lifecycle.version++;
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
+  persist(atom);
   logIt(id, 'update', actor.id, changeset(before, atom.attr));
   return atom;
 }
@@ -402,9 +475,12 @@ function replace(id, body, actor, ifMatch) {
     throw new Err(409, `version conflict: have ${atom.lifecycle.version}, sent ${ifMatch}`);
   const before = { ...atom.attr };
   atom.attr = validate(modelId, body.attr || {});
+  attenuate(actor, modelId, atom.attr);
+  if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies replace of ${modelId}`);
   atom.lifecycle.version++;
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
+  persist(atom);
   logIt(id, 'replace', actor.id, changeset(before, atom.attr));
   return atom;
 }
@@ -414,10 +490,12 @@ function retire(id, actor) {
   if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
   if (!canOp(actor, refId(atom.model), 'delete'))
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
+  if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies delete of ${refId(atom.model)}`);
   atom.lifecycle.status = 'retired';
   atom.lifecycle.version++;
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
+  persist(atom);
   logIt(id, 'delete', actor.id, [{ path: 'status', from: 'active', to: 'retired' }]);
   return atom;
 }
@@ -464,8 +542,13 @@ function sortBy(atoms, sort) {
 
 function listModel(modelId, q, actor) {
   let atoms = getStore(actor).all().filter(
-    (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired');
-  for (const f of q.filters) atoms = atoms.filter((a) => passes(a, f));
+    (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired' && ruleOk(actor, a, 'read'));
+  for (const f of q.filters) {
+    if (f.field === 'q') { // full-text over manifest + attr
+      const term = f.val.toLowerCase();
+      atoms = atoms.filter((a) => JSON.stringify([a.manifest, a.attr]).toLowerCase().includes(term));
+    } else atoms = atoms.filter((a) => passes(a, f));
+  }
   atoms = sortBy(atoms, q.sort);
   return atoms.map((a) => redact(actor, a));
 }
@@ -834,7 +917,7 @@ const server = http.createServer(async (req, res) => {
         result = atoms;
       } else if (segs.length) result = traverse(headAtom, segs);
       else {
-        if (!visible(actor, headAtom)) throw new Err(404, `no atom ${head}`);
+        if (!visible(actor, headAtom) || !ruleOk(actor, headAtom, 'read')) throw new Err(404, `no atom ${head}`);
         const a = redact(actor, headAtom);
         if (wantsHtml) return send(200, renderAtom(a, actor), true);
         result = a;
@@ -936,7 +1019,7 @@ function bootstrap() {
     attr: { email: 'view@acme.com',
       grants: [{ path: 'contact.name', mode: 'read' }, { path: 'contact.title', mode: 'read' }] }, lifecycle: lc('0', 'acme') });
   seed({ id: 'tok-outreach', model: 'atom://token', manifest: 'Outreach integration',
-    attr: { grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy', 'acme') });
+    attr: { team: 'atom://team-west', grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy', 'acme') });
   // demo records — so the live instance has data to navigate (in-memory: reseeded each start)
   seed({ id: 'northwind', model: 'atom://company', manifest: 'Northwind Traders, enterprise account',
     attr: { name: 'Northwind Traders', domain: 'northwind.com',
@@ -962,8 +1045,13 @@ function bootstrap() {
   }
 }
 
-bootstrap();
+if (loadAll()) {                 // durable store on disk -> replay it
+  buildInverse();
+  logSeq = [...store.values()].reduce((m, a) => a.id.startsWith('log-') ? Math.max(m, +a.id.slice(4) || 0) : m, 0);
+} else {
+  bootstrap();                   // fresh -> seed (and persist, if ATOMIC_STORE is set)
+}
 const PORT = process.env.PORT || 7777;
 server.listen(PORT, () => {
-  console.log(`atomic kernel on http://localhost:${PORT}  (${store.size} atoms seeded)`);
+  console.log(`atomic kernel on http://localhost:${PORT}  (${store.size} atoms${ROOT ? `, persisted -> ${ROOT}` : ', in-memory'})`);
 });
