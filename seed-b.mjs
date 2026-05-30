@@ -1,12 +1,25 @@
 // Demo B — an advocacy program: stories shared by advocates from districts that
 // each reference an elected official. Run: node seed-b.mjs
-import { tenant, defineModels, atom, token, A } from './seed-lib.mjs';
+import { tenant, defineModels, defineStates, atom, token, hook, A } from './seed-lib.mjs';
 
 await defineModels();
+await defineStates();
 await tenant('b', 'Demo B — Advocacy');
 
-// CapConnect: a one-click (open) login that can write only the advocate model
-await token('capconnect', 'b', { email: 'capconnect@emailjoey.com', login: 'open', grants: [{ path: 'advocate.*', mode: 'write' }] });
+// census-district hook: a capability whose only grant is to write advocate.congress.
+// It runs on advocate writes and geocodes the embedded address (scripts/census-district.mjs).
+await hook('census-district', 'atom://advocate', 'census-district', [{ path: 'advocate.congress', mode: 'write' }]);
+
+// CapConnect: open (one-click) login. It may submit advocate fields — but NOT congress —
+// and may invoke the census hook (read), which writes congress on its behalf.
+await token('capconnect', 'b', { email: 'capconnect@emailjoey.com', login: 'open', grants: [
+  { path: 'advocate.name', mode: 'write' },
+  { path: 'advocate.email', mode: 'write' },
+  { path: 'advocate.address', mode: 'write' },
+  { path: 'advocate.address', mode: 'read' },
+  { path: 'advocate.district', mode: 'write' },
+  { path: 'census-district', mode: 'read' },
+] });
 
 const T = 'b';
 const offices = ['Mayor', 'State Senator', 'US Representative', 'City Council', 'Governor'];

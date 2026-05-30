@@ -14,6 +14,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+// load ./.env (KEY=VALUE lines) into process.env as a fallback — no dependency,
+// explicit env still wins. This is where ATOMIC_STORE / SENDGRID_API_KEY live.
+try {
+  for (const line of fs.readFileSync(new URL('./.env', import.meta.url), 'utf8').split('\n')) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  }
+} catch { /* no .env — fine */ }
+
 // ---------------------------------------------------------------------------
 // Store + ledger
 // ---------------------------------------------------------------------------
@@ -275,7 +284,10 @@ function grantMatch(gpath, target) {
 // permits; the method maps to one. `write` is the mutation superset, and any
 // grant implies read (if you can touch it, you can see it).
 const OP = { GET: 'read', POST: 'create', PUT: 'update', PATCH: 'update', DELETE: 'delete' };
-const permits = (mode, op) => mode === 'write' || op === 'read' || mode === op;
+// `all` = everything; `read` reads; `write` = create+update+delete (NOT read);
+// create/update/delete = just that op. read is its own grant — write-only can't read.
+const permits = (mode, op) =>
+  mode === 'all' ? true : op === 'read' ? mode === 'read' : mode === 'write' ? true : mode === op;
 
 // field-level: may the actor do `op` on this path (model.field, index, ...)?
 const allows = (actor, target, op) =>
@@ -291,7 +303,7 @@ const canRead = (actor, target) => allows(actor, target, 'read');
 // Attenuation: a token may only be issued with grants that are a subset of the
 // issuer's own — it can never grant more than it holds.
 function attenuate(actor, modelId, attr) {
-  if (modelId !== 'token' || !Array.isArray(attr.grants)) return;
+  if (!['token', 'hook'].includes(modelId) || !Array.isArray(attr.grants)) return;
   for (const cg of attr.grants)
     if (!grantsOf(actor).some((g) => grantMatch(g.path, cg.path) && permits(g.mode, cg.mode)))
       throw new Err(403, `cannot grant ${cg.mode} ${cg.path}: it exceeds your own grants`);
@@ -511,6 +523,35 @@ function replace(id, body, actor, ifMatch) {
   return atom;
 }
 
+// Hooks (the Logic primitive). A hook is an atom { on: <model>, run: <script> }.
+// After a write, every hook whose `on` matches the atom's model runs its script
+// from ./scripts/<run>.mjs. The script may patch the atom (no re-trigger).
+// a hook writes under ITS OWN grants — not the caller's. So a caller who can
+// only submit an advocate can still trigger a hook that writes a field they can't.
+function patchAtom(atom, fields, hook) {
+  const modelId = refId(atom.model);
+  for (const f of Object.keys(fields))
+    if (!allows(hook, `${modelId}.${f}`, 'write'))
+      throw new Err(403, `hook ${hook.id} is not granted write on ${modelId}.${f}`);
+  const before = { ...atom.attr };
+  atom.attr = { ...atom.attr, ...fields };
+  atom.lifecycle.version++;
+  atom.lifecycle.updatedAt = now();
+  atom.lifecycle.updatedBy = ref(hook.id);
+  persist(atom);
+  logIt(atom.id, 'hook', hook.id, changeset(before, atom.attr));
+}
+async function runHooks(atom, actor) {
+  for (const h of [...store.values()]) {
+    if (h.model !== 'atom://hook' || h.attr.on !== atom.model) continue;
+    if (!canOp(actor, h.id, 'read')) continue; // the caller must hold invoke (read) access to the hook
+    try {
+      const mod = await import(new URL(`./scripts/${h.attr.run}.mjs`, import.meta.url));
+      await mod.default(atom, { patch: (f) => patchAtom(atom, f, h), getAtom, refId, ref });
+    } catch (e) { console.error(`hook ${h.id} (${h.attr.run}):`, e.message); }
+  }
+}
+
 function retire(id, actor) {
   const atom = getAtom(id);
   if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
@@ -567,6 +608,7 @@ function sortBy(atoms, sort) {
 }
 
 function listModel(modelId, q, actor) {
+  if (!canOp(actor, modelId, 'read')) return []; // no read grant -> no listing
   let atoms = getStore(actor).all().filter(
     (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired' && ruleOk(actor, a, 'read'));
   for (const f of q.filters) {
@@ -714,7 +756,9 @@ function renderForm(modelId, atom, actor) {
     const blocks = items.map((it, i) => `<div class="item">${control(name + '.' + i, ofDef, it)}</div>`).join('');
     return `<div class="list" data-name="${esc(name)}">${blocks}</div><button type="button" class="addItem">+ add</button>`;
   }
+  const wop = editing ? 'update' : 'create';
   const fieldRows = Object.entries(m.attr.fields || {})
+    .filter(([k]) => allows(actor, `${modelId}.${k}`, wop)) // only fields the actor may write
     .map(([k, def]) => `<tr><th>${esc(k)}</th><td>${control(k, def, cur[k])}</td></tr>`).join('');
   // a datalist per model — its atoms (atom://) plus embed://<model> — for any ref at any depth
   const scope = getStore(actor).all();
@@ -775,16 +819,18 @@ function navSelect(actor, current) {
   const opt = (a) => `<option value="/${esc(a.id)}"${a.id === current ? ' selected' : ''}>atom://${esc(a.id)}</option>`;
   const models = all.filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map(opt).join('');
   const indexes = all.filter((a) => a.model === 'atom://index' && (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over)))).map(opt).join('');
-  return `<select onchange="if(this.value)location.href=this.value"><option value="/">atom://0</option>`
+  const sel = `<select onchange="if(this.value)location.href=this.value"><option value="/">atom://0</option>`
     + (models ? `<optgroup label="models">${models}</optgroup>` : '')
     + (indexes ? `<optgroup label="indexes">${indexes}</optgroup>` : '')
     + `</select>`;
+  return actor.id === '0' ? sel : `${sel} <a href="/auth/logout">sign out</a>`;
 }
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
+  const table = canOp(actor, modelId, 'read') ? renderTable(modelId, atoms) : ''; // hidden without read
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
-    renderForm(modelId, null, actor) + renderTable(modelId, atoms), navSelect(actor, modelId));
+    renderForm(modelId, null, actor) + table, navSelect(actor, modelId));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -941,8 +987,7 @@ const server = http.createServer(async (req, res) => {
       const a = getAtom('0');
       if (!wantsHtml) return send(200, a);
       let body = renderFields(a);
-      body += isAnon ? sessionForm()
-        : `<p>signed in as ${atomValue(ref(actor.id))} · <a href="/auth/logout">sign out</a></p>`;
+      body += isAnon ? sessionForm() : `<p>signed in as ${atomValue(ref(actor.id))}</p>`;
       return send(200, page(a.manifest || 'atom://0', body, navSelect(actor, '')), true);
     }
     // no anonymous access beyond the root
@@ -972,7 +1017,8 @@ const server = http.createServer(async (req, res) => {
         result = atoms;
       } else if (segs.length) result = traverse(headAtom, segs);
       else {
-        if (!visible(actor, headAtom) || !ruleOk(actor, headAtom, 'read')) throw new Err(404, `no atom ${head}`);
+        if (!visible(actor, headAtom) || !canOp(actor, refId(headAtom.model), 'read') || !ruleOk(actor, headAtom, 'read'))
+          throw new Err(404, `no atom ${head}`);
         const a = redact(actor, headAtom);
         if (wantsHtml) return send(200, renderAtom(a, actor), true);
         result = a;
@@ -980,11 +1026,9 @@ const server = http.createServer(async (req, res) => {
       return send(200, result);
     }
 
-    if (req.method === 'POST') return send(201, create(head, await readBody(req), actor));
-    if (req.method === 'PUT')
-      return send(200, replace(head, await readBody(req), actor, req.headers['if-match']));
-    if (req.method === 'PATCH')
-      return send(200, update(head, await readBody(req), actor, req.headers['if-match']));
+    if (req.method === 'POST') { const a = create(head, await readBody(req), actor); await runHooks(a, actor); return send(201, a); }
+    if (req.method === 'PUT') { const a = replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, actor); return send(200, a); }
+    if (req.method === 'PATCH') { const a = update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, actor); return send(200, a); }
     if (req.method === 'DELETE') return send(200, retire(head, actor));
     return send(405, { error: 'method not allowed' });
   } catch (e) {
@@ -1007,7 +1051,7 @@ function bootstrap() {
   // joey is the root authority; atom://0 is the public/anonymous identity that
   // also describes the app (no data grants — it is what an unauthenticated caller sees).
   seed({ id: 'joey', model: 'atom://token', manifest: 'Joey — admin',
-    attr: { email: 'joey@emailjoey.com', grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('joey') });
+    attr: { email: 'joey@emailjoey.com', grants: [{ path: '**', mode: 'all' }] }, lifecycle: lc('joey') });
   seed({ id: '0', model: 'atom://token', manifest: 'Atomic (public root + anonymous identity)',
     attr: { name: 'Atomic',
       description: 'A data substrate where schema, data, identity, and the UI surface are all atoms.',
@@ -1019,7 +1063,7 @@ function bootstrap() {
   model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
     grants: { kind: 'list', of: 'embed://grant' } });
   model('grant',  'Grant',  { path: { kind: 'text', required: true },
-    mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write'] } });
+    mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } });
   model('tenant', 'Tenant', { name: { kind: 'text', required: true } });
   model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
     params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } });
@@ -1027,6 +1071,8 @@ function bootstrap() {
     actor: { kind: 'ref', to: 'atom://token' }, at: { kind: 'datetime' }, changes: { kind: 'list' } });
   model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
     createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } });
+  model('hook',   'Hook',   { on: { kind: 'ref', to: 'atom://model' }, run: { kind: 'text', required: true },
+    grants: { kind: 'list', of: 'embed://grant' } });
 
   // core indexes (queries are atoms too)
   seed({ id: 'atomLog', model: 'atom://index', manifest: 'Full change history for one atom',
