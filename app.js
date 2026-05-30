@@ -59,6 +59,7 @@
   F.onsubmit = async function (e) {
     e.preventDefault();
     var method = e.target.querySelector('[name="$method"]').value;
+    if (method === 'IMPORT') return; // the dropzone handles the upload, not submit
     var url = method === 'POST' ? createUrl : atomUrl;
     var opts = { method: method, headers: { 'content-type': 'application/json' } };
     if (method === 'DELETE') { if (!confirm('Delete ' + atomUrl + '?')) return; }
@@ -82,4 +83,39 @@
     if (r.ok) { location.href = method === 'DELETE' ? createUrl : (method === 'POST' ? createUrl : atomUrl); }
     else { var j = await r.json(); alert(j.error || 'error'); }
   };
+
+  // IMPORT method: reveal the template + dropzone, hide the normal create rows,
+  // and upload the dropped/picked CSV to the model (the API bulk-creates it).
+  var methodSel = F.querySelector('[name="$method"]');
+  var importRow = F.querySelector('[data-import-row]');
+  if (methodSel && importRow) {
+    var submitBtn = F.querySelector('p > button');
+    var rows = F.querySelectorAll('table tr');
+    var syncImport = function () {
+      var imp = methodSel.value === 'IMPORT';
+      importRow.hidden = !imp;
+      rows.forEach(function (tr) { if (tr !== importRow && !tr.contains(methodSel)) tr.hidden = imp; });
+      if (submitBtn) submitBtn.hidden = imp;
+    };
+    methodSel.addEventListener('change', syncImport); syncImport();
+
+    var DZ = importRow.querySelector('[data-import]'), dzUrl = DZ.getAttribute('data-import');
+    var upload = async function (file) {
+      if (!file) return;
+      var text = await file.text();
+      var resp = await fetch(dzUrl, { method: 'POST', headers: { 'content-type': 'text/csv' }, body: text });
+      var j = await resp.json().catch(function () { return {}; });
+      if (!resp.ok && j.imported === undefined) { alert(j.error || ('import failed: ' + resp.status)); return; }
+      var msg = 'Imported ' + (j.imported || 0) + ' row(s).';
+      if (j.failed && j.failed.length) msg += '\n' + j.failed.length + ' failed:\n' +
+        j.failed.slice(0, 8).map(function (f) { return (f.id || ('row ' + f.row)) + ': ' + f.error; }).join('\n');
+      alert(msg);
+      if (j.imported) location.reload();
+    };
+    ['dragenter', 'dragover'].forEach(function (ev) { DZ.addEventListener(ev, function (e) { e.preventDefault(); DZ.setAttribute('data-over', '1'); }); });
+    ['dragleave', 'dragend'].forEach(function (ev) { DZ.addEventListener(ev, function () { DZ.removeAttribute('data-over'); }); });
+    DZ.addEventListener('drop', function (e) { e.preventDefault(); DZ.removeAttribute('data-over'); upload(e.dataTransfer.files[0]); });
+    var fi = DZ.querySelector('input[type="file"]');
+    if (fi) fi.addEventListener('change', function () { upload(fi.files[0]); });
+  }
 })();

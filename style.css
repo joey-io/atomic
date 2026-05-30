@@ -114,3 +114,12 @@ fieldset {
   display: flex; flex-direction: column; gap: var(--gap); align-items: flex-start;
 }
 fieldset fieldset { background: var(--row) }
+
+/* nav actions (export CSV) sit beside the dropdown */
+nav a { font-size: .82rem; font-weight: 500 }
+
+/* the CSV import dropzone: a dashed drop target, highlighted while dragging over */
+figure[data-import] { border-style: dashed; text-align: center; color: var(--muted); padding: 18px }
+figure[data-import] p { margin: 6px 0 }
+figure[data-import] input { min-width: 0 }
+[data-over] { border-color: var(--accent); background: var(--accent-weak); color: var(--fg) }

@@ -855,6 +855,96 @@ function page(title, body, fab, foot) {
 <script src="/app.js?v=${APP.length}" defer></script>`;
 }
 
+// ---------------------------------------------------------------------------
+// CSV — a flat view of a model's atoms, for export and an import template. The
+// columns are id, manifest, then every field. ref cells are atom:// strings;
+// embed/list/map/json cells are JSON, so a round-trip (export → edit → import)
+// preserves shape. Import is plain CRUD: each row is POSTed to the model.
+// ---------------------------------------------------------------------------
+const csvCell = (v) => {
+  if (v == null) return '';
+  const s = (typeof v === 'object') ? JSON.stringify(v) : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const csvRow = (cells) => cells.map(csvCell).join(',');
+const modelCols = (modelAtom) => Object.keys(modelAtom.attr.fields || {});
+// header-only template: the shape to fill in for import
+const templateCsv = (modelAtom) => csvRow(['id', 'manifest', ...modelCols(modelAtom)]) + '\n';
+// the field-kind map an importer uses to coerce each cell (embed → a json object)
+function fieldKinds(modelAtom) {
+  const out = {};
+  for (const [k, def] of Object.entries(modelAtom.attr.fields || {}))
+    out[k] = (typeof def === 'string' && def.startsWith('embed://')) ? 'json' : (def.kind || 'text');
+  return out;
+}
+// export a set of atoms. modelId null → cross-model (an index over atom://atom).
+function atomsCsv(modelId, atoms) {
+  if (!modelId) {
+    const lines = [csvRow(['id', 'model', 'manifest', 'createdAt'])];
+    for (const a of atoms) lines.push(csvRow([a.id, refId(a.model), a.manifest || '', a.lifecycle?.createdAt || '']));
+    return lines.join('\n') + '\n';
+  }
+  const cols = modelCols(getAtom(modelId));
+  const lines = [csvRow(['id', 'manifest', ...cols])];
+  for (const a of atoms) lines.push(csvRow([a.id, a.manifest || '', ...cols.map((c) => a.attr?.[c])]));
+  return lines.join('\n') + '\n';
+}
+
+// ---- Import (the inverse of export). A POST to a model with a CSV or a JSON
+// array body is a bulk create: each row/element runs through the normal create()
+// path — same grants, attenuation, rules, dedup, and hooks — and the response is
+// a per-row summary. "Import" is not a new verb; it is POST over many records.
+function parseCsvText(text) {
+  const rows = []; let row = [], cur = '', q = false;
+  text = String(text).replace(/\r\n?/g, '\n');
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+    else if (ch === '"') q = true;
+    else if (ch === ',') { row.push(cur); cur = ''; }
+    else if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+    else cur += ch;
+  }
+  if (cur !== '' || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+function coerceCsv(kind, raw) {
+  if (raw === '') return undefined;
+  if (kind === 'number' || kind === 'integer') { const n = Number(raw); return isNaN(n) ? raw : n; }
+  if (kind === 'boolean') return /^(true|1|yes)$/i.test(raw);
+  if (kind === 'json' || kind === 'map' || kind === 'list') { try { return JSON.parse(raw); } catch { return raw; } }
+  return raw; // text/email/url/uuid/ref/datetime/enum pass through as-is
+}
+// a CSV (id, manifest, then fields) → create bodies, coercing each cell by kind
+function csvToBodies(modelId, text) {
+  const rows = parseCsvText(text);
+  if (rows.length < 2) return [];
+  const header = rows[0].map((h) => h.trim());
+  const kinds = fieldKinds(getAtom(modelId));
+  const bodies = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    if (!cells.length || cells.every((c) => c === '')) continue;
+    const body = { attr: {} };
+    header.forEach((h, ci) => {
+      const v = cells[ci]; if (v === undefined || v === '') return;
+      if (h === 'id') body.id = v;
+      else if (h === 'manifest') body.manifest = v;
+      else { const cv = coerceCsv(kinds[h] || 'text', v); if (cv !== undefined) body.attr[h] = cv; }
+    });
+    bodies.push(body);
+  }
+  return bodies;
+}
+async function bulkCreate(modelId, bodies, actor) {
+  const out = { imported: 0, failed: [] };
+  for (let i = 0; i < bodies.length; i++) {
+    try { const a = create(modelId, bodies[i], actor); await runHooks(a, 'create'); out.imported++; }
+    catch (e) { out.failed.push({ row: i, id: bodies[i]?.id || null, error: e.message }); }
+  }
+  return out;
+}
+
 function renderTable(modelId, atoms, actor) {
   const m = getAtom(modelId);
   const cols = m.attr.display?.row || Object.keys(m.attr.fields || {});
@@ -918,11 +1008,18 @@ function renderForm(modelId, atom, actor) {
       .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}<option value="embed://${esc(mm.id)}"></option></datalist>`).join('');
   // the methods this actor may run here, from its grants (the auth schema)
   const methods = [];
-  if (!editing && canOp(actor, modelId, 'create')) methods.push('POST');
+  if (!editing && canOp(actor, modelId, 'create')) methods.push('POST', 'IMPORT');
   if (editing && canOp(actor, modelId, 'update')) methods.push('PATCH', 'PUT');
   if (editing && canOp(actor, modelId, 'delete')) methods.push('DELETE');
   if (!methods.length) return '';
-  const LABEL = { POST: 'POST · create', PUT: 'PUT · replace', PATCH: 'PATCH · update', DELETE: 'DELETE · delete' };
+  const LABEL = { POST: 'POST · create', IMPORT: 'IMPORT · bulk CSV', PUT: 'PUT · replace', PATCH: 'PATCH · update', DELETE: 'DELETE · delete' };
+  // IMPORT mode (revealed by app.js when chosen): a template to fill + a dropzone
+  // that POSTs the CSV to this model. The server bulk-creates it under the same
+  // grants/rules as a single create. Only in create context (!editing).
+  const importRow = (!editing && canOp(actor, modelId, 'create'))
+    ? `<tr data-import-row hidden><th>csv</th><td><p><a href="/${esc(modelId)}?as=template" download>download template</a></p>`
+      + `<figure data-import="/${esc(modelId)}"><p>Drop a CSV here to import, or <input type="file" accept=".csv,text/csv"></p></figure></td></tr>`
+    : '';
   const methodRow = `<tr><th>method</th><td><select name="$method">${methods.map((x) => `<option value="${x}">${esc(LABEL[x])}</option>`).join('')}</select></td></tr>`;
   const idRows = (editing
     ? `<tr><th>id</th><td><code>${esc(atom.id)}</code></td></tr>`
@@ -930,7 +1027,7 @@ function renderForm(modelId, atom, actor) {
     + `<tr><th>model</th><td><a href="/${esc(modelId)}">atom://${esc(modelId)}</a></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
   // the form is data-driven; /app.js reads these targets and wires submit + repeaters
-  return `<form data-create="${esc('/' + modelId)}" data-atom="${editing ? esc('/' + atom.id) : ''}"><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows}</table></figure><p><button>Submit</button></p>${suggest}</form>`;
+  return `<form data-create="${esc('/' + modelId)}" data-atom="${editing ? esc('/' + atom.id) : ''}"><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows}${importRow}</table></figure><p><button>Submit</button></p>${suggest}</form>`;
 }
 
 // the top nav: indexes the actor can reach, then every model it can touch below.
@@ -973,11 +1070,14 @@ function workspaceMap(actor) {
   return `<ul>${models.map(branch).join('')}</ul>`;
 }
 
-function renderModelPage(modelId, atoms, actor) {
+function renderModelPage(modelId, atoms, actor, search = '') {
   const m = getAtom(modelId);
-  const table = canOp(actor, modelId, 'read') ? renderTable(modelId, atoms, actor) : ''; // hidden without read
+  const canRd = canOp(actor, modelId, 'read');
+  const table = canRd ? renderTable(modelId, atoms, actor) : ''; // hidden without read
+  const qs = (search || '').replace(/^\?/, '');
+  const exp = canRd ? `<a href="/${esc(modelId)}?${qs ? qs + '&' : ''}as=csv" download>export CSV</a>` : '';
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
-    renderForm(modelId, null, actor) + table, navSelect(actor, modelId), footer(actor));
+    renderForm(modelId, null, actor) + table, navSelect(actor, modelId) + exp, footer(actor));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -1018,7 +1118,9 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
     body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, navSelect(actor, indexAtom.id), footer(actor));
+  const ps = new URLSearchParams(values); ps.delete('as'); ps.set('as', 'csv');
+  const exp = `<a href="/${esc(indexAtom.id)}?${esc(ps.toString())}" download>export CSV</a>`;
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, navSelect(actor, indexAtom.id) + exp, footer(actor));
 }
 
 // every place a ref to `target` appears in a value, with its dotted field path
@@ -1087,6 +1189,11 @@ const server = http.createServer(async (req, res) => {
       ...SECURITY, ...(html ? { 'content-security-policy': CSP } : {}) });
     res.end(html ? val : JSON.stringify(val, null, 2));
   };
+  const sendCsv = (filename, body) => {
+    res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8',
+      'content-disposition': `attachment; filename="${filename}"`, ...SECURITY });
+    res.end(body);
+  };
   const redirect = (location, setCookie) => {
     const h = { location, ...SECURITY }; if (setCookie) h['set-cookie'] = setCookie;
     res.writeHead(302, h); res.end();
@@ -1101,8 +1208,8 @@ const server = http.createServer(async (req, res) => {
     const cookies = parseCookies(req);
     const origin = `${tls ? 'https' : 'http'}://${req.headers.host || 'localhost'}`;
     const path = decodeURIComponent(url.pathname).replace(/^\//, '');
-    const wantsHtml = (req.headers.accept || '').includes('text/html') ||
-                      url.searchParams.get('as') === 'html';
+    const as = url.searchParams.get('as');                 // html | csv | template
+    const wantsHtml = (req.headers.accept || '').includes('text/html') || as === 'html';
 
     if (req.method === 'GET' && path === 'style.css') {
       res.writeHead(200, { 'content-type': 'text/css', ...SECURITY }); return res.end(CSS);
@@ -1180,6 +1287,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path && store.has(path) && getAtom(path).model === 'atom://index') {
       const ix = getAtom(path);
       const atoms = runIndex(ix, url.search, actor);
+      if (as === 'csv') return sendCsv(`${ix.id}.csv`, atomsCsv(refId(ix.attr.over) === 'atom' ? null : refId(ix.attr.over), atoms));
       if (wantsHtml) return send(200, renderIndexPage(ix, atoms, actor, Object.fromEntries(url.searchParams)), true);
       return send(200, atoms);
     }
@@ -1197,11 +1305,18 @@ const server = http.createServer(async (req, res) => {
       let result;
       if (headAtom.model === 'atom://index') {
         const atoms = runIndex(headAtom, url.search, actor);
+        if (as === 'csv') return sendCsv(`${headAtom.id}.csv`, atomsCsv(refId(headAtom.attr.over) === 'atom' ? null : refId(headAtom.attr.over), atoms));
         if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
         result = atoms;
       } else if (headAtom.model === 'atom://model' && segs.length === 0) {
-        const atoms = listModel(head, q, actor);
-        if (wantsHtml) return send(200, renderModelPage(head, atoms, actor), true);
+        // a blank template to fill for import (gated on create — you template what you can import)
+        if (as === 'template') {
+          if (!canOp(actor, head, 'create')) throw new Err(403, `${actor.id} cannot import ${head}`);
+          return sendCsv(`${head}-template.csv`, templateCsv(headAtom));
+        }
+        const atoms = listModel(head, q, actor);                 // already gated by read
+        if (as === 'csv') return sendCsv(`${head}.csv`, atomsCsv(head, atoms));
+        if (wantsHtml) return send(200, renderModelPage(head, atoms, actor, url.search), true);
         result = atoms;
       } else if (segs.length) result = traverse(headAtom, segs);
       else {
@@ -1214,7 +1329,17 @@ const server = http.createServer(async (req, res) => {
       return send(200, result);
     }
 
-    if (req.method === 'POST') { const a = create(head, await readBody(req), actor); await runHooks(a, 'create'); return send(201, a); }
+    if (req.method === 'POST') {
+      // IMPORT (bulk create) — POST a CSV body, or a JSON array, to a model. Each
+      // row/element runs through create() under the caller's own grants and rules.
+      if ((req.headers['content-type'] || '').includes('csv')) {
+        const text = await new Promise((r) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => r(b)); });
+        return send(200, await bulkCreate(head, csvToBodies(head, text), actor));
+      }
+      const body = await readBody(req);
+      if (Array.isArray(body)) return send(200, await bulkCreate(head, body, actor));
+      const a = create(head, body, actor); await runHooks(a, 'create'); return send(201, a);
+    }
     if (req.method === 'PUT') { const a = replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); return send(200, a); }
     if (req.method === 'PATCH') { const a = update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); return send(200, a); }
     if (req.method === 'DELETE') { const a = retire(head, actor); await runHooks(a, 'delete'); return send(200, a); }
