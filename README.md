@@ -4,6 +4,30 @@ Atomic stores data and its definitions as one kind of record. A model defines a 
 
 Atomic is a data substrate for graph-relational, queryable stores such as a CRM. Every record is an atom. The schema that defines other records is also made of atoms. Relationships are typed edges. Queries, constraints, permissions, and migrations are atoms and run by one kernel.
 
+## Status — running instance and roadmap
+
+A runnable kernel lives in `kernel.mjs` (dependency-free, Node ≥ 18). It is deployed live at **`http://165.22.37.30:3040/`** under pm2 (process `atomic`), with durable per-tenant persistence under `ATOMIC_STORE` (replayed on boot). Configuration is in `.env` (gitignored): `SENDGRID_API_KEY` (magic-link email, reused from MondayDraft), `ATOMIC_MAIL_FROM`, `ATOMIC_STORE`, `PORT`. The US Census geocoder used by the demo hook is keyless — no API key needed.
+
+**What works today (all exercised by `node test.mjs`, 50 assertions):**
+
+- Atoms, models, Zod-style validation (semantic kinds `email`/`url`/`uuid`, refinements), `embed://` inline shapes, refs + inverse edges, path traversal with a budget.
+- One read seam (`getStore(actor)`); per-attribute redaction; rules predicates; identity dedup/merge; optimistic concurrency; retire (soft delete).
+- Grants with `read`/`create`/`update`/`delete`/`write`/`all` modes — `write` is the mutation superset and does **not** imply read; `all` is everything. HTTP method → op.
+- **Roles** — a `role` atom is a reusable bundle of grants; a token references roles via `attr.roles`, and its effective grants are its own plus its roles'.
+- Tenancy = `lifecycle.parent`; global atoms (parent `atom://0`) are world-visible; a tenant-less token is a superuser.
+- Identity: token atoms, `atom://joey` (root `**`/`all`), `atom://0` (anonymous, no grants). Magic-link sign-in via SendGrid + session atoms + cookie; **open-login** tokens (`login: open`) for one-click public access.
+- **Hooks registered in `lifecycle.hooks`** of any atom (keyed `create`/`update`/`delete`). A hook is a capability atom `{ run, grants }` that runs under **its own** grants — the caller needs no invoke permission. Put a hook on a model atom and it fires for every instance. The reference hook (`scripts/census-district.mjs`) geocodes an advocate's address against the US Census and upserts + links a congressional-district (`census`) atom.
+- Generated surface: API + UI from the same atoms; recursive atom rendering; sortable/overflow tables; model-driven create forms (embed → nested table, list → repeater, ref → autocomplete); index forms; backlink ref-map. Links render **only** to atoms the viewer can actually open — a ref to a missing, retired, or unreadable atom shows as plain `atom://id` text.
+- Three demo tenants seeded from files (not baked into the kernel): **A** = a PAC (`seed-a.mjs` — 3 regions, 20 people in a `manager` reporting chain, 100 fundraising txns), **B** = an advocacy program (`seed-b.mjs` — officials, districts, advocates with real addresses, stories; CapConnect = open-login write-only intake wearing the `website` role), **C** = a hybrid (`seed-c.mjs`). Admin is `joey@emailjoey.com`. The census hook is verified live: Baltimore → MD-07, Chicago → IL-07, Dallas → TX-30.
+
+**Left to do / open threads:**
+
+- README sections below still describe the *earlier* hook design (hook with an `on` field, caller invoke grant). The current design — hooks in `lifecycle.hooks`, run under own grants, no invoke — is summarized here and in the kernel comments; fold it into the prose sections (Logic/Hooks, Identity and access) and add a first-class **Role** subsection.
+- Schema evolution (`migration` atoms) is specified but not yet implemented in the kernel.
+- The "Hue rename" sweep (project-wide rename) is out of scope for Atomic.
+- Consider a richer roles UI (the `roles` field currently renders as a plain list, not a ref repeater).
+- Nashville (`1 Public Sq`, TN) was the one demo address the geocoder didn't match (11 of 12 districts resolved) — cosmetic.
+
 ## Primitives
 
 Atomic has six concepts:
@@ -481,6 +505,31 @@ A grant is itself a model (`{ path, mode }`), and `token.grants` is a `list` of 
 |`openDeals`         |the results of an index                         |
 |`company.*.deals.**`|deals reached through any company field         |
 |`**`                |everything in the token's tenant (an admin)     |
+
+### Role
+
+Grants can live on the token directly, or be bundled into a **role** and shared. A `role` atom is `{ label, grants }` — a named set of grants. A token references roles through `attr.roles` (a list of `atom://role-…`), and its effective grants are its own plus the union of its roles'. Change a role once and every token wearing it changes with it. Attenuation still applies to whatever a token ends up holding.
+
+```json
+{ "id": "role-website", "model": "atom://role", "manifest": "Website intake",
+  "attr": { "label": "Website intake", "grants": [
+    { "path": "advocate.name", "mode": "write" },
+    { "path": "advocate.email", "mode": "write" },
+    { "path": "advocate.address", "mode": "write" }
+  ] } }
+```
+
+A public intake token then just wears the role: `"attr": { "login": "open", "roles": ["atom://role-website"] }` — write-only, no read, nothing inline.
+
+### Hooks (the Logic primitive, as capabilities)
+
+A hook is a capability atom `{ run, grants }` whose `run` names a handler in `scripts/`. It is **registered in an atom's `lifecycle.hooks`**, keyed by event (`create` / `update` / `delete`). On a write, the kernel runs the hooks declared on the atom itself *and* on its model atom — so a hook on a model fires for every instance, a hook on one atom fires for just that one.
+
+The hook runs under **its own grants** (attenuated when it was created), never the caller's. So the caller needs **no invoke permission**: writing the atom is enough, and the hook can only do what it holds. This is how a write-only public form can trigger privileged enrichment safely — e.g. the advocate model registers `census-district`, which geocodes the submitted address and writes the congressional-district link the submitter could never write directly.
+
+```json
+"lifecycle": { "hooks": { "create": ["atom://census-district"], "update": ["atom://census-district"] } }
+```
 
 ### Read filtering
 

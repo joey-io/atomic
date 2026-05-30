@@ -262,7 +262,12 @@ function newSession(tokenId) {
   return id;
 }
 
-const grantsOf = (actor) => actor.attr?.grants || [];
+// a token's effective grants = its own grants + the grants of every role it
+// references. A role atom is just a reusable bundle of grants (see canSee/role).
+const grantsOf = (actor) => [
+  ...(actor.attr?.grants || []),
+  ...(actor.attr?.roles || []).flatMap((r) => store.get(isRef(r) ? refId(r) : r)?.attr?.grants || []),
+];
 
 // segment-wise match with * (one segment) and ** (any number)
 function grantMatch(gpath, target) {
@@ -468,6 +473,7 @@ function create(modelId, body, actor) {
       status: 'active', version: 1,
       modelVersion: modelAtom.attr.version || 1,
       createdAt: now(), createdBy: ref(actor.id), parent: ref(parentId),
+      ...(body.hooks ? { hooks: body.hooks } : {}), // hooks registered on this atom
     },
   };
   if (!evalRule(modelAtom.attr.rules?.write, actor, atom))
@@ -492,6 +498,7 @@ function update(id, body, actor, ifMatch) {
   atom.attr = validate(modelId, { ...atom.attr, ...body.attr });
   attenuate(actor, modelId, atom.attr);
   if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies update of ${modelId}`);
+  if (body.hooks) atom.lifecycle.hooks = body.hooks; // (re)register lifecycle hooks
   atom.lifecycle.version++;
   atom.lifecycle.updatedAt = now();
   atom.lifecycle.updatedBy = ref(actor.id);
@@ -523,9 +530,9 @@ function replace(id, body, actor, ifMatch) {
   return atom;
 }
 
-// Hooks (the Logic primitive). A hook is an atom { on: <model>, run: <script> }.
-// After a write, every hook whose `on` matches the atom's model runs its script
-// from ./scripts/<run>.mjs. The script may patch the atom (no re-trigger).
+// Hooks (the Logic primitive). A hook is an atom { run: <script>, grants: [...] }
+// registered in some atom's lifecycle.hooks (see runHooks). After a write, each
+// registered hook runs its script from ./scripts/<run>.mjs and may patch the atom.
 // a hook writes under ITS OWN grants — not the caller's. So a caller who can
 // only submit an advocate can still trigger a hook that writes a field they can't.
 function patchAtom(atom, fields, hook) {
@@ -541,13 +548,43 @@ function patchAtom(atom, fields, hook) {
   persist(atom);
   logIt(atom.id, 'hook', hook.id, changeset(before, atom.attr));
 }
-async function runHooks(atom, actor) {
-  for (const h of [...store.values()]) {
-    if (h.model !== 'atom://hook' || h.attr.on !== atom.model) continue;
-    if (!canOp(actor, h.id, 'read')) continue; // the caller must hold invoke (read) access to the hook
+// a hook may upsert a related atom (e.g. the census district it links to) under
+// its own grants, into the subject's tenant. Returns the ref to link.
+function hookUpsert(hook, subject, modelId, id, attr) {
+  if (store.has(id)) return ref(id);
+  for (const f of Object.keys(attr))
+    if (!allows(hook, `${modelId}.${f}`, 'create'))
+      throw new Err(403, `hook ${hook.id} is not granted create on ${modelId}.${f}`);
+  seed({
+    id, model: ref(modelId), manifest: id, attr: validate(modelId, attr),
+    lifecycle: { status: 'active', version: 1, modelVersion: getAtom(modelId).attr.version || 1,
+      createdAt: now(), createdBy: ref(hook.id), parent: ref(tenantOf(subject) || '0') },
+  });
+  if (modelId === 'model') buildInverse();
+  logIt(id, 'create', hook.id, changeset({}, attr));
+  return ref(id);
+}
+// Hooks are registered in an atom's `lifecycle.hooks` block, keyed by event
+// ('create' | 'update' | 'delete'). On a write we run the hooks declared on the
+// atom itself AND on its model atom — so a hook on a model fires for every
+// instance, a hook on one atom fires for just that atom. Each hook is a
+// capability that runs under ITS OWN grants (attenuated when it was created),
+// so the caller needs no invoke permission — the hook can only do what it holds.
+async function runHooks(atom, event) {
+  const sources = [atom.lifecycle?.hooks];
+  try { sources.push(getAtom(refId(atom.model)).lifecycle?.hooks); } catch { /* model gone */ }
+  const refs = [];
+  for (const hs of sources) for (const r of [].concat(hs?.[event] || [])) if (!refs.includes(r)) refs.push(r);
+  for (const hr of refs) {
+    const h = store.get(isRef(hr) ? refId(hr) : hr);
+    if (!h || h.model !== 'atom://hook' || h.lifecycle?.status === 'retired') continue;
     try {
       const mod = await import(new URL(`./scripts/${h.attr.run}.mjs`, import.meta.url));
-      await mod.default(atom, { patch: (f) => patchAtom(atom, f, h), getAtom, refId, ref });
+      await mod.default(atom, {
+        patch: (f) => patchAtom(atom, f, h),
+        upsert: (m, id, a) => hookUpsert(h, atom, m, id, a),
+        getAtom, refId, ref,
+      });
     } catch (e) { console.error(`hook ${h.id} (${h.attr.run}):`, e.message); }
   }
 }
@@ -661,20 +698,28 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 // The atom component. Everything rendered is an atom: a value is a ref (a link
 // to another atom), a scalar, a list, or an atom inside an atom (an embedded
 // map) — which renders with this same component, recursively.
-const atomValue = (v) => {
+// link to an atom only if the actor can actually open it — it exists, isn't
+// retired, is in scope, and is readable. Otherwise show the plain atom:// text.
+function canSee(actor, id) {
+  const a = store.get(id);
+  if (!a || a.lifecycle?.status === 'retired') return false;
+  return visible(actor, a) && canOp(actor, refId(a.model), 'read') && ruleOk(actor, a, 'read');
+}
+const link = (actor, id) => canSee(actor, id) ? `<a href="/${esc(id)}">atom://${esc(id)}</a>` : `atom://${esc(id)}`;
+
+const atomValue = (v, actor) => {
   if (v == null) return '';
-  if (isRef(v)) return `<a href="/${esc(refId(v))}">${esc(v)}</a>`;
+  if (isRef(v)) return link(actor, refId(v));
   if (Array.isArray(v))
-    return v.every((x) => typeof x !== 'object' || isRef(x)) ? v.map(atomValue).join(', ') : v.map(atomValue).join('');
-  if (typeof v === 'object') return renderFields(v); // an atom inside an atom
+    return v.every((x) => typeof x !== 'object' || isRef(x)) ? v.map((x) => atomValue(x, actor)).join(', ') : v.map((x) => atomValue(x, actor)).join('');
+  if (typeof v === 'object') return renderFields(v, actor); // an atom inside an atom
   return esc(v);
 };
 
 // render an atom's fields (a map) as the key/value atom table
-function renderFields(map) {
+function renderFields(map, actor) {
   const rows = Object.entries(map).map(([k, v]) => {
-    const cell = (k === 'id' && typeof v === 'string' && !isRef(v))
-      ? `<a href="/${esc(v)}">atom://${esc(v)}</a>` : atomValue(v);
+    const cell = (k === 'id' && typeof v === 'string' && !isRef(v)) ? link(actor, v) : atomValue(v, actor);
     return `<tr><th>${esc(k)}</th><td>${cell}</td></tr>`;
   }).join('');
   return `<div class="tw"><table>${rows}</table></div>`;
@@ -704,13 +749,13 @@ document.querySelectorAll('table').forEach(function(t){
 </script>`;
 }
 
-function renderTable(modelId, atoms) {
+function renderTable(modelId, atoms, actor) {
   const m = getAtom(modelId);
   const cols = m.attr.display?.row || Object.keys(m.attr.fields || {});
   const head = ['id', ...cols].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
-    `<tr><td><a href="/${esc(a.id)}">atom://${esc(a.id)}</a></td>` +
-    cols.map((c) => `<td>${atomValue(a.attr?.[c])}</td>`).join('') + '</tr>').join('');
+    `<tr><td>${link(actor, a.id)}</td>` +
+    cols.map((c) => `<td>${atomValue(a.attr?.[c], actor)}</td>`).join('') + '</tr>').join('');
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
 
@@ -828,16 +873,16 @@ function navSelect(actor, current) {
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
-  const table = canOp(actor, modelId, 'read') ? renderTable(modelId, atoms) : ''; // hidden without read
+  const table = canOp(actor, modelId, 'read') ? renderTable(modelId, atoms, actor) : ''; // hidden without read
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
     renderForm(modelId, null, actor) + table, navSelect(actor, modelId));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
-function renderCrossTable(atoms) {
+function renderCrossTable(atoms, actor) {
   const head = ['id', 'model', 'manifest', 'createdAt'].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
-    `<tr><td><a href="/${esc(a.id)}">atom://${esc(a.id)}</a></td><td>${atomValue(a.model)}</td>` +
+    `<tr><td>${link(actor, a.id)}</td><td>${atomValue(a.model, actor)}</td>` +
     `<td>${esc(a.manifest || '')}</td><td>${esc(a.lifecycle?.createdAt || '')}</td></tr>`).join('');
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
@@ -864,7 +909,7 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
       .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}</datalist>`).join('');
     form = `<form method="get" action="/${esc(indexAtom.id)}"><div class="tw"><table class="form">${rows}</table></div><p><button>Run</button></p>${lists}</form>`;
   }
-  let body = form + (over === 'atom' ? renderCrossTable(atoms) : renderTable(over, atoms));
+  let body = form + (over === 'atom' ? renderCrossTable(atoms, actor) : renderTable(over, atoms, actor));
   const pg = indexAtom.attr.page;
   if (pg && atoms.length) {
     const last = atoms[atoms.length - 1];
@@ -891,11 +936,11 @@ function referencedBy(atom, actor) {
   }
   return out;
 }
-function renderRefMap(rows) {
+function renderRefMap(rows, actor) {
   if (!rows.length) return '';
   const head = ['referenced by', 'model', 'via'].map((c) => `<th>${esc(c)}</th>`).join('');
   const body = rows.slice(0, 200).map((r) =>
-    `<tr><td><a href="/${esc(r.id)}">${esc(r.label)}</a></td><td>${atomValue('atom://' + r.model)}</td><td>${esc(r.via)}</td></tr>`).join('');
+    `<tr><td>${link(actor, r.id)}</td><td>${atomValue('atom://' + r.model, actor)}</td><td>${esc(r.via)}</td></tr>`).join('');
   return `<p>referenced by — ${rows.length}</p><div class="tw"><table><tr>${head}</tr>${body}</table></div>`;
 }
 
@@ -903,7 +948,7 @@ function renderAtom(atom, actor) {
   const modelId = refId(atom.model);
   // the UI mirrors the schema: render the whole atom — id, model, manifest,
   // attr, lifecycle — then the ref map (everything that references it)
-  const body = renderFields(atom) + renderForm(modelId, atom, actor) + renderRefMap(referencedBy(atom, actor));
+  const body = renderFields(atom, actor) + renderForm(modelId, atom, actor) + renderRefMap(referencedBy(atom, actor), actor);
   return page(atom.manifest || atom.id, body, navSelect(actor, refId(atom.model)));
 }
 
@@ -986,8 +1031,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path === '') {
       const a = getAtom('0');
       if (!wantsHtml) return send(200, a);
-      let body = renderFields(a);
-      body += isAnon ? sessionForm() : `<p>signed in as ${atomValue(ref(actor.id))}</p>`;
+      let body = renderFields(a, actor);
+      body += isAnon ? sessionForm() : `<p>signed in as ${atomValue(ref(actor.id), actor)}</p>`;
       return send(200, page(a.manifest || 'atom://0', body, navSelect(actor, '')), true);
     }
     // no anonymous access beyond the root
@@ -1001,7 +1046,7 @@ const server = http.createServer(async (req, res) => {
       if (head === 'atom' && segs.length === 0) {
         const atoms = sortBy(getStore(actor).all().filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
           .map((a) => redact(actor, a));
-        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), navSelect(actor, '')), true);
+        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms, actor), navSelect(actor, '')), true);
         return send(200, atoms);
       }
       const headAtom = getAtom(head);
@@ -1026,10 +1071,10 @@ const server = http.createServer(async (req, res) => {
       return send(200, result);
     }
 
-    if (req.method === 'POST') { const a = create(head, await readBody(req), actor); await runHooks(a, actor); return send(201, a); }
-    if (req.method === 'PUT') { const a = replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, actor); return send(200, a); }
-    if (req.method === 'PATCH') { const a = update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, actor); return send(200, a); }
-    if (req.method === 'DELETE') return send(200, retire(head, actor));
+    if (req.method === 'POST') { const a = create(head, await readBody(req), actor); await runHooks(a, 'create'); return send(201, a); }
+    if (req.method === 'PUT') { const a = replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); return send(200, a); }
+    if (req.method === 'PATCH') { const a = update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); return send(200, a); }
+    if (req.method === 'DELETE') { const a = retire(head, actor); await runHooks(a, 'delete'); return send(200, a); }
     return send(405, { error: 'method not allowed' });
   } catch (e) {
     send(e.code || 500, { error: e.message });
@@ -1061,9 +1106,10 @@ function bootstrap() {
   model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
     indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } });
   model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
-    grants: { kind: 'list', of: 'embed://grant' } });
+    grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' } });
   model('grant',  'Grant',  { path: { kind: 'text', required: true },
     mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } });
+  model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } });
   model('tenant', 'Tenant', { name: { kind: 'text', required: true } });
   model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
     params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } });
@@ -1071,7 +1117,7 @@ function bootstrap() {
     actor: { kind: 'ref', to: 'atom://token' }, at: { kind: 'datetime' }, changes: { kind: 'list' } });
   model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
     createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } });
-  model('hook',   'Hook',   { on: { kind: 'ref', to: 'atom://model' }, run: { kind: 'text', required: true },
+  model('hook',   'Hook',   { label: { kind: 'text' }, run: { kind: 'text', required: true },
     grants: { kind: 'list', of: 'embed://grant' } });
 
   // core indexes (queries are atoms too)

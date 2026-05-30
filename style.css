@@ -11,8 +11,7 @@ td, th {
   border: var(--border);
   padding: var(--pad);
   text-align: left;
-  max-width: var(--col-max);
-  overflow-wrap: anywhere;
+  white-space: nowrap;
 }
 th { cursor: pointer }
 th[data-dir="1"]::after { content: var(--asc) }

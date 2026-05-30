@@ -26,20 +26,28 @@ ok(await code(null, 'GET', '/widget') === 401, 'anonymous cannot read data');
 ok((await (await fetch(base + '/style.css')).headers.get('content-type')) === 'text/css', 'style.css served');
 
 // --- admin sets up a model, a hook, tenants, scoped tokens -------------------
-await J('joey', 'POST', '/model', { id: 'widget', manifest: 'Widget', attr: { label: 'Widget', version: 1, fields: {
+await J('joey', 'POST', '/model', { id: 'tag', manifest: 'Tag', attr: { label: 'Tag', version: 1, fields: { label: { kind: 'text' } } } });
+// the two hooks are capability atoms (no `on`); the model registers them in its lifecycle
+await J('joey', 'POST', '/hook', { id: 'stamp', attr: { run: 'test-stamp', grants: [{ path: 'widget.stamp', mode: 'write' }] } });
+await J('joey', 'POST', '/hook', { id: 'link', attr: { run: 'test-link', grants: [{ path: 'widget.tag', mode: 'write' }, { path: 'tag.*', mode: 'write' }] } });
+await J('joey', 'POST', '/model', { id: 'widget', manifest: 'Widget', hooks: { create: ['atom://stamp', 'atom://link'] }, attr: { label: 'Widget', version: 1, fields: {
   name: { kind: 'text', required: true }, size: { kind: 'number', min: 0, max: 100 },
   kind: { kind: 'enum', values: ['a', 'b'] }, parentw: { kind: 'ref', to: 'atom://widget', inverse: 'children' },
+  tag: { kind: 'ref', to: 'atom://tag', inverse: 'widgets' },
   stamp: { kind: 'text' }, email: { kind: 'email' },
 }, indexes: { byName: { on: ['name'], role: 'identity' } } } });
-await J('joey', 'POST', '/hook', { id: 'stamp', attr: { on: 'atom://widget', run: 'test-stamp', grants: [{ path: 'widget.stamp', mode: 'write' }] } });
+// a reusable role: read widgets. tk-roled wears it instead of carrying grants inline.
+await J('joey', 'POST', '/role', { id: 'role-reader', attr: { label: 'Reader', grants: [{ path: 'widget.*', mode: 'read' }] } });
 await J('joey', 'POST', '/tenant', { id: 't1', attr: { name: 'T1' } });
 await J('joey', 'POST', '/tenant', { id: 't2', attr: { name: 'T2' } });
 const mk = (id, t, grants) => J('joey', 'POST', '/token', { id, parent: 'atom://' + t, attr: { email: `${id}@x.com`, grants } });
 await mk('tk-all', 't1', [{ path: '**', mode: 'all' }]);
 await mk('tk-read', 't1', [{ path: 'widget.*', mode: 'read' }]);
 await mk('tk-name', 't1', [{ path: 'widget.name', mode: 'write' }]);          // write name only, no read
-await mk('tk-stamp', 't1', [{ path: 'widget.name', mode: 'write' }, { path: 'stamp', mode: 'read' }]); // + invoke hook
+await mk('tk-stamp', 't1', [{ path: 'widget.name', mode: 'write' }, { path: 'stamp', mode: 'read' }]);
+await mk('tk-link', 't1', [{ path: 'widget.name', mode: 'write' }, { path: 'link', mode: 'read' }]);
 await mk('tk2', 't2', [{ path: '**', mode: 'all' }]);
+await J('joey', 'POST', '/token', { id: 'tk-roled', parent: 'atom://t1', attr: { email: 'tk-roled@x.com', roles: ['atom://role-reader'] } });
 
 // --- validation --------------------------------------------------------------
 ok(await code('tk-all', 'POST', '/widget', { attr: {} }) === 400, 'required field enforced');
@@ -92,12 +100,27 @@ ok(await code('tk-nodel', 'DELETE', '/w2') === 403, 'delete blocked without a mu
 ok(await code('tk-all', 'DELETE', '/w2') === 200, 'delete with grant retires');
 ok(!(await jsonOf('tk-all', '/widget')).find((a) => a.id === 'w2'), 'retired atom hidden from list');
 
-// --- hook delegation ---------------------------------------------------------
+// --- hooks (model-registered in lifecycle; run under own grants, no invoke) --
 await J('tk-stamp', 'POST', '/widget', { id: 'w-hook', attr: { name: 'Gamma' } });
-ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook wrote a field under its own grant');
-ok(await code('tk-stamp', 'POST', '/widget', { attr: { name: 'z', stamp: 'no' } }) === 403, 'caller cannot write the hook-only field');
-await J('tk-name', 'POST', '/widget', { id: 'w-nohook', attr: { name: 'Delta' } }); // tk-name lacks hook invoke
-ok((await jsonOf('joey', '/w-nohook')).attr.stamp === undefined, 'hook does not run without invoke grant');
+ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'model hook wrote a field under its own grant');
+ok(await code('tk-stamp', 'POST', '/widget', { attr: { name: 'z2', stamp: 'no' } }) === 403, 'caller cannot write the hook-only field directly');
+await J('tk-name', 'POST', '/widget', { id: 'w-anyone', attr: { name: 'Delta' } });
+ok((await jsonOf('joey', '/w-anyone')).attr.stamp === 'ok', 'model hook runs for any authorized writer (no invoke grant needed)');
+
+// --- hook upsert + link (the census/district pattern) ------------------------
+await J('tk-link', 'POST', '/widget', { id: 'w-link', attr: { name: 'Echo' } });
+ok((await jsonOf('joey', '/w-link')).attr.tag === 'atom://tag-echo', 'hook upserts a related atom and links it');
+ok((await jsonOf('joey', '/tag-echo')).attr.label === 'Echo', 'the upserted atom exists');
+ok(await code('tk-link', 'POST', '/widget', { attr: { name: 'zz', tag: 'atom://tag-x' } }) === 403, 'caller cannot set the hook-linked ref directly');
+
+// --- roles: a token inherits grants from referenced role atoms ---------------
+ok((await jsonOf('tk-roled', '/widget')).length >= 1, 'token inherits read grant from its role');
+ok(await code('tk-roled', 'POST', '/widget', { attr: { name: 'nope' } }) === 403, 'role grants do not exceed what the role holds');
+
+// --- links render only when the target is reachable --------------------------
+await J('tk-all', 'POST', '/widget', { id: 'w-dang', attr: { name: 'Dangling', parentw: 'atom://ghost' } });
+const dh = await (await J('joey', 'GET', '/w-dang?as=html', null, { accept: 'text/html' })).text();
+ok(dh.includes('atom://ghost') && !dh.includes('href="/ghost"'), 'ref to a missing atom is plain text, not a link');
 
 // --- path traversal + inverse edges ------------------------------------------
 await J('tk-all', 'POST', '/widget', { id: 'wp', attr: { name: 'Parent' } });
