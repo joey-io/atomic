@@ -664,7 +664,7 @@ function renderTable(modelId, atoms) {
   const cols = m.attr.display?.row || Object.keys(m.attr.fields || {});
   const head = ['id', ...cols].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
-    `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td>` +
+    `<tr><td><a href="/${esc(a.id)}">atom://${esc(a.id)}</a></td>` +
     cols.map((c) => `<td>${atomValue(a.attr?.[c])}</td>`).join('') + '</tr>').join('');
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
@@ -786,7 +786,7 @@ function renderModelPage(modelId, atoms, actor) {
 function renderCrossTable(atoms) {
   const head = ['id', 'model', 'manifest', 'createdAt'].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
-    `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td><td>${atomValue(a.model)}</td>` +
+    `<tr><td><a href="/${esc(a.id)}">atom://${esc(a.id)}</a></td><td>${atomValue(a.model)}</td>` +
     `<td>${esc(a.manifest || '')}</td><td>${esc(a.lifecycle?.createdAt || '')}</td></tr>`).join('');
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
