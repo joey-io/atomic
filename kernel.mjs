@@ -223,18 +223,22 @@ function grantMatch(gpath, target) {
   return go(0, 0);
 }
 
-const canRead  = (actor, target) => grantsOf(actor).some((x) => grantMatch(x.path, target));
-const canWrite = (actor, target) =>
-  grantsOf(actor).some((x) => x.mode === 'write' && grantMatch(x.path, target));
+// The HTTP methods are the auth schema. A grant's mode is the operation it
+// permits; the method maps to one. `write` is the mutation superset, and any
+// grant implies read (if you can touch it, you can see it).
+const OP = { GET: 'read', POST: 'create', PUT: 'update', PATCH: 'update', DELETE: 'delete' };
+const permits = (mode, op) => mode === 'write' || op === 'read' || mode === op;
 
-// can the actor touch anything under this top-level name (a model or index id)?
+// field-level: may the actor do `op` on this path (model.field, index, ...)?
+const allows = (actor, target, op) =>
+  grantsOf(actor).some((x) => permits(x.mode, op) && grantMatch(x.path, target));
+// model-level: may the actor do `op` on this model/index as a whole?
+const canOp = (actor, name, op) =>
+  grantsOf(actor).some((x) => { const s = x.path.split('.')[0]; return (s === name || s === '*' || s === '**') && permits(x.mode, op); });
+// nav visibility: does the actor hold any grant touching this name?
 const canTouch = (actor, name) =>
   grantsOf(actor).some((x) => { const s = x.path.split('.')[0]; return s === name || s === '*' || s === '**'; });
-
-// can the actor create atoms of this model (a write grant covering it)?
-const canCreate = (actor, modelId) =>
-  grantsOf(actor).some((x) =>
-    x.mode === 'write' && (() => { const s = x.path.split('.')[0]; return s === modelId || s === '*' || s === '**'; })());
+const canRead = (actor, target) => allows(actor, target, 'read');
 
 function redact(actor, atom) {
   const modelId = refId(atom.model);
@@ -269,8 +273,8 @@ function changeset(before, after) {
 function create(modelId, body, actor) {
   const modelAtom = getAtom(modelId);
   const fields = Object.keys(body.attr || {});
-  if (!fields.every((f) => canWrite(actor, `${modelId}.${f}`)))
-    throw new Err(403, `${actor.id} cannot write ${modelId}`);
+  if (!fields.every((f) => allows(actor, `${modelId}.${f}`, 'create')))
+    throw new Err(403, `${actor.id} cannot create ${modelId}`);
 
   // POST creates. An explicit id that already exists is a conflict — never clobber.
   if (body.id && store.has(body.id))
@@ -312,8 +316,8 @@ function update(id, body, actor, ifMatch) {
   const atom = getAtom(id);
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
-  if (!fields.every((f) => canWrite(actor, `${modelId}.${f}`)))
-    throw new Err(403, `${actor.id} cannot write ${modelId}`);
+  if (!fields.every((f) => allows(actor, `${modelId}.${f}`, 'update')))
+    throw new Err(403, `${actor.id} cannot update ${modelId}`);
   if (ifMatch != null && Number(ifMatch) !== atom.lifecycle.version)
     throw new Err(409, `version conflict: have ${atom.lifecycle.version}, sent ${ifMatch}`);
 
@@ -332,8 +336,8 @@ function replace(id, body, actor, ifMatch) {
   const atom = getAtom(id);
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
-  if (!fields.every((f) => canWrite(actor, `${modelId}.${f}`)))
-    throw new Err(403, `${actor.id} cannot write ${modelId}`);
+  if (!fields.every((f) => allows(actor, `${modelId}.${f}`, 'update')))
+    throw new Err(403, `${actor.id} cannot update ${modelId}`);
   if (ifMatch != null && Number(ifMatch) !== atom.lifecycle.version)
     throw new Err(409, `version conflict: have ${atom.lifecycle.version}, sent ${ifMatch}`);
   const before = { ...atom.attr };
@@ -347,6 +351,8 @@ function replace(id, body, actor, ifMatch) {
 
 function retire(id, actor) {
   const atom = getAtom(id);
+  if (!canOp(actor, refId(atom.model), 'delete'))
+    throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   atom.lifecycle.status = 'retired';
   atom.lifecycle.version++;
   atom.lifecycle.updatedAt = now();
@@ -438,7 +444,7 @@ function runIndex(indexAtom, search, actor) {
 // Tiny HTML rendering (UI generated from field kinds)
 // ---------------------------------------------------------------------------
 
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 // The atom component. Everything rendered is an atom: a value is a ref (a link
 // to another atom), a scalar, a list, or an atom inside an atom (an embedded
@@ -541,40 +547,62 @@ document.querySelectorAll('button[data-email]').forEach(function(b){
 </script>`);
 }
 
-// add form generated from the model's field kinds; POSTs JSON with the session cookie
-function renderForm(modelId) {
+// a form generated from the model's field kinds. Create (POST /model) when no
+// atom is given; edit (PATCH /id) when one is. Includes id, model, manifest.
+function renderForm(modelId, atom) {
   const m = getAtom(modelId);
+  const editing = !!atom;
+  const cur = atom?.attr || {};
   const inputs = Object.entries(m.attr.fields || {})
     .filter(([, d]) => typeof d === 'object')
     .map(([k, def]) => {
+      const v = cur[k];
       if (def.kind === 'enum')
-        return `<p><label>${esc(k)} <select name="${esc(k)}">${def.values.map((v) => `<option>${esc(v)}</option>`).join('')}</select></label></p>`;
+        return `<p><label>${esc(k)} <select name="${esc(k)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select></label></p>`;
       if (def.kind === 'boolean')
-        return `<p><label><input type="checkbox" name="${esc(k)}"> ${esc(k)}</label></p>`;
+        return `<p><label><input type="checkbox" name="${esc(k)}"${v ? ' checked' : ''}> ${esc(k)}</label></p>`;
       if (def.kind === 'ref' && def.to) {
         const opts = [...store.values()]
           .filter((a) => a.model === def.to && a.lifecycle?.status !== 'retired')
-          .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('');
+          .map((a) => `<option value="atom://${esc(a.id)}"${'atom://' + a.id === v ? ' selected' : ''}>${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('');
         return `<p><label>${esc(k)} <select name="${esc(k)}" data-kind="ref"><option value="">—</option>${opts}</select></label></p>`;
       }
       const type = (def.kind === 'integer' || def.kind === 'number') ? 'number' : 'text';
-      return `<p><label>${esc(k)} <input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}"></label></p>`;
+      return `<p><label>${esc(k)} <input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}" value="${v === undefined ? '' : esc(v)}"></label></p>`;
     }).join('');
-  return `<h1>Add ${esc(m.attr.label || modelId)}</h1><form id="add">${inputs}<button>Create</button></form>
+  const idRow = editing
+    ? `<p>id <code>${esc(atom.id)}</code> · model <code>atom://${esc(modelId)}</code></p>`
+    : `<p><label>id <input name="$id" placeholder="auto"></label> &nbsp; model <code>atom://${esc(modelId)}</code></p>`;
+  const manifestRow = `<p><label>manifest <input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></label></p>`;
+  const method = editing ? 'PATCH' : 'POST';
+  const url = editing ? `/${atom.id}` : `/${modelId}`;
+  return `<h1>${editing ? 'Edit' : 'Add ' + esc(m.attr.label || modelId)}</h1>
+<form id="f">${idRow}${manifestRow}${inputs}<button>${editing ? 'Save' : 'Create'}</button></form>
 <script>
-document.getElementById('add').onsubmit=async function(e){e.preventDefault();var attr={};
-e.target.querySelectorAll('[name]').forEach(function(el){
-  if(el.type==='checkbox'){attr[el.name]=el.checked;return;}
+document.getElementById('f').onsubmit=async function(e){e.preventDefault();var body={},attr={};
+e.target.querySelectorAll('[name]').forEach(function(el){var n=el.name;
+  if(n==='$id'){if(el.value)body.id=el.value;return;}
+  if(n==='$manifest'){body.manifest=el.value;return;}
+  if(el.type==='checkbox'){attr[n]=el.checked;return;}
   if(el.value==='')return;
-  attr[el.name]=(el.dataset.kind==='number'||el.dataset.kind==='integer')?Number(el.value):el.value;});
-var r=await fetch('/'+${JSON.stringify(modelId)},{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({attr:attr})});
-if(r.ok){location.reload();}else{var j=await r.json();alert(j.error||'error');}};
+  attr[n]=(el.dataset.kind==='number'||el.dataset.kind==='integer')?Number(el.value):el.value;});
+body.attr=attr;
+var r=await fetch('${url}',{method:'${method}',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+if(r.ok){location.href='${editing ? '/' + atom.id : '/' + modelId}';}else{var j=await r.json();alert(j.error||'error');}};
 </script>`;
+}
+
+function renderDelete(id) {
+  return `<p><button id="del">Delete</button></p>
+<script>document.getElementById('del').onclick=async function(){
+if(!confirm('Retire '+${JSON.stringify(id)}+'?'))return;
+var r=await fetch('/'+${JSON.stringify(id)},{method:'DELETE'});
+if(r.ok){location.href='/';}else{var j=await r.json();alert(j.error||'error');}};</script>`;
 }
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
-  const form = canCreate(actor, modelId) ? renderForm(modelId) : '';
+  const form = canOp(actor, modelId, 'create') ? renderForm(modelId) : '';
   return page(`${m.attr.label || modelId} — ${atoms.length}`, renderTable(modelId, atoms) + form);
 }
 
@@ -599,8 +627,13 @@ function renderIndexPage(indexAtom, atoms) {
   return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body);
 }
 
-function renderAtom(atom) {
-  return page(atom.manifest || atom.id, renderFields(atom.attr || {}));
+function renderAtom(atom, actor) {
+  const modelId = refId(atom.model);
+  let body = `<p>id <code>${esc(atom.id)}</code> · model ${atomValue(atom.model)} · v${atom.lifecycle?.version ?? ''} · ${esc(atom.lifecycle?.status || '')}</p>`
+    + renderFields(atom.attr || {});
+  if (canOp(actor, modelId, 'update')) body += renderForm(modelId, atom);
+  if (canOp(actor, modelId, 'delete')) body += renderDelete(atom.id);
+  return page(atom.manifest || atom.id, body);
 }
 
 function renderHome(h) {
@@ -723,7 +756,7 @@ const server = http.createServer(async (req, res) => {
       } else if (segs.length) result = traverse(headAtom, segs);
       else {
         const a = redact(actor, headAtom);
-        if (wantsHtml) return send(200, renderAtom(a), true);
+        if (wantsHtml) return send(200, renderAtom(a, actor), true);
         result = a;
       }
       return send(200, result);
@@ -758,7 +791,7 @@ function bootstrap() {
   seed({ id: 'joey', model: 'atom://token', manifest: 'Joey (founding operator, root authority)',
     attr: { grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('joey') });
   seed({ id: '0', model: 'atom://token', manifest: 'Atomic (public root + anonymous identity)',
-    attr: { name: 'Atomic',
+    attr: { name: 'Atomic ⚛',
       description: 'A data substrate where schema, data, identity, and the UI surface are all atoms.',
       grants: [] }, lifecycle: lc('joey') });
 

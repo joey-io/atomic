@@ -456,7 +456,7 @@ A tenant is the organization and the isolation boundary. A token belongs to one 
 
 A grant gives a token access to a ref — a model, an index, or a single attribute path — for read or write. A path may use wildcards, so one grant covers many attributes across many atoms.
 
-- A grant is `{ "path": "<path>", "mode": "read" | "write" }`.
+- A grant is `{ "path": "<path>", "mode": "read" | "create" | "update" | "delete" | "write" }`. The mode is the operation, and the HTTP method selects it: `GET`→read, `POST`→create, `PUT`/`PATCH`→update, `DELETE`→delete. `write` is the mutation superset, and any grant implies read.
 - `*` matches one segment. `**` matches any number.
 - The path is an ordinary path, so a grant can name a model (`contact.*`), an index (`openDeals`), or reach across edges.
 
