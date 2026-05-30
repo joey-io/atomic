@@ -238,6 +238,115 @@ The kernel exposes one address space. Every atom, model, and index is reachable 
 
 Every model gets create, read, update, and delete endpoints and a matching add-and-edit form, generated from its fields. Every index gets a query endpoint and a table view. Every edge in a result is a link to the referenced atom. The model's `rules` apply to both data and UI, because both resolve through the same path. There is no code generation step and no separate API or UI definition. The surface is computed from the atoms on each request.
 
+## Addressing
+
+Every reference is a URL. The same `atom://` string is used wherever a value, a link, or a query is expected: as an edge stored in `attr`, as a parameter in another query, as a route in the API, and as a link in the UI. A reference means the same thing in each place, so it is portable across all of them.
+
+A URL has the form:
+
+```
+atom://<ref>[.<path>][?<query>]
+```
+
+- `<ref>` — an atom id, a model id, or an index id.
+- `.<path>` — an optional dotted path that reads fields and edges from the result.
+- `?<query>` — optional query parameters.
+
+|URL                                          |Returns                                                       |
+|---------------------------------------------|--------------------------------------------------------------|
+|`atom://northwind`                           |the company record                                            |
+|`atom://northwind.tier`                      |the value `enterprise`                                        |
+|`atom://northwind.owner.team`                |`atom://team-west`, across two edges                          |
+|`atom://northwind.contacts`                  |the inverse edge: every contact at the company                |
+|`atom://contact`                             |every contact (the model's table)                             |
+|`atom://openDeals?company=atom://northwind`  |the stored index, run with a parameter                        |
+|`atom://deal?stage=qualified&sort=-amount`   |an ad-hoc query over a model's filterable fields              |
+
+A query over a model filters on `filterable` fields and orders on `sortable` fields. The rules are:
+
+- `key=value` matches equality.
+- `key=a,b` matches any value in the list.
+- `key>=value`, `key<=value`, `key>value`, `key<value` compare.
+- Multiple parameters combine with AND.
+- `sort=field` orders ascending; `sort=-field` orders descending.
+
+A stored index names and reuses such a query. An ad-hoc query is the same query written inline on a model. Each URL resolves to data or to a rendered view through the same path, so every query is also a shareable link.
+
+### Over HTTP
+
+The kernel serves the address space under one host. `atom://<ref>` maps to `https://<host>/<ref>`. The HTTP method selects the operation:
+
+|Method               |Operation                                                          |
+|---------------------|-------------------------------------------------------------------|
+|`GET /<id>`          |read an atom                                                       |
+|`GET /<id>.<path>`   |read across a path                                                 |
+|`GET /<model>?<query>`|run a query, return the result set                                |
+|`POST /<model>`      |create an atom of that model from a JSON body                      |
+|`PATCH /<id>`        |update an atom; the `If-Match` header carries the version read     |
+|`DELETE /<id>`       |retire an atom (set `lifecycle.status`)                            |
+
+A model is created the same way as any record: `POST /model` with the model definition as the body. An index is created with `POST /index`. Defining a type and creating a record are the same operation on different models.
+
+Run a query:
+
+```
+curl 'https://crm.example/deal?stage=qualified&sort=-amount'
+```
+
+Read across a path:
+
+```
+curl 'https://crm.example/northwind.owner.team'
+```
+
+Create an atom:
+
+```
+curl -X POST https://crm.example/contact \
+  -H 'content-type: application/json' \
+  -d '{
+    "manifest": "Jane Roe, VP Eng at Northwind",
+    "attr": {
+      "name": "Jane Roe",
+      "email": "jane@northwind.com",
+      "company": "atom://northwind"
+    }
+  }'
+```
+
+The kernel generates `id`, fills `lifecycle`, sets `model` from the route, and validates `attr` against the contact model. If a contact with the same `byEmail` key exists, the write merges into it.
+
+Post a model — define a new type by creating an atom whose model is `model`:
+
+```
+curl -X POST https://crm.example/model \
+  -H 'content-type: application/json' \
+  -d '{
+    "manifest": "A task",
+    "attr": {
+      "label": "Task",
+      "version": 1,
+      "fields": {
+        "title": { "kind": "text", "required": true },
+        "done": { "kind": "boolean", "default": false }
+      }
+    }
+  }'
+```
+
+The new `task` model is immediately addressable: `GET /task` returns its (empty) table and `POST /task` creates a task.
+
+Update an atom:
+
+```
+curl -X PATCH https://crm.example/7b8f-2f0c \
+  -H 'content-type: application/json' \
+  -H 'if-match: 3' \
+  -d '{ "attr": { "title": "VP Platform Engineering" } }'
+```
+
+The kernel commits only if the stored version still equals `3`. Otherwise it returns a conflict.
+
 ## Correctness
 
 **Identity and deduplication.** On create, the kernel checks the model's `identity` indexes. If a record with the same key exists, the write is merged into it (per `behavior.merge`) instead of inserting a duplicate. The `id` is not used for matching. By default `id` is a generated surrogate. `behavior.addressing: content` derives `id` from the identity key and is allowed only for immutable, single-key models.
@@ -586,3 +695,89 @@ One company, its owner, two contacts, and a deal. `hq` holds resolved address va
 - `atom://7b8f-2f0c.company.owner.team` → `atom://team-west` (path across two edges).
 - `atom://openDeals?company=atom://northwind` → `[ atom://deal-9001 ]` (stage in lead/qualified, sorted by amount).
 - Writing a second contact with `email: jane@northwind.com` matches the `byEmail` identity index and merges into `atom://7b8f-2f0c` instead of creating a duplicate.
+
+## Example: a website signup form
+
+A public website collects signups. The form is a model atom that embeds the contact model. Embedding inlines the contact's fields into each registration, so a registration is one record and not a separate shared contact. The person fields are defined once on `contact` and reused here.
+
+```json
+{
+  "id": "registration",
+  "model": "atom://model",
+  "manifest": "Website signup form",
+  "attr": {
+    "label": "Registration",
+    "version": 1,
+    "fields": {
+      "contact": "embed://contact",
+      "source": {
+        "kind": "text",
+        "default": "website"
+      },
+      "consent": {
+        "kind": "boolean",
+        "required": true
+      }
+    },
+    "rules": {
+      "read": "actor.team == 'sales'",
+      "write": "true"
+    }
+  },
+  "lifecycle": "atom://0"
+}
+```
+
+`write: "true"` lets anyone submit. `read` keeps submissions internal to the sales team.
+
+The form is made from the contact model. Because `contact` is `embed://contact`, the person inputs come straight from the contact model's fields. The contact model is defined once and drives both the CRM's contact records and this public form. The `source` and `consent` fields are added by the registration model on top of the embedded contact.
+
+The website mounts the generated form by reference. The kernel renders inputs from field kinds: the embedded contact expands into its `name`, `email`, and `title` fields, `consent` becomes a checkbox, and `source` is hidden with its default.
+
+```html
+<div data-atom="atom://registration"></div>
+<script src="https://crm.example/embed.js"></script>
+```
+
+A submission is a POST that creates one registration atom with the contact fields inline:
+
+```
+curl -X POST https://crm.example/registration \
+  -H 'content-type: application/json' \
+  -d '{
+    "attr": {
+      "contact": {
+        "name": "Sam Lee",
+        "email": "sam@acme.com"
+      },
+      "consent": true
+    }
+  }'
+```
+
+The kernel validates the embedded `contact` values against the contact model, fills `source` from its default, generates `id` and `lifecycle`, and stores the registration. The stored record holds resolved values, with no `embed://` string and no `id` or `lifecycle` on the embedded contact:
+
+```json
+{
+  "id": "c4d2-71aa",
+  "model": "atom://registration",
+  "manifest": "Sam Lee, signup from website",
+  "attr": {
+    "contact": {
+      "name": "Sam Lee",
+      "email": "sam@acme.com"
+    },
+    "source": "website",
+    "consent": true
+  },
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-05-30T18:00:00Z",
+    "createdBy": "atom://anon"
+  }
+}
+```
+
+`GET /registration` returns the table of signups for sales. Each row shows the embedded contact fields.
