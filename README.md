@@ -47,7 +47,7 @@ An atom is a raw data record. Every atom has the same five fields.
 |`model`    |A pointer to the model atom that defines this record's type. This pointer is the record's identity.   |
 |`manifest` |Free-text description. Set through CRUD. Full-text indexed.                                            |
 |`attr`     |The record's values. The model validates them. `ref` values are edges.                                |
-|`lifecycle`|Kernel-managed: `status`, `version` (write count), `modelVersion`, and created/updated actor and time.|
+|`lifecycle`|Kernel-managed: `status`, `version` (write count), `modelVersion`, `parent` (the containing atom — see Tenant), and created/updated actor and time.|
 
 `id` is opaque and never changes. References stay valid when data changes. Domain timestamps such as `closedAt` go in `attr`. `lifecycle` holds operational metadata only.
 
@@ -113,9 +113,10 @@ An atom names its model with the `model` pointer. The kernel uses that pointer t
 **Field kinds**
 
 - Scalars: `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`.
+- Semantic strings: `email`, `url`, `uuid` — validated by format, like Zod's `z.string().email()`.
 - `ref`: a reference to a standalone atom. Declares `to` (target model) and optional `inverse`. Stored as a link to a separate record.
 - Containers: `list` (item type declared with `of`, e.g. `of: embed://grant`), `map`, `json`.
-- Modifiers: `required`, `default`, `unique`, `filterable`, `sortable`.
+- Modifiers: `required`, `default`, `unique`, `filterable`, `sortable`; refinements `min`/`max` (numbers), `minLength`/`maxLength`/`pattern` (text).
 
 ## Kernel atoms
 
@@ -390,13 +391,19 @@ A token is an atom scoped to refs by its grants. It is the `actor` that rules an
   "manifest": "Amy Chen",
   "attr": {
     "email": "amy@acme.com",
-    "tenant": "atom://acme",
     "team": "atom://team-west",
     "grants": [
       { "path": "**", "mode": "write" }
     ]
   },
-  "lifecycle": "atom://0"
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-01-10T09:00:00Z",
+    "createdBy": "atom://joey",
+    "parent": "atom://acme"
+  }
 }
 ```
 
@@ -453,7 +460,9 @@ Every atom records the token that created it in `lifecycle.createdBy` and the to
 
 ### Tenant
 
-A tenant is the organization and the isolation boundary. A token belongs to one tenant. New atoms are created in the token's tenant, and access across tenants is denied unless a grant allows it. An atom's tenant is its creator's tenant — `createdBy.tenant` — so it is not stored on the atom separately. The tenant's tokens are its members, reached through the inverse of `token.tenant`.
+The tenant is the parent atom. Every atom carries `lifecycle.parent` — the atom it lives under — and an atom's tenant is its nearest tenant ancestor (walk `parent`). A `tenant` atom is simply the boundary node; a token belongs to a tenant by being parented under it. Containment and tenancy are one structure.
+
+A new atom is born into its creator's tenant: `parent` defaults to the writer's tenant. Isolation falls out of the tree — you can read or write an atom only if it shares your tenant ancestor. Global atoms (the core models, above any tenant) are visible to everyone; a token with no tenant is a superuser. An authorized caller may pass `parent` on create to place an atom under a chosen tenant — how root provisions a new tenant and the first token inside it. A tenant's members are the atoms parented under it.
 
 ### Grants
 
@@ -907,7 +916,6 @@ Outreach needs no special webhook. An external system is an API caller. It authe
   "model": "atom://token",
   "manifest": "Outreach integration credential",
   "attr": {
-    "tenant": "atom://acme",
     "grants": [
       {
         "path": "contact.*",
@@ -915,7 +923,14 @@ Outreach needs no special webhook. An external system is an API caller. It authe
       }
     ]
   },
-  "lifecycle": "atom://tok-amy"
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-05-30T00:00:00Z",
+    "createdBy": "atom://tok-amy",
+    "parent": "atom://acme"
+  }
 }
 ```
 
