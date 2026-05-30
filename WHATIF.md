@@ -238,6 +238,12 @@ lives beside the document instead of the large thing that has to become it.**
 
 # What If, part two — just a UI on SQLite
 
+> **Read this as the decision record it is.** It was written while the store was still
+> per-tenant NDJSON, and it argues *whether* and *how* to move to SQLite. The decision it
+> reaches (Fork A) was **executed on 2026-05-30** — SQLite is now live. Where the text below
+> says "today" or "the day will come," read it in the past tense; the resolution is in the
+> **Update** at the very end.
+
 The first experiment pushed *outward*: HTML is the most universal structured format, so
 borrow it. This one pushes the other way — *downward, toward the most proven engine* — and
 asks a blunter question:
@@ -261,10 +267,11 @@ Because look at what `atomic.mjs` actually hand-rolls. Then look at the column o
 | Durable persistence, replayed on boot   | **the file.** WAL, crash recovery, fsync — decades-hard |
 | Path traversal with a budget            | recursive CTEs (`WITH RECURSIVE`)                        |
 
-Atomic's persistence is per-tenant NDJSON replayed into memory on boot. That is a write-
+Atomic's persistence *was* per-tenant NDJSON replayed into memory on boot. That is a write-
 ahead log and a recovery routine — the two hardest, most bug-prone things in a storage
 engine — rebuilt by hand. SQLite has spent twenty-five years and a famously exhaustive test
-suite getting exactly that right. The NDJSON store is, in this light, a worse SQLite.
+suite getting exactly that right. The NDJSON store was, in this light, a worse SQLite — which
+is precisely the realization that retired it (see the Update at the end).
 
 So the same move as before: subtract everything SQLite already does, and see what's left.
 
@@ -368,7 +375,7 @@ Run the one test that actually discriminates. Not "can it persist," not "can it 
 
 | Substrate          | Stores data | Indexes | **Has grants?**                                   |
 |--------------------|:-----------:|:-------:|---------------------------------------------------|
-| NDJSON log (today) |     yes     |  hand-rolled | **no** — a file; whoever reads it has all of it  |
+| NDJSON log (former)|     yes     |  hand-rolled | **no** — a file; whoever reads it has all of it  |
 | The DOM / HTML     |     yes     |  `querySelector` | **no** — renders everything to everyone     |
 | SQLite             |     yes     |  excellent | **no** — no `GRANT`, no roles, no row/col security |
 | Postgres           |     yes     |  excellent | *partial* — roles + RLS, but not per-actor redaction of arbitrary fields the way `permits` does |
@@ -402,7 +409,7 @@ the validate→permit→hook→log path. Nothing above that seam knows or cares 
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼
         NDJSON log     SQLite log     DOM / docs
-        (today)        (Fork A)       (part one)
+        (former)       (Fork A·live)  (part one)
 ```
 
 A backend only has to do the dumb part: put an atom somewhere durable, get atoms back by
@@ -411,8 +418,8 @@ in the kernel, always** — because, per the table, the port can't be trusted to
 
 ## The two forks, named once and for all
 
-When the day comes to move off NDJSON, there are exactly two ways to use SQLite, and only
-one is allowed:
+When the day came to move off NDJSON (it did — 2026-05-30), there were exactly two ways to use
+SQLite, and only one was allowed — Fork A is the one that shipped:
 
 - **Fork A — SQLite as a dumb atom log.** One table: `id, model, manifest, attr (JSON),
   lifecycle (JSON)`, plus an FTS5 index on `manifest`. Atoms stay uniform; schema stays
@@ -436,10 +443,11 @@ schema, and the moment it does, the kernel has handed away the thing it was for.
 1. **Keep the kernel as the product.** Permissions, generated surface, capabilities, the
    self-describing atom. None of it moves, ever, regardless of substrate.
 2. **Treat storage as a port behind `getStore` / the write path.** No backend sees a grant.
-3. **Stay on the NDJSON log while it's honest** — dependency-free, data fits in RAM, boot
-   replay is fast. That's genuinely the right default *today*.
-4. **The day it stops being honest** (replay slow, or data past memory), swap in **Fork A**.
-   One new backend behind the existing port. The kernel never notices.
+3. **Stay on a substrate while it's honest** — the NDJSON log was the right default for as
+   long as the data fit in RAM and boot replay was fast.
+4. **The day it stopped being honest** (data past memory, replay O(history)), we swapped in
+   **Fork A** — one new backend behind the existing port, and the kernel never noticed.
+   *(Done — 2026-05-30. And the badge survived: `node:sqlite` is a runtime, not a dependency.)*
 5. **Never Fork B.** The instant the store knows your schema, you've stopped being Atomic.
 
 ## The one-line version
