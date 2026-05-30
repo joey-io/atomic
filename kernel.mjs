@@ -350,8 +350,11 @@ function parseQuery(search) {
   return { filters, sort, as };
 }
 
+// read a sortable/filterable value from attr, falling back to lifecycle (createdAt, ...)
+const fieldVal = (a, key) => (a.attr && key in a.attr) ? a.attr[key] : a.lifecycle?.[key];
+
 function passes(atom, f) {
-  const v = atom.attr?.[f.field];
+  const v = fieldVal(atom, f.field);
   if (f.op === '=') return f.val.includes(',')
     ? f.val.split(',').includes(String(v)) : String(v) === f.val;
   const a = Number(v), b = Number(f.val);
@@ -363,7 +366,7 @@ function sortBy(atoms, sort) {
   const desc = sort.startsWith('-');
   const key = desc ? sort.slice(1) : sort;
   return [...atoms].sort((x, y) => {
-    const a = x.attr?.[key], b = y.attr?.[key];
+    const a = fieldVal(x, key), b = fieldVal(y, key);
     const c = a < b ? -1 : a > b ? 1 : 0;
     return desc ? -c : c;
   });
@@ -379,10 +382,12 @@ function listModel(modelId, q, actor) {
 
 function runIndex(indexAtom, search, actor) {
   const over = refId(indexAtom.attr.over);
+  const all = over === 'atom';                 // pseudo-model atom://atom = every atom
   const params = new URLSearchParams(search);
   const match = indexAtom.attr.match || {};
-  let atoms = [...store.values()].filter(
-    (a) => a.model === ref(over) && a.lifecycle?.status !== 'retired');
+  let atoms = [...store.values()].filter((a) =>
+    a.lifecycle?.status !== 'retired' &&
+    (all ? a.model !== 'atom://log' : a.model === ref(over)));
   for (const [field, cond] of Object.entries(match)) {
     if (typeof cond === 'string' && cond.startsWith('params.')) {
       const val = params.get(cond.slice('params.'.length));
@@ -396,6 +401,12 @@ function runIndex(indexAtom, search, actor) {
   for (const s of indexAtom.attr.sort || []) {
     const [field, dir] = Object.entries(s)[0];
     atoms = sortBy(atoms, dir === 'desc' ? `-${field}` : field);
+  }
+  const pg = indexAtom.attr.page;             // paginate by a date cursor + limit
+  if (pg) {
+    const before = params.get('before');
+    if (before) atoms = atoms.filter((a) => String(fieldVal(a, pg.cursor)) < before);
+    atoms = atoms.slice(0, Number(params.get('limit')) || pg.limit || 25);
   }
   return atoms.map((a) => redact(actor, a));
 }
@@ -486,9 +497,25 @@ function renderModelPage(modelId, atoms, actor) {
   return page(`${m.attr.label || modelId} — ${atoms.length}`, renderTable(modelId, atoms) + form);
 }
 
+// cross-model table for indexes that span all models (over: atom://atom)
+function renderCrossTable(atoms) {
+  const head = ['id', 'model', 'manifest', 'createdAt'].map((c) => `<th>${esc(c)}</th>`).join('');
+  const rows = atoms.map((a) =>
+    `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td><td>${cell(a.model)}</td>` +
+    `<td>${esc(a.manifest || '')}</td><td>${esc(a.lifecycle?.createdAt || '')}</td></tr>`).join('');
+  return `<table><tr>${head}</tr>${rows}</table>`;
+}
+
 function renderIndexPage(indexAtom, atoms) {
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`,
-    renderTable(refId(indexAtom.attr.over), atoms));
+  const over = refId(indexAtom.attr.over);
+  let body = over === 'atom' ? renderCrossTable(atoms) : renderTable(over, atoms);
+  const pg = indexAtom.attr.page;
+  if (pg && atoms.length) {
+    const last = atoms[atoms.length - 1];
+    const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
+    body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
+  }
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body);
 }
 
 function renderAtom(atom) {
@@ -692,6 +719,9 @@ function bootstrap() {
   seed({ id: 'atomLog', model: 'atom://index', manifest: 'Full change history for one atom',
     attr: { label: 'Atom log', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } },
       match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }, lifecycle: lc('0') });
+  seed({ id: 'recent', model: 'atom://index', manifest: 'Recent atoms across all models',
+    attr: { label: 'Recent', over: 'atom://atom', sort: [{ createdAt: 'desc' }],
+      page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }, lifecycle: lc('0') });
 
   // tenant + tokens (the people and integrations are all tokens)
   seed({ id: 'acme', model: 'atom://tenant', manifest: 'Acme, Inc.', attr: { name: 'Acme, Inc.' }, lifecycle: lc('0') });
