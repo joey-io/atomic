@@ -235,6 +235,7 @@ const BILLY_GRANTS = [
   { path: 'condition.*',  mode: 'all'    }, // retention predicates he owns
   { path: 'policy.*',     mode: 'all'    }, // retention policies he owns
   { path: 'hook.*',       mode: 'all'    }, // wire vetted automations (attenuated)
+  { path: 'model.*',      mode: 'all'    }, // define his own types — creator-owns mints <type>.* on create
 ];
 await token('billy', 'd', { email: 'j@a-gnt.com', login: 'open', grants: BILLY_GRANTS });
 
