@@ -616,7 +616,7 @@ function renderForm(modelId, atom, actor) {
   const idRows = (editing
     ? `<tr><th>id</th><td><code>${esc(atom.id)}</code></td></tr>`
     : `<tr><th>id</th><td><input name="$id" placeholder="auto"></td></tr>`)
-    + `<tr><th>model</th><td><code>atom://${esc(modelId)}</code></td></tr>`;
+    + `<tr><th>model</th><td><a href="/${esc(modelId)}">atom://${esc(modelId)}</a></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
   return `<form id="f"><div class="tw"><table class="form">${methodRow}${idRows}${manifestRow}${fieldRows}</table></div><p><button>Submit</button></p>${suggest}</form>
 <script>
