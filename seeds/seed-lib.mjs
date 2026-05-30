@@ -93,6 +93,11 @@ export async function defineModels() {
   await model('census', 'Congressional District', {
     state: { kind: 'ref', to: 'atom://state' }, district: { kind: 'integer' }, name: { kind: 'text' },
   });
+  // the census-district hook (a capability: advocate.cd write + census.* write) is
+  // created here, beside the advocate model that registers it, so the model's
+  // lifecycle.hooks ref always resolves — whichever demo defines the model first.
+  await hook('census-district', 'census-district',
+    [{ path: 'advocate.cd', mode: 'write' }, { path: 'census.*', mode: 'write' }]);
   // the advocate model registers the census-district hook in its lifecycle, so
   // creating/updating any advocate (in any tenant) geocodes its address and links
   // advocate.cd to the matching congressional-district atom — under the hook's grants.

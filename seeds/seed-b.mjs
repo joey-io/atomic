@@ -1,17 +1,16 @@
 // Demo B — an advocacy program: stories shared by advocates from districts that
 // each reference an elected official. Run: node seeds/seed-b.mjs
-import { tenant, defineModels, defineStates, atom, token, hook, role, addr, A } from './seed-lib.mjs';
+import { tenant, defineModels, defineStates, atom, token, role, addr, A } from './seed-lib.mjs';
 
-await defineModels();
+await defineModels(); // also creates the census-district hook the advocate model registers
 await defineStates();
 await tenant('b', 'Demo B — Advocacy');
 
-// census-district hook: a capability whose grants are advocate.cd (write) + census.*
-// (write). It is registered in the advocate model's lifecycle (see defineModels),
-// so it runs on every advocate write, geocodes the embedded address, and links
-// advocate.cd — under its OWN grants, not the caller's (scripts/census-district.mjs).
-await hook('census-district', 'census-district',
-  [{ path: 'advocate.cd', mode: 'write' }, { path: 'census.*', mode: 'write' }]);
+// The census-district hook is a capability whose grants are advocate.cd (write) +
+// census.* (write). defineModels() creates it beside the advocate model that
+// registers it in its lifecycle, so it runs on every advocate write, geocodes the
+// embedded address, and links advocate.cd — under its OWN grants, not the caller's
+// (scripts/census-district.mjs).
 
 // the "website" role: a reusable bundle of grants for public advocate intake —
 // write-only on the advocate fields a public form may submit, plus read on the
