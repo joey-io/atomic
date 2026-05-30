@@ -470,11 +470,8 @@ function page(title, body, fab) {
   return `<!doctype html><meta charset=utf8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
 <style>
-body{font:14px 'Google Sans Code',ui-monospace,monospace;margin:1.25rem}
+body{margin:1.25rem}
 .tw{overflow-x:auto;max-width:100%}
 table{border-collapse:collapse}
 td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap}
