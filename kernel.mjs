@@ -480,7 +480,7 @@ th{background:#f6f6f6;cursor:pointer;user-select:none}th:hover{background:#ecece
 th[data-dir="1"]::after{content:" \\2191"}th[data-dir="-1"]::after{content:" \\2193"}
 h1{font-size:1.1rem}code{background:#f3f3f3;padding:1px 4px;border-radius:3px}
 input,select{font:inherit;padding:2px 4px}</style>
-<h1>${esc(title)}</h1>${body}
+<h1><a href="/" style="text-decoration:none;color:inherit" title="Atomic">⚛</a> ${esc(title)}</h1>${body}
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
@@ -791,7 +791,7 @@ function bootstrap() {
   seed({ id: 'joey', model: 'atom://token', manifest: 'Joey (founding operator, root authority)',
     attr: { grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('joey') });
   seed({ id: '0', model: 'atom://token', manifest: 'Atomic (public root + anonymous identity)',
-    attr: { name: 'Atomic ⚛',
+    attr: { name: 'Atomic',
       description: 'A data substrate where schema, data, identity, and the UI surface are all atoms.',
       grants: [] }, lifecycle: lc('joey') });
 
