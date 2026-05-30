@@ -128,13 +128,14 @@ The system is made of atoms. The kernel's own types are model atoms, so the kern
 |`migration`|A one-way transform that moves a model from one version to the next.       |
 |`token`    |Identity and capability: an atom with grants over models and indexes, optionally an email for sign-in. A user is a token.|
 |`tenant`   |An organization and isolation boundary. A token belongs to a tenant; the tenant's tokens are its members.|
+|`session`  |Binds a signed-in browser (a cookie) to the token it authenticates — an atom like any other.|
 |`log`      |An append-only entry recording one change to one atom. The ledger.         |
 |`file`     |A stored blob, addressed like any atom.                                    |
 |`config`   |Kernel and tenant settings.                                                |
 |`plugin`   |A bundle of models, indexes, and handlers installed together.              |
 |`hook`     |A handler that runs on a write — the transform side of Logic.              |
 
-There is no `user` type. A user is a token — an atom with grants. `atom://0` is the root token: it is scoped to the core models and created them, so it is the only atom that can create new core types, and every other token descends from it. Everything else — companies, contacts, deals, signups — is an application model built the same way. There is no privileged layer: defining a type, granting access, recording a change, and storing a record are all atom CRUD.
+There is no `user` type. A user is a token — an atom with grants. `atom://joey` is the root authority (it holds `**`); `atom://0` is the genesis atom and the anonymous identity, the origin of the core models. Everything else — companies, contacts, deals, signups — is an application model built the same way. There is no privileged layer: defining a type, granting access, recording a change, and storing a record are all atom CRUD.
 
 ## References
 
@@ -397,21 +398,24 @@ A token is an atom scoped to refs by its grants. It is the `actor` that rules an
 
 Edges that point at a person — `deal.owner`, `lifecycle.createdBy` — reference a token. There is no separate user atom to hold permissions out of band.
 
-### atom://0 — the root
+### Genesis: joey and atom://0
 
-`atom://0` is the first token. It holds `**` and is the origin of the core models — `model`, `index`, `token`, `tenant`, `migration`, and the rest of the kernel types — which carry `atom://0` as their `createdBy`. Only `atom://0`, or a token it has granted that scope, can create atoms of the core types. An application token descends from `atom://0` with narrower grants: it can create contacts and deals, but not new model, token, or tenant types. Every capability traces back to `atom://0`, and the chain is in the log.
+Two atoms are seeded when the store is initialized:
 
-`atom://0` is not special-cased. Like every atom it has a lifecycle, and it was created by `atom://joey` — the founding operator, written when the store is initialized. The regress ends there: the install seeds `atom://joey` and `atom://0` together.
+- **`atom://joey`** — the founding operator and root authority. It holds `**`, so it is the only principal that can mint capabilities. Every other token descends from it.
+- **`atom://0`** — the genesis atom. joey writes it, and it is the origin of the core models (`model`, `index`, `token`, `tenant`, `session`, `migration`, and the rest), which carry `atom://0` as their `createdBy`. After install `atom://0` holds **no data grants**: it is the **anonymous identity**. An unauthenticated request resolves to `atom://0`.
+
+So `"lifecycle": "atom://0"` on a kernel atom means "created at genesis by `atom://0`." Creating a new core type later (a model, token, or tenant) needs a grant on those types, which only descends from `atom://joey`.
 
 ```json
 {
   "id": "0",
   "model": "atom://token",
-  "manifest": "Root token",
+  "manifest": "Atomic — public root and anonymous identity",
   "attr": {
-    "grants": [
-      { "path": "**", "mode": "write" }
-    ]
+    "name": "Atomic",
+    "description": "A data substrate where schema, data, identity, and the UI surface are all atoms.",
+    "grants": []
   },
   "lifecycle": {
     "status": "active",
@@ -423,16 +427,20 @@ Edges that point at a person — `deal.owner`, `lifecycle.createdBy` — referen
 }
 ```
 
+### The app describes itself
+
+An unauthenticated caller — resolved to `atom://0` — gets the app's public self-description at the root: a JSON-LD document with the app's name, the catalog of types and indexes it offers, and how to authenticate. It is discovery, not data; reading records requires a session. Because `atom://0` holds no data grants, the catalog of types is public while the records are not.
+
 ### Attenuation
 
-A token can issue another token only with grants that are a subset of its own. It can never grant more than it holds. `atom://0` holds the core scope; every other token descends from it, equal or narrower. Issuing or editing a token is itself a write, gated by a grant on the `token` model. Access can only narrow as it spreads, so it cannot be minted out of band. To audit who can do what, follow the chain of tokens in the log.
+A token can issue another token only with grants that are a subset of its own. It can never grant more than it holds. `atom://joey` holds `**`; every other token descends from it, equal or narrower. Issuing or editing a token is itself a write, gated by a grant on the `token` model. Access can only narrow as it spreads, so it cannot be minted out of band. To audit who can do what, follow the chain of tokens in the log.
 
-### Magic-link sign-in
+### Sessions and magic-link sign-in
 
-A token with an email can sign in by magic link. There are no passwords.
+A token with an email signs in by magic link; the kernel then tracks that token through a session. There are no passwords.
 
-- `POST /auth` with `{ "email": "amy@acme.com" }` finds the token with that email, mints a short-lived session, and emails a link.
-- Opening the link activates the session as that token. The token is the `actor`.
+- `POST /auth` with `{ "email": "amy@acme.com" }` mints a one-time code and emails a link.
+- Opening the link establishes a **session** — itself an atom (`atom://session`) that binds a cookie to the token. The session resolves to the token, which becomes the `actor`. Signing out retires the session, and the caller falls back to `atom://0`.
 - A token without an email does not sign in interactively. It is presented directly as a bearer credential — an integration is just such a token. There is no separate webhook or callback concept; an external system is an API caller holding a token.
 
 ### Provenance

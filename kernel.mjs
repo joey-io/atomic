@@ -720,6 +720,13 @@ function bootstrap() {
     lifecycle: lc('tok-amy') });
 
   buildInverse();
+
+  // genesis ledger: every seeded atom is itself a logged change — everything is logged
+  for (const a of [...store.values()]) {
+    if (a.model === 'atom://log') continue;
+    const by = typeof a.lifecycle === 'object' ? refId(a.lifecycle.createdBy) : '0';
+    logIt(a.id, 'genesis', by, changeset({}, a.attr));
+  }
 }
 
 bootstrap();
