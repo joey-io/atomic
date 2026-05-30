@@ -9,5 +9,8 @@
     "audit": "node atomic.mjs --audit",
     "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
   },
+  "engines": {
+    "node": ">=22.5"
+  },
   "license": "MIT"
 }

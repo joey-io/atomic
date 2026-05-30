@@ -449,3 +449,29 @@ schema, and the moment it does, the kernel has handed away the thing it was for.
 > grants-plus-log is the irreducible kernel, and the kernel is the whole product. So the
 > answer to "should we just be a UI on SQLite" is **no — we should be the grant-and-surface
 > kernel that can sit on SQLite, or NDJSON, or the DOM, and outlive whichever one we pick.**
+
+## Update — Fork A taken (2026-05-30)
+
+The day came, and **Fork A is now live**. State sits in an embedded SQLite `atoms.db` (WAL mode)
+behind the existing `getStore` / write seam: one `atom` table — `id, shard, model, body` — where
+`body` is the opaque serialized atom and `shard`/`model` are structural columns the engine routes
+and indexes on. The substrate never learns what a `contact` *is*; it stores opaque rows and the
+kernel still holds all meaning. Grants and the log stayed above the port. The kernel did not
+change a line of its meaning — only the `Store` behind the port. Exactly the sanctioned escape
+hatch, exactly as written in point 4.
+
+Two notes where reality diverged from the plan, both for the better:
+
+- **The zero-dependency badge was *not* spent.** Fork A assumed adopting SQLite costs the "no
+  dependencies, single file" property. It didn't: the engine is **`node:sqlite`**, part of the Node
+  runtime — imported like `node:fs` or `node:crypto`, nothing in `package.json`, nothing to compile.
+  So we gained crash-safe durability, index-scoped reads, and an O(1) boot (no more replay, no more
+  RAM ceiling) and kept the badge. The only cost is that the binding API is flagged experimental on
+  Node 22 (the engine and file format are not; unflagged on Node 24+).
+- **Reads got scoped, not just stored.** Beyond Fork A's "dumb atom log," the read seam now pushes
+  the tenant (`shard`) and type (`model`) filters into SQL, so a read hits an index and never
+  materializes another tenant's atoms — which is what carries the substrate to billions of atoms
+  per tenant. Still opaque rows; still no schema in the engine; still not Fork B.
+
+The standing decision holds unchanged: the kernel is the product, storage is a port, and the port
+now happens to be SQLite — which the kernel, true to the thesis, never noticed.

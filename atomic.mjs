@@ -14,6 +14,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite'; // embedded SQLite — part of the Node runtime, not a dependency
 
 // load ./.env (KEY=VALUE lines) into process.env as a fallback — no dependency,
 // explicit env still wins. This is where ATOMIC_STORE / SENDGRID_API_KEY live.
@@ -278,7 +279,8 @@ const CLIENT = function () {
   }
 };
 const APP = `(${CLIENT})();`; // the IIFE source served at /app.js
-const store = new Map();      // id -> atom
+let   store;                  // id -> atom; assigned once ROOT + the persistence helpers
+                              // are defined below: a SQLite driver (ROOT set) or in-memory Map
 let   logSeq = 0;             // ledger sequence
 const invReg = {};            // inverseName -> { sourceModel, field, targetModel }
 
@@ -305,7 +307,7 @@ let storeGen = 0;
 // Put an atom straight into the store (bootstrap / seed — bypasses checks).
 // Every write funnels a log atom through seed(), so bumping here invalidates
 // the read memos after any mutation, not just direct seeds.
-function seed(atom) { store.set(atom.id, atom); storeGen++; persist(atom); return atom; }
+function seed(atom) { store.set(atom.id, atom); storeGen++; return atom; }
 
 // ---------------------------------------------------------------------------
 // Inverse-edge registry (built from model atoms)
@@ -313,8 +315,7 @@ function seed(atom) { store.set(atom.id, atom); storeGen++; persist(atom); retur
 
 function buildInverse() {
   for (const k of Object.keys(invReg)) delete invReg[k];
-  for (const a of store.values()) {
-    if (a.model !== 'atom://model') continue;
+  for (const a of store.query({ model: 'atom://model' })) {
     const fields = a.attr.fields || {};
     for (const [field, def] of Object.entries(fields)) {
       if (def && typeof def === 'object' && def.kind === 'ref' && def.inverse) {
@@ -330,12 +331,9 @@ function buildInverse() {
 
 function inverseList(targetId, inv) {
   const out = [];
-  for (const a of store.values()) {
-    if (a.model === ref(inv.sourceModel) &&
-        a.lifecycle?.status !== 'retired' &&
-        a.attr?.[inv.field] === ref(targetId)) {
+  for (const a of store.query({ model: ref(inv.sourceModel) })) {
+    if (a.lifecycle?.status !== 'retired' && a.attr?.[inv.field] === ref(targetId))
       out.push(ref(a.id));
-    }
   }
   return out;
 }
@@ -449,8 +447,8 @@ function findByIdentity(modelId, attr, modelAtom) {
   for (const idx of identityIndexes(modelAtom)) {
     const keyFields = idx.on;
     if (keyFields.some((f) => attr[f] === undefined)) continue;
-    for (const a of store.values()) {
-      if (a.model !== ref(modelId) || a.lifecycle?.status === 'retired') continue;
+    for (const a of store.query({ model: ref(modelId) })) {
+      if (a.lifecycle?.status === 'retired') continue;
       if (keyFields.every((f) => a.attr[f] === attr[f])) return a;
     }
   }
@@ -673,7 +671,12 @@ function getStore(actor) {
     // session atoms are bearer credentials, never application data: they are
     // excluded from every actor-facing read here, so no listing, index, feed,
     // ref-map, datalist, or workspace can ever surface a live cookie id.
-    hit = { gen: storeGen, list: [...store.values()].filter((a) => a.model !== 'atom://session' && visible(actor, a)) };
+    // tenant scoping pushed into the store: root (no tenant) sees every shard;
+    // a tenant user sees only the global shard plus its own. So a read never
+    // even materializes another tenant's atoms.
+    const ut = tenantOf(actor);
+    const shards = ut === null ? null : ['_global', ut];
+    hit = { gen: storeGen, list: store.query({ shards }).filter((a) => a.model !== 'atom://session' && visible(actor, a)) };
     _scope.set(actor, hit);
   }
   return { all: () => hit.list };
@@ -686,15 +689,16 @@ function getStore(actor) {
 // file); unset ATOMIC_STORE keeps the kernel purely in-memory (the default).
 // ---------------------------------------------------------------------------
 const ROOT = process.env.ATOMIC_STORE || null;
-const _dirs = new Set(); // shard dirs we've already mkdir'd this process — skip the syscall
 const shardOf = (atom) => tenantOf(atom) || '_global';
 
 // Encryption at rest (opt-in). Set ATOMIC_KEY to a 64-char hex key or any
-// passphrase (stretched with scrypt). When set, each shard-log line is written
-// as `enc:<base64(iv12 ‖ tag16 ‖ ciphertext)>` under AES-256-GCM — confidential
-// and tamper-evident (GCM auth tag). Unset → plaintext NDJSON (the default).
-// Reads accept either form per line, so turning the key on is forward-only and a
-// store written without it still loads.
+// passphrase (stretched with scrypt). When set, an atom's payload is sealed as
+// `enc:<base64(iv12 ‖ tag16 ‖ ciphertext)>` under AES-256-GCM — confidential and
+// tamper-evident (GCM auth tag). Unset → plaintext (the default). Reads accept
+// either form per row, so turning the key on is forward-only and a store written
+// without it still loads. (The structural columns id/shard/model stay plaintext
+// so the engine can route and index on them; only the atom body — where the data
+// lives — is sealed.)
 const KEY = process.env.ATOMIC_KEY
   ? (/^[0-9a-f]{64}$/i.test(process.env.ATOMIC_KEY)
       ? Buffer.from(process.env.ATOMIC_KEY, 'hex')
@@ -709,28 +713,104 @@ function serializeLine(atom) {
 }
 function parseLine(line) {
   if (!line.startsWith('enc:')) return JSON.parse(line);
-  if (!KEY) throw new Err(500, 'shard is encrypted but ATOMIC_KEY is not set');
+  if (!KEY) throw new Err(500, 'store is encrypted but ATOMIC_KEY is not set');
   const buf = Buffer.from(line.slice(4), 'base64');
   const d = createDecipheriv('aes-256-gcm', KEY, buf.subarray(0, 12));
   d.setAuthTag(buf.subarray(12, 28));
   return JSON.parse(Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString('utf8'));
 }
-function persist(atom) {
-  if (!ROOT) return;
-  const dir = path.join(ROOT, shardOf(atom));
-  if (!_dirs.has(dir)) { fs.mkdirSync(dir, { recursive: true }); _dirs.add(dir); }
-  fs.appendFileSync(path.join(dir, 'log.ndjson'), serializeLine(atom) + '\n');
+
+// --- The store: one logical id->atom map, two drivers behind one interface ---
+// Every reader and writer in the kernel talks to `store` through five methods:
+// get(id) · set(id, atom) · has(id) · delete(id) · values() · size. Swapping the
+// driver swaps the substrate; nothing else moves. `persist(atom)` is the durable
+// write-back used by in-place mutators (bump/migrate) and is just store.set.
+function memStore() {                                   // in-memory (no ATOMIC_STORE): the default
+  const m = new Map();
+  return {
+    get: (id) => m.get(id), set: (id, a) => m.set(id, a), has: (id) => m.has(id),
+    delete: (id) => m.delete(id), values: () => [...m.values()], get size() { return m.size; },
+    // scoped read: the rows in `shards` (null = all) of type `model` (null = any).
+    query({ shards = null, model = null } = {}) {
+      const out = [];
+      for (const a of m.values()) {
+        if (model && a.model !== model) continue;
+        if (shards && !shards.includes(shardOf(a))) continue;
+        out.push(a);
+      }
+      return out;
+    },
+    close() {},
+  };
 }
-function loadAll() {
-  if (!ROOT || !fs.existsSync(ROOT)) return false;
+// node:sqlite (ATOMIC_STORE set): one durable, indexed, ACID WAL-mode atoms.db.
+// State lives authoritatively in the `atom` table — there is no boot-time replay
+// of a log and no requirement that the working set fit in RAM. `shard` (= tenant)
+// and `model` are kept as plaintext indexed columns so reads can be scoped to a
+// tenant / model in SQL (the lever that takes this to billions of atoms/tenant);
+// the atom body is stored as one TEXT cell, sealed when ATOMIC_KEY is set.
+function sqliteStore() {
+  fs.mkdirSync(ROOT, { recursive: true });
+  const db = new DatabaseSync(path.join(ROOT, 'atoms.db'));
+  db.exec('PRAGMA journal_mode = WAL');     // many concurrent readers + one writer; crash-safe
+  db.exec('PRAGMA synchronous = NORMAL');   // fsync at checkpoint — durable across process crash
+  db.exec('CREATE TABLE IF NOT EXISTS atom (id TEXT PRIMARY KEY, shard TEXT NOT NULL, model TEXT NOT NULL, body TEXT NOT NULL)');
+  db.exec('CREATE INDEX IF NOT EXISTS atom_by_shard ON atom(shard)');
+  db.exec('CREATE INDEX IF NOT EXISTS atom_by_model ON atom(model)');
+  const cache = new Map();                                   // sql string -> prepared statement
+  const prep = (sql) => { let s = cache.get(sql); if (!s) cache.set(sql, s = db.prepare(sql)); return s; };
+  const q = {
+    get:   prep('SELECT body FROM atom WHERE id = ?'),
+    has:   prep('SELECT 1 FROM atom WHERE id = ?'),
+    put:   prep('INSERT INTO atom(id, shard, model, body) VALUES(?, ?, ?, ?) ' +
+                'ON CONFLICT(id) DO UPDATE SET shard = excluded.shard, model = excluded.model, body = excluded.body'),
+    del:   prep('DELETE FROM atom WHERE id = ?'),
+    all:   prep('SELECT body FROM atom'),
+    count: prep('SELECT count(*) AS c FROM atom'),
+  };
+  return {
+    get(id)      { const r = q.get.get(id); return r ? parseLine(r.body) : undefined; },
+    set(id, a)   { q.put.run(id, shardOf(a), a.model, serializeLine(a)); },
+    has(id)      { return !!q.has.get(id); },
+    delete(id)   { q.del.run(id); },
+    values()     { return q.all.all().map((r) => parseLine(r.body)); },
+    get size()   { return Number(q.count.get().c); },
+    // scoped read: pushes the tenant (shard) and type (model) filters into SQL so a
+    // read hits the atom_by_shard / atom_by_model indexes and never materializes
+    // atoms outside its scope — this is what holds up at billions of atoms/tenant.
+    query({ shards = null, model = null } = {}) {
+      const where = [], params = [];
+      if (shards) { where.push(`shard IN (${shards.map(() => '?').join(', ')})`); params.push(...shards); }
+      if (model)  { where.push('model = ?'); params.push(model); }
+      const sql = 'SELECT body FROM atom' + (where.length ? ' WHERE ' + where.join(' AND ') : '');
+      return prep(sql).all(...params).map((r) => parseLine(r.body));
+    },
+    close()      { db.close(); },
+  };
+}
+store = ROOT ? sqliteStore() : memStore();
+function persist(atom) { store.set(atom.id, atom); storeGen++; } // durable write-back; bumps the read-memo gen
+
+// One-time migration: fold any legacy per-tenant NDJSON shards (the previous
+// on-disk format) into atoms.db, last-write-wins by id, then set them aside as
+// .migrated so they are never re-read. A fresh store has none and this is a no-op.
+function migrateNdjson() {
+  if (!ROOT || !fs.existsSync(ROOT)) return;
   let n = 0;
   for (const shard of fs.readdirSync(ROOT)) {
     const f = path.join(ROOT, shard, 'log.ndjson');
     if (!fs.existsSync(f)) continue;
     for (const line of fs.readFileSync(f, 'utf8').split('\n'))
       if (line.trim()) { const a = parseLine(line); store.set(a.id, a); n++; }
+    fs.renameSync(f, f + '.migrated');
   }
-  return n > 0;
+  if (n) console.log(`migrated ${n} NDJSON log lines into atoms.db`);
+}
+// Durable data present? (SQLite: rows in atoms.db, after folding any legacy NDJSON.)
+function loadAll() {
+  if (!ROOT) return false;
+  if (store.size === 0) migrateNdjson();
+  return store.size > 0;
 }
 
 function redact(actor, atom) {
@@ -1053,8 +1133,12 @@ function sortBy(atoms, sort) {
 
 function listModel(modelId, q, actor) {
   if (!canOp(actor, modelId, 'read')) return []; // no read grant -> no listing
-  let atoms = getStore(actor).all().filter(
-    (a) => a.model === ref(modelId) && a.lifecycle?.status !== 'retired' && ruleOk(actor, a, 'read'));
+  // model + tenant scope both pushed into the store (the atom_by_model / atom_by_shard
+  // indexes), so listing one type reads only that type's rows in the actor's scope.
+  const ut = tenantOf(actor);
+  const shards = ut === null ? null : ['_global', ut];
+  let atoms = store.query({ shards, model: ref(modelId) }).filter(
+    (a) => a.lifecycle?.status !== 'retired' && visible(actor, a) && ruleOk(actor, a, 'read'));
   for (const f of q.filters) {
     if (f.field === 'q') { // full-text over manifest + attr
       const term = f.val.toLowerCase();
@@ -1248,7 +1332,7 @@ function renderTable(modelId, atoms, actor) {
 
 // a form to create a session (sign in) — a session is itself an atom
 function sessionForm() {
-  const open = [...store.values()].filter((a) => a.model === 'atom://token' && a.attr.login === 'open');
+  const open = store.query({ model: 'atom://token' }).filter((a) => a.attr.login === 'open');
   const items = open.map((t) => `<li><a href="/auth/open?token=${esc(t.id)}">atom://${esc(t.id)}</a></li>`).join('');
   return `<form method="post" action="/auth"><p><input name="email" type="email" placeholder="you@example.com" required></p><p><button>send magic link</button></p></form>
 ${open.length ? `<ul>${items}</ul>` : ''}`;
@@ -1519,7 +1603,7 @@ const server = http.createServer(async (req, res) => {
     // --- sign-in: magic link -> tracked session cookie ---
     if (req.method === 'POST' && path === 'auth') {
       const { email } = await readBody(req);
-      const tok = [...store.values()].find((a) => a.model === 'atom://token' && a.attr.email === email);
+      const tok = store.query({ model: 'atom://token' }).find((a) => a.attr.email === email);
       // Never reveal whether an email maps to a token (no enumeration oracle):
       // issue a link only if it does, but always answer the same shape.
       let link = null;
@@ -1552,7 +1636,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && path === 'auth/logout') {
       const sid = cookies['atomic_session'];
-      if (sid && store.has(sid)) store.get(sid).lifecycle.status = 'retired';
+      if (sid && store.has(sid)) { const s = store.get(sid); s.lifecycle.status = 'retired'; store.set(s.id, s); }
       return redirect('/', sessionCookie('', 0));
     }
 
