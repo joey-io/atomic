@@ -1,0 +1,23 @@
+:root {
+  --border: 1px solid #ddd;
+  --pad: 4px 10px;
+  --col-max: 80vw;
+  --asc: " ↑";
+  --desc: " ↓";
+}
+.tw { overflow-x: auto; max-width: 100% }
+table { border-collapse: collapse }
+td, th {
+  border: var(--border);
+  padding: var(--pad);
+  text-align: left;
+  white-space: nowrap;
+  max-width: var(--col-max);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+th { cursor: pointer }
+th[data-dir="1"]::after { content: var(--asc) }
+th[data-dir="-1"]::after { content: var(--desc) }
+form table th { text-align: right; cursor: default }
+form table th::after { content: "" }

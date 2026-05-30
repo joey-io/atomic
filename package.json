@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node kernel.mjs",
-    "test": "node test.mjs"
+    "test": "node test.mjs",
+    "seed": "node seed-a.mjs && node seed-b.mjs && node seed-c.mjs"
   },
   "license": "MIT"
 }

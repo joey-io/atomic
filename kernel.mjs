@@ -18,6 +18,7 @@ import { randomUUID } from 'node:crypto';
 // Store + ledger
 // ---------------------------------------------------------------------------
 
+const CSS = (() => { try { return fs.readFileSync(new URL('./style.css', import.meta.url), 'utf8'); } catch { return ''; } })();
 const store = new Map();      // id -> atom
 let   logSeq = 0;             // ledger sequence
 const invReg = {};            // inverseName -> { sourceModel, field, targetModel }
@@ -613,13 +614,7 @@ function page(title, body, fab) {
   return `<!doctype html><meta charset=utf8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<style>
-.tw{overflow-x:auto;max-width:100%}
-table{border-collapse:collapse}
-td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap;max-width:80vw;overflow:hidden;text-overflow:ellipsis}
-th{cursor:pointer}th[data-dir="1"]::after{content:" ↑"}th[data-dir="-1"]::after{content:" ↓"}
-form table th{text-align:right;cursor:default}form table th::after{content:""}
-</style>
+<link rel="stylesheet" href="/style.css">
 <p>${fab || peerSelect([], '')}</p>
 ${body}
 <script>
@@ -651,8 +646,7 @@ function renderTable(modelId, atoms) {
 
 // a form to create a session (sign in) — a session is itself an atom
 function sessionForm() {
-  return `<p><button data-email="amy@acme.com">amy@acme.com (admin)</button>
-<button data-email="view@acme.com">view@acme.com (read-only)</button></p>
+  return `<p><button data-email="joey@emailjoey.com">joey@emailjoey.com (admin)</button></p>
 <form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com"> <button>send magic link</button></p></form>
 <script>document.querySelectorAll('button[data-email]').forEach(function(b){b.onclick=async function(){
 var r=await fetch('/auth',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:b.dataset.email})});
@@ -850,6 +844,10 @@ const server = http.createServer(async (req, res) => {
     const wantsHtml = (req.headers.accept || '').includes('text/html') ||
                       url.searchParams.get('as') === 'html';
 
+    if (req.method === 'GET' && path === 'style.css') {
+      res.writeHead(200, { 'content-type': 'text/css' }); return res.end(CSS);
+    }
+
     // --- sign-in: magic link -> tracked session cookie ---
     if (req.method === 'POST' && path === 'auth') {
       const { email } = await readBody(req);
@@ -951,8 +949,8 @@ function bootstrap() {
   // genesis: joey -> atom://0 -> core models
   // joey is the root authority; atom://0 is the public/anonymous identity that
   // also describes the app (no data grants — it is what an unauthenticated caller sees).
-  seed({ id: 'joey', model: 'atom://token', manifest: 'Joey (founding operator, root authority)',
-    attr: { grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('joey') });
+  seed({ id: 'joey', model: 'atom://token', manifest: 'Joey — admin',
+    attr: { email: 'joey@emailjoey.com', grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('joey') });
   seed({ id: '0', model: 'atom://token', manifest: 'Atomic (public root + anonymous identity)',
     attr: { name: 'Atomic',
       description: 'A data substrate where schema, data, identity, and the UI surface are all atoms.',
@@ -961,8 +959,7 @@ function bootstrap() {
   // core model definitions (the kernel's own types are model atoms)
   model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
     indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } });
-  model('token',  'Token',  { email: { kind: 'email' },
-    team: { kind: 'ref', to: 'atom://team' }, grants: { kind: 'list', of: 'embed://grant' } });
+  model('token',  'Token',  { email: { kind: 'email' }, grants: { kind: 'list', of: 'embed://grant' } });
   model('grant',  'Grant',  { path: { kind: 'text', required: true },
     mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write'] } });
   model('tenant', 'Tenant', { name: { kind: 'text', required: true } });
@@ -970,70 +967,18 @@ function bootstrap() {
     params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } });
   model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
     actor: { kind: 'ref', to: 'atom://token' }, at: { kind: 'datetime' }, changes: { kind: 'list' } });
-  model('team',   'Team',   { name: { kind: 'text', required: true } });
   model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
     createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } });
 
-  // CRM models
-  model('company', 'Company', {
-    name: { kind: 'text', required: true }, domain: { kind: 'text' }, hq: 'embed://address',
-    owner: { kind: 'ref', to: 'atom://token' },
-    tier: { kind: 'enum', values: ['smb', 'mid', 'enterprise'], filterable: true },
-  }, {
-    indexes: { byDomain: { on: ['domain'], role: 'identity' }, byName: { on: ['name'], role: 'identity' } },
-    display: { row: ['name', 'tier'] },
-  });
-  model('address', 'Address', { street: { kind: 'text' }, city: { kind: 'text' },
-    state: { kind: 'text' }, zip: { kind: 'text' }, country: { kind: 'text', default: 'US' } });
-  model('contact', 'Contact', {
-    name: { kind: 'text', required: true }, email: { kind: 'email' }, title: { kind: 'text' },
-    company: { kind: 'ref', to: 'atom://company', inverse: 'contacts' },
-  }, { indexes: { byEmail: { on: ['email'], role: 'identity' } }, display: { row: ['name', 'title', 'company'] } });
-  model('deal', 'Deal', {
-    name: { kind: 'text', required: true },
-    amount: { kind: 'number', filterable: true, sortable: true },
-    stage: { kind: 'enum', values: ['lead', 'qualified', 'won', 'lost'], filterable: true },
-    company: { kind: 'ref', to: 'atom://company', inverse: 'deals' },
-    owner: { kind: 'ref', to: 'atom://token' },
-  }, { display: { row: ['name', 'amount', 'stage'] } });
-
-  // stored indexes (queries are atoms too — including queries over the log)
-  seed({ id: 'openDeals', model: 'atom://index', manifest: 'Open deals for a company',
-    attr: { label: 'Open deals', over: 'atom://deal', params: { company: { kind: 'ref', to: 'atom://company' } },
-      match: { company: 'params.company', stage: { in: ['lead', 'qualified'] } },
-      sort: [{ amount: 'desc' }], returns: 'set' }, lifecycle: lc('0') });
+  // core indexes (queries are atoms too)
   seed({ id: 'atomLog', model: 'atom://index', manifest: 'Full change history for one atom',
     attr: { label: 'Atom log', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } },
       match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }, lifecycle: lc('0') });
   seed({ id: 'recent', model: 'atom://index', manifest: 'Recent atoms across all models',
     attr: { label: 'Recent', over: 'atom://atom', sort: [{ createdAt: 'desc' }],
       page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }, lifecycle: lc('0') });
-
-  // tenant + tokens (the people and integrations are all tokens)
-  seed({ id: 'acme', model: 'atom://tenant', manifest: 'Acme, Inc.', attr: { name: 'Acme, Inc.' }, lifecycle: lc('0') });
-  seed({ id: 'team-west', model: 'atom://team', manifest: 'West team', attr: { name: 'West' }, lifecycle: lc('0') });
-  seed({ id: 'tok-amy', model: 'atom://token', manifest: 'Amy Chen',
-    attr: { email: 'amy@acme.com', team: 'atom://team-west',
-      grants: [{ path: '**', mode: 'write' }] }, lifecycle: lc('0', 'acme') });
-  seed({ id: 'tok-read', model: 'atom://token', manifest: 'Read-limited viewer',
-    attr: { email: 'view@acme.com',
-      grants: [{ path: 'contact.name', mode: 'read' }, { path: 'contact.title', mode: 'read' }] }, lifecycle: lc('0', 'acme') });
-  seed({ id: 'tok-outreach', model: 'atom://token', manifest: 'Outreach integration',
-    attr: { team: 'atom://team-west', grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy', 'acme') });
-  // demo records — so the live instance has data to navigate (in-memory: reseeded each start)
-  seed({ id: 'northwind', model: 'atom://company', manifest: 'Northwind Traders, enterprise account',
-    attr: { name: 'Northwind Traders', domain: 'northwind.com',
-      hq: { street: '500 Market St', city: 'Seattle', state: 'WA', zip: '98101', country: 'US' },
-      owner: 'atom://tok-amy', tier: 'enterprise' }, lifecycle: lc('tok-amy', 'acme') });
-  seed({ id: 'jane', model: 'atom://contact', manifest: 'Jane Roe, VP Eng at Northwind',
-    attr: { name: 'Jane Roe', email: 'jane@northwind.com', title: 'VP Engineering', company: 'atom://northwind' },
-    lifecycle: lc('tok-amy', 'acme') });
-  seed({ id: 'john', model: 'atom://contact', manifest: 'John Vega, CFO at Northwind',
-    attr: { name: 'John Vega', email: 'john@northwind.com', title: 'CFO', company: 'atom://northwind' },
-    lifecycle: lc('tok-amy', 'acme') });
-  seed({ id: 'deal-9001', model: 'atom://deal', manifest: 'Northwind platform expansion',
-    attr: { name: 'Platform expansion', amount: 120000, stage: 'qualified', company: 'atom://northwind', owner: 'atom://tok-amy' },
-    lifecycle: lc('tok-amy', 'acme') });
+  // Demo tenants A / B / C are loaded from seed-a.mjs / seed-b.mjs / seed-c.mjs
+  // (POSTed through the API as the admin) so they never bloat the kernel.
 
   buildInverse();
 

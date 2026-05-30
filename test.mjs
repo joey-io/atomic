@@ -1,6 +1,6 @@
 // Smoke test: boots the kernel on a temp port + temp store, exercises the
-// load-bearing behaviour over HTTP, restarts to prove durability. No deps.
-//   node test.mjs
+// load-bearing behaviour over HTTP as the admin, restarts to prove durability.
+// Self-contained — creates its own model/tenants. No deps. Run: node test.mjs
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 
@@ -18,27 +18,32 @@ rmSync(STORE, { recursive: true, force: true });
 let srv = start(); await wait();
 
 ok((await (await fetch(base + '/')).json()).id === '0', 'root is atom://0');
+ok((await J('joey', 'POST', '/token', { attr: { email: 'bad', grants: [] } })).status === 400, 'semantic email rejected');
 
-ok((await J('tok-amy', 'POST', '/contact', { attr: { name: 'x', email: 'bad' } })).status === 400, 'semantic email rejected');
-ok((await J('tok-amy', 'POST', '/contact', { id: 't-good', attr: { name: 'G', email: 'g@acme.com', company: 'atom://northwind' } })).status === 201, 'valid contact created');
+// admin sets up a model + two tenants + a member token in each
+await J('joey', 'POST', '/model', { id: 'note', manifest: 'Note', attr: { label: 'Note', version: 1, fields: { text: { kind: 'text', required: true } } } });
+await J('joey', 'POST', '/tenant', { id: 't1', attr: { name: 'T1' } });
+await J('joey', 'POST', '/tenant', { id: 't2', attr: { name: 'T2' } });
+await J('joey', 'POST', '/token', { id: 'tk1', parent: 'atom://t1', attr: { email: 'a@t1.com', grants: [{ path: '**', mode: 'write' }] } });
+await J('joey', 'POST', '/token', { id: 'tk2', parent: 'atom://t2', attr: { email: 'b@t2.com', grants: [{ path: '**', mode: 'write' }] } });
+ok((await J('tk1', 'POST', '/note', { id: 'n1', attr: { text: 'hello world' } })).status === 201, 'tenant member creates a note');
 
-await J('joey', 'POST', '/token', { id: 'tok-mid', parent: 'atom://acme', attr: { email: 'm@acme.com', grants: [{ path: 'token.*', mode: 'write' }, { path: 'contact.*', mode: 'read' }] } });
-ok((await J('tok-mid', 'POST', '/token', { attr: { email: 'a@acme.com', grants: [{ path: 'contact.*', mode: 'read' }] } })).status === 201, 'attenuation allows a subset grant');
-ok((await J('tok-mid', 'POST', '/token', { attr: { email: 'b@acme.com', grants: [{ path: 'deal.*', mode: 'write' }] } })).status === 403, 'attenuation blocks a super-set grant');
+// attenuation: tk-mid can issue tokens but only holds note.* read
+await J('joey', 'POST', '/token', { id: 'tk-mid', parent: 'atom://t1', attr: { email: 'm@t1.com', grants: [{ path: 'token.*', mode: 'write' }, { path: 'note.*', mode: 'read' }] } });
+ok((await J('tk-mid', 'POST', '/token', { attr: { email: 'x@t1.com', grants: [{ path: 'note.*', mode: 'read' }] } })).status === 201, 'attenuation allows a subset grant');
+ok((await J('tk-mid', 'POST', '/token', { attr: { email: 'y@t1.com', grants: [{ path: 'note.*', mode: 'write' }] } })).status === 403, 'attenuation blocks a super-set grant');
 
-await J('joey', 'POST', '/tenant', { id: 'gx', attr: { name: 'GX' } });
-await J('joey', 'POST', '/token', { id: 'tok-gx', parent: 'atom://gx', attr: { email: 'g@gx.com', grants: [{ path: '**', mode: 'write' }] } });
-await J('tok-gx', 'POST', '/contact', { id: 'gx-c', attr: { name: 'GX Lead', email: 'l@gx.com' } });
-const amy = await (await J('tok-amy', 'GET', '/contact')).json();
-const gx = await (await J('tok-gx', 'GET', '/contact')).json();
-ok(!amy.find((c) => c.id === 'gx-c') && !!gx.find((c) => c.id === 'gx-c'), 'tenant isolation: gx data hidden from acme');
+// tenant isolation
+const s1 = await (await J('tk1', 'GET', '/note')).json();
+const s2 = await (await J('tk2', 'GET', '/note')).json();
+ok(!!s1.find((a) => a.id === 'n1') && !s2.find((a) => a.id === 'n1'), 'tenant isolation: t2 cannot see t1 data');
 
-ok((await (await J('tok-amy', 'GET', '/contact?q=northwind')).json()).length > 0, 'full-text search matches');
-ok((await (await J('tok-amy', 'GET', '/contact?q=zzznope')).json()).length === 0, 'full-text search empties');
+ok((await (await J('tk1', 'GET', '/note?q=hello')).json()).length > 0, 'full-text search matches');
+ok((await (await J('tk1', 'GET', '/note?q=zzznope')).json()).length === 0, 'full-text search empties');
 
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();
-ok((await (await J('tok-amy', 'GET', '/t-good')).json())?.attr?.name === 'G', 'atom persists across restart');
+ok((await (await J('tk1', 'GET', '/n1')).json())?.attr?.text === 'hello world', 'atom persists across restart');
 
 srv.kill();
 console.log(`\n${pass} passed, ${fail} failed`);
