@@ -208,14 +208,20 @@ for (const [name, category, room, owner] of things)
 //   • create-only — `create` does not imply read, so he still can't GET /token
 //     to enumerate existing tokens. He can make members, not snoop on them.
 //
-// He CAN save reports: `index.* read + create` lets him browse the available
-// queries and define his own views of his data ("all electronics", "kids'
-// belongings"). An index grants nothing — when anyone runs it, runIndex filters
-// by THAT viewer's read grants + tenant, so a report Billy defines can only ever
-// return what Billy can already read. He gets read + create but NOT update/delete,
-// so he can't edit or remove the shared household indexes. His own indexes are
-// born into his tenant (the kernel forbids a non-superuser placing global), so
-// they stay private to his household and never clutter another tenant's nav.
+// He OWNS his automations — within his own tenant, scoped to his access tree:
+//   • index   — saved reports/views ("all electronics", "kids' belongings"). An
+//               index grants nothing; runIndex filters every result by the
+//               VIEWER's grants, so it can only return what Billy can read.
+//   • condition + policy — retention rules ("expire toys after a year"). Pure
+//               data predicates the kernel evaluates; no code, no grants.
+//   • hook    — wire a VETTED script (scripts/*.mjs) onto his own atoms. The hook
+//               is attenuated (its grants ⊆ Billy's) and runs under its own
+//               grants. He can WIRE automation, not AUTHOR code: he can't add
+//               script files, and `run` is locked to a bare basename (no traversal).
+// He gets `all` on each, but the kernel's `tenant == actor.tenant` write rule on
+// these models confines create/update/delete to HIS OWN — the shared/global ones
+// (room.byHouse, policy-default, …) stay read-only to him. So on his own index he
+// sees a full create/edit/delete form; on a shared one, just run + export.
 // ---------------------------------------------------------------------------
 const BILLY_GRANTS = [
   { path: 'house.**',     mode: 'read'   },
@@ -225,8 +231,10 @@ const BILLY_GRANTS = [
   { path: 'belonging.**', mode: 'all'    },
   { path: 'usage.**',     mode: 'all'    },
   { path: 'token.*',      mode: 'create' }, // invite household members (attenuated)
-  { path: 'index.*',      mode: 'read'   }, // browse reports/views
-  { path: 'index.*',      mode: 'create' }, // save his own (run under the viewer's grants)
+  { path: 'index.*',      mode: 'all'    }, // reports/views he owns
+  { path: 'condition.*',  mode: 'all'    }, // retention predicates he owns
+  { path: 'policy.*',     mode: 'all'    }, // retention policies he owns
+  { path: 'hook.*',       mode: 'all'    }, // wire vetted automations (attenuated)
 ];
 await token('billy', 'd', { email: 'j@a-gnt.com', login: 'open', grants: BILLY_GRANTS });
 
