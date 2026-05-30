@@ -146,6 +146,25 @@ ok(!!link, 'magic link issued (dev fallback shows link)');
 const ver = await fetch(base + link.slice(base.length), { redirect: 'manual' });
 ok((ver.headers.get('set-cookie') || '').includes('atomic_session'), 'magic link verifies into a session');
 
+// --- access invariants: the tree decides who may write ----------------------
+// global/root atoms are root-only: a tenant user can't write one even WITH the grant
+await J('joey', 'POST', '/config', { id: 'cfg-g', parent: 'atom://0', attr: { key: 'k', value: 1 } });
+await mk('tk-cfg', 't1', [{ path: 'config.*', mode: 'all' }]);
+ok(await code('tk-cfg', 'PATCH', '/cfg-g', { attr: { key: 'x' } }) === 403, 'tenant user cannot write a global atom');
+ok(await code('tk-cfg', 'DELETE', '/cfg-g') === 403, 'tenant user cannot delete a global atom');
+ok(await code('tk-cfg', 'POST', '/config', { parent: 'atom://0', attr: { key: 'y', value: 2 } }) === 403, 'tenant user cannot create into the global scope');
+ok(await code('joey', 'PATCH', '/cfg-g', { attr: { key: 'z' } }) === 200, 'root can write a global atom');
+// creator-owns: defining a type lets the definer immediately instantiate it
+await mk('tk-maker', 't1', [{ path: 'model.*', mode: 'all' }]);
+ok(await code('tk-maker', 'POST', '/model', { id: 'gizmo', attr: { label: 'Gizmo', version: 1, fields: { n: { kind: 'text' } } } }) === 201, 'tenant user can define a type');
+ok(await code('tk-maker', 'POST', '/gizmo', { attr: { n: 'a' } }) === 201, 'creator-owns: definer can instantiate the new type');
+ok(await code('tk2', 'GET', '/gizmo') === 404, 'a tenant-scoped type is invisible to another tenant');
+ok(await code('joey', 'PATCH', '/gizmo', { attr: { label: 'Gizmo2' } }) === 200, 'root can write a tenant atom');
+// hooks: run is locked to a safe basename (no path-traversal import)
+ok(await code('joey', 'POST', '/hook', { id: 'h-bad', attr: { run: '../../x', grants: [] } }) === 400, 'hook run rejects path traversal');
+// sessions are bearer credentials, never served through the surface
+ok(await code('joey', 'GET', '/' + cookie.split('=')[1]) === 404, 'a session atom is unreadable, even by root');
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();
