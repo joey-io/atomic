@@ -4,6 +4,8 @@ Atomic stores data and its definitions as one kind of record. A model defines a 
 
 Atomic is a data substrate for graph-relational, queryable stores such as a CRM. Every record is an atom. The schema that defines other records is also made of atoms. Relationships are typed edges. Queries, constraints, permissions, and migrations are atoms and run by one kernel.
 
+**Why one shape.** Atomic is built to be legible — to people and to machines. The whole system is one idea (the atom) and one format (JSON): there is no ORM, API layer, query builder, or UI framework to hold in your head, and no generated code to keep in sync. A complex data system stays simple to reason about because every part — a record, a type, a permission, a query, a migration, an audit entry — is the same shape, addressed the same way. The model is depth-on-demand: light when you don't need it, deep when you do. And because the substrate is plain JSON at its core, an AI agent — including small or local models — can read, build, maintain, and support it without special tooling. The simplicity is the feature: fewer moving parts is fewer things an agent (or a person) can get wrong.
+
 ## Status — running instance and roadmap
 
 A runnable kernel lives in `kernel.mjs` (dependency-free, Node ≥ 18). It is deployed live at **`http://165.22.37.30:3040/`** under pm2 (process `atomic`), with durable per-tenant persistence under `ATOMIC_STORE` (replayed on boot). Configuration is in `.env` (gitignored): `SENDGRID_API_KEY` (magic-link email, reused from MondayDraft), `ATOMIC_MAIL_FROM`, `ATOMIC_STORE`, `PORT`. The US Census geocoder used by the demo hook is keyless — no API key needed.
@@ -20,13 +22,16 @@ A runnable kernel lives in `kernel.mjs` (dependency-free, Node ≥ 18). It is de
 - Generated surface: API + UI from the same atoms; recursive atom rendering; sortable/overflow tables; model-driven create forms (embed → nested table, list → repeater, ref → autocomplete); index forms; backlink ref-map. Links render **only** to atoms the viewer can actually open — a ref to a missing, retired, or unreadable atom shows as plain `atom://id` text.
 - Styling: Noto Sans (Google Fonts) and one small variable-driven `style.css` with **no classes and no ids** — every rule targets a semantic element. Structure carries meaning: a data grid is a `<table>` with a `<thead>` inside a scrolling `<figure>`; a key/value or form table is a bare `<table>`; a repeater is a `<fieldset>`. (The single exception is `<datalist id>` ↔ `<input list>`, the spec's only way to bind ref-autocomplete — a functional binding like `name`, not a style hook.)
 - Three demo tenants seeded from files (not baked into the kernel): **A** = a PAC (`seed-a.mjs` — 3 regions, 20 people in a `manager` reporting chain, 100 fundraising txns), **B** = an advocacy program (`seed-b.mjs` — officials, districts, advocates with real addresses, stories; CapConnect = open-login write-only intake wearing the `website` role), **C** = a hybrid (`seed-c.mjs`). Admin is `joey@emailjoey.com`. The census hook is verified live: Baltimore → MD-07, Chicago → IL-07, Dallas → TX-30.
+- **Durable, per-tenant persistence with opt-in encryption at rest.** Each tenant is an append-only NDJSON shard under `ATOMIC_STORE`, replayed on boot (state is the fold of the log). Set `ATOMIC_KEY` (64-hex, or a passphrase stretched with scrypt) and every shard line is sealed with AES-256-GCM — confidential and tamper-evident (a wrong or altered key fails the load closed). Unset, lines are plaintext; reads accept either form per line, so enabling the key is forward-only.
+- **Hardened HTTP surface.** Every response sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`; HTML adds a strict Content-Security-Policy (`script-src 'self'` — the client is one static, same-origin `/app.js`, with no inline script anywhere). Session cookies are `HttpOnly; SameSite=Lax`, add `Secure` behind TLS, and carry full-entropy ids; `/auth` answers identically for known and unknown emails (no enumeration oracle).
+- **Governance self-check** — `npm run audit` (`node kernel.mjs --audit`): a fsck for the substrate that asserts its own invariants (every atom resolves to a model, every reference resolves, every atom conforms to its schema, every grant is well-formed, every ledger entry is well-formed, every parent resolves) and exits non-zero on any finding, so it slots into CI or a cron. Point it at a real store with `ATOMIC_STORE`/`ATOMIC_KEY`.
 
 **Left to do / open threads:**
 
-- README sections below still describe the *earlier* hook design (hook with an `on` field, caller invoke grant). The current design — hooks in `lifecycle.hooks`, run under own grants, no invoke — is summarized here and in the kernel comments; fold it into the prose sections (Logic/Hooks, Identity and access) and add a first-class **Role** subsection.
-- Schema evolution (`migration` atoms) is specified but not yet implemented in the kernel.
-- The "Hue rename" sweep (project-wide rename) is out of scope for Atomic.
-- Consider a richer roles UI (the `roles` field currently renders as a plain list, not a ref repeater).
+- Some prose sections below (Hooks, Identity and access) predate the current hook design — capabilities registered in `lifecycle.hooks`, run under their own grants, no caller invoke permission. The Status summary above and the kernel comments are authoritative where they differ.
+- Schema evolution (`migration` atoms) is specified (see *Schema evolution*) but not yet implemented in the kernel.
+- Secondary field indexes: reads are a single in-memory pass through one `getStore(actor)` seam (memoized per request so a request scans the store at most once), not yet backed by per-field indexes. Fine at demo scale; the seam is exactly where a sharded/indexed store (SQLite/LMDB) would slot in.
+- A richer roles UI (the `roles` field renders as a plain list, not a ref repeater).
 - Nashville (`1 Public Sq`, TN) was the one demo address the geocoder didn't match (11 of 12 districts resolved) — cosmetic.
 
 ## Primitives
@@ -140,7 +145,7 @@ An atom names its model with the `model` pointer. The kernel uses that pointer t
 - Scalars: `text`, `longtext`, `integer`, `number`, `boolean`, `datetime`, `enum`.
 - Semantic strings: `email`, `url`, `uuid` — validated by format, like Zod's `z.string().email()`.
 - `ref`: a reference to a standalone atom. Declares `to` (target model) and optional `inverse`. Stored as a link to a separate record.
-- Containers: `list` (item type declared with `of`, e.g. `of: embed://grant`), `map`, `json`.
+- Containers: `list` (item type declared with `of`, e.g. `of: embed://grant`); `map` (a JSON **object**); and `json` (**any** JSON value — scalar, array, or object — for open-ended shapes like `rules`, `display`, or a condition's `value`, which may be a duration string, a scalar, or a list).
 - Modifiers: `required`, `default`, `unique`, `filterable`, `sortable`; refinements `min`/`max` (numbers), `minLength`/`maxLength`/`pattern` (text).
 
 ## Kernel atoms
@@ -475,8 +480,8 @@ A token can issue another token only with grants that are a subset of its own. I
 
 A token with an email signs in by magic link; the kernel then tracks that token through a session. There are no passwords.
 
-- `POST /auth` with `{ "email": "amy@acme.com" }` mints a one-time code and emails a link.
-- Opening the link establishes a **session** — itself an atom (`atom://session`) that binds a cookie to the token. The session resolves to the token, which becomes the `actor`. Signing out retires the session, and the caller falls back to `atom://0`.
+- `POST /auth` with `{ "email": "amy@acme.com" }` mints a one-time code (15-minute expiry) and emails a link. It answers the same way whether or not the email maps to a token, so it cannot be used to enumerate accounts.
+- Opening the link establishes a **session** — itself an atom (`atom://session`) that binds a cookie to the token. The session resolves to the token, which becomes the `actor`. The cookie is `HttpOnly; SameSite=Lax` (and `Secure` when served over TLS) with a full-entropy id, since it is a bearer credential. Signing out retires the session, and the caller falls back to `atom://0`.
 - A token without an email does not sign in interactively. It is presented directly as a bearer credential — an integration is just such a token. There is no separate webhook or callback concept; an external system is an API caller holding a token.
 
 ### Provenance
@@ -1003,11 +1008,11 @@ The kernel resolves the token to its actor, checks the `contact.*` write grant, 
 
 ### The ledger
 
-Atom CRUD is the ledger. Every create, update, and delete appends one `log` atom. The log is append-only, and the current state of an atom is the fold of its log entries. Replaying the log rebuilds every atom, so the store is auditable and can be replicated entry by entry.
+Atom CRUD is the ledger. Every write — `create`, `merge`, `update`, `replace`, `delete`, and each hook `patch` — appends one `log` atom (and the genesis seed logs itself), keyed by a sequential `log-<n>` id. The log is append-only, and the current state of an atom is the fold of its log entries. A log atom lives in the same per-tenant shard as its subject, so replaying a shard rebuilds that tenant's atoms; the store is auditable and replicable entry by entry.
 
 ```json
 {
-  "id": "log-9c20",
+  "id": "log-148",
   "model": "atom://log",
   "manifest": "create contact dana",
   "attr": {
@@ -1041,8 +1046,8 @@ The actor on the entry is the outreach token, so every atom the integration crea
 
 ## Reference kernel
 
-`kernel.mjs` is a minimal, dependency-free implementation of this spec — run it with `node kernel.mjs` (Node ≥ 18); `node test.mjs` is the smoke test. It implements: atoms, models that validate `attr` (incl. semantic `email`/`url`/`uuid` and `min`/`max`/`pattern`), the `atom://0`←`atom://joey` genesis, CRUD over HTTP (`GET`/`POST`/`PUT`/`PATCH`/`DELETE`), path/edge/inverse resolution with a traversal budget, ad-hoc queries, full-text search (`?q=`), stored indexes (parameterised + date-paginated), tokens with method-based grants, **enforced attenuation**, **`rules` predicates**, attribute redaction, magic-link sessions, tenancy as `lifecycle.parent`, and a surface that renders every atom from its model — root included.
+`kernel.mjs` is a minimal, dependency-free implementation of this spec — run it with `node kernel.mjs` (Node ≥ 18); `node test.mjs` is the smoke test. It implements: atoms, models that validate `attr` (incl. semantic `email`/`url`/`uuid` and `min`/`max`/`pattern`), the `atom://0`←`atom://joey` genesis, CRUD over HTTP (`GET`/`POST`/`PUT`/`PATCH`/`DELETE`), path/edge/inverse resolution with a traversal budget, ad-hoc queries, full-text search (`?q=`), stored indexes (parameterised + date-paginated), tokens with method-based grants, **enforced attenuation**, **`rules` predicates**, attribute redaction, magic-link sessions, tenancy as `lifecycle.parent`, a hardened HTTP surface (security headers, strict CSP, a static same-origin client), opt-in AES-256-GCM encryption at rest, a `--audit` governance self-check, and a surface that renders every atom from its model — root included.
 
 The kernel ships no sample data — only the genesis (`joey@emailjoey.com` as admin), the core models, and the core indexes; its table styling is one external `style.css`. Three demo tenants are loaded over the API by `seed-a.mjs` (a PAC: a reporting chain and 100 fundraising transactions), `seed-b.mjs` (an advocacy program: stories → advocates → districts → elected officials), and `seed-c.mjs` (a hybrid) — `npm run seed`.
 
-Persistence is durable and per-tenant: set `ATOMIC_STORE=<dir>` and each tenant becomes an append-only NDJSON shard (`<dir>/<tenant>/log.ndjson`), replayed on boot — state is the fold of the log. Unset, the kernel runs in-memory. Reads route through one `getStore(actor)` seam, so a sharded build swaps in a per-tenant store (SQLite/LMDB) without touching the query/render logic. Still `TODO`: schema migrations and secondary field indexes.
+Persistence is durable and per-tenant: set `ATOMIC_STORE=<dir>` and each tenant becomes an append-only NDJSON shard (`<dir>/<tenant>/log.ndjson`), replayed on boot — state is the fold of the log. Set `ATOMIC_KEY` and each line is sealed with AES-256-GCM (confidential and tamper-evident); unset, lines are plaintext, and reads accept either form, so turning the key on is forward-only. Unset `ATOMIC_STORE` runs in-memory. Reads route through one `getStore(actor)` seam — memoized per request so a request scans the store at most once — so a sharded build swaps in a per-tenant store (SQLite/LMDB) without touching the query/render logic. `node kernel.mjs --audit` runs the governance self-check (`npm run audit`) and exits non-zero on any structural finding. Still `TODO`: schema migrations and secondary field indexes.

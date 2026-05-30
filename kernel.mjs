@@ -12,7 +12,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
 
 // load ./.env (KEY=VALUE lines) into process.env as a fallback — no dependency,
 // explicit env still wins. This is where ATOMIC_STORE / SENDGRID_API_KEY live.
@@ -27,7 +27,9 @@ try {
 // Store + ledger
 // ---------------------------------------------------------------------------
 
-const CSS = (() => { try { return fs.readFileSync(new URL('./style.css', import.meta.url), 'utf8'); } catch { return ''; } })();
+const readAsset = (name) => { try { return fs.readFileSync(new URL(`./${name}`, import.meta.url), 'utf8'); } catch { return ''; } };
+const CSS = readAsset('style.css');
+const APP = readAsset('app.js'); // the static client, served same-origin so the page runs under a strict CSP
 const store = new Map();      // id -> atom
 let   logSeq = 0;             // ledger sequence
 const invReg = {};            // inverseName -> { sourceModel, field, targetModel }
@@ -46,8 +48,16 @@ function getAtom(id) {
 }
 const isAtomObj = (n) => n && typeof n === 'object' && 'model' in n && 'attr' in n;
 
+// storeGen is bumped on every store mutation. Read-side memos (tenantOf,
+// grantsOf, getStore's scan) tag their cached value with the gen they were
+// computed at and recompute when it moves — so a request never rescans the
+// whole store more than once, but a write is instantly visible to the next read.
+let storeGen = 0;
+
 // Put an atom straight into the store (bootstrap / seed — bypasses checks).
-function seed(atom) { store.set(atom.id, atom); persist(atom); return atom; }
+// Every write funnels a log atom through seed(), so bumping here invalidates
+// the read memos after any mutation, not just direct seeds.
+function seed(atom) { store.set(atom.id, atom); storeGen++; persist(atom); return atom; }
 
 // ---------------------------------------------------------------------------
 // Inverse-edge registry (built from model atoms)
@@ -168,7 +178,8 @@ function checkKind(key, def, val) {
     case 'enum': if (!def.values?.includes(val)) fail(`one of ${def.values?.join(', ')}`); break;
     case 'ref': if (!isRef(val)) fail('an atom:// reference'); break;
     case 'list': if (!Array.isArray(val)) fail('a list'); break;
-    case 'map': case 'json': if (typeof val !== 'object') fail('an object'); break;
+    case 'map': if (typeof val !== 'object' || val === null || Array.isArray(val)) fail('an object'); break;
+    case 'json': break; // any JSON value — scalar, array, or object
     default: /* unknown kind: accept */ break;
   }
 }
@@ -254,7 +265,7 @@ function actorFromReq(req, cookies) {
 
 // A session is an atom too — it binds a cookie id to the token it authenticates.
 function newSession(tokenId) {
-  const id = `sess-${randomUUID().slice(0, 8)}`;
+  const id = `sess-${randomUUID()}`; // full 122-bit id — this cookie is a bearer credential
   seed({
     id, model: 'atom://session', manifest: `session for ${tokenId}`,
     attr: { token: ref(tokenId), createdAt: now(), expiresAt: new Date(Date.now() + 7 * 864e5).toISOString() },
@@ -265,10 +276,17 @@ function newSession(tokenId) {
 
 // a token's effective grants = its own grants + the grants of every role it
 // references. A role atom is just a reusable bundle of grants (see canSee/role).
-const grantsOf = (actor) => [
-  ...(actor.attr?.grants || []),
-  ...(actor.attr?.roles || []).flatMap((r) => store.get(isRef(r) ? refId(r) : r)?.attr?.grants || []),
-];
+const _grants = new WeakMap(); // actor obj -> { gen, val }; actor objs are per-request
+const grantsOf = (actor) => {
+  const hit = _grants.get(actor);
+  if (hit && hit.gen === storeGen) return hit.val;
+  const val = [
+    ...(actor.attr?.grants || []),
+    ...(actor.attr?.roles || []).flatMap((r) => store.get(isRef(r) ? refId(r) : r)?.attr?.grants || []),
+  ];
+  _grants.set(actor, { gen: storeGen, val });
+  return val;
+};
 
 // segment-wise match with * (one segment) and ** (any number)
 function grantMatch(gpath, target) {
@@ -343,15 +361,20 @@ const ruleOk = (actor, atom, which) =>
 
 // the tenant is the parent atom: an atom's tenant is its nearest tenant ancestor
 // (walk lifecycle.parent). Global atoms (the core models) have none.
+const _tenant = new Map(); // id -> { gen, val }; the ancestor walk is pure given the store
 function tenantOf(atom) {
-  let cur = atom;
+  if (!atom) return null;
+  const hit = _tenant.get(atom.id);
+  if (hit && hit.gen === storeGen) return hit.val;
+  let cur = atom, val = null;
   for (let hops = 0; cur && hops < 8; hops++) {
-    if (cur.model === 'atom://tenant') return cur.id;
+    if (cur.model === 'atom://tenant') { val = cur.id; break; }
     const p = cur.lifecycle?.parent;
-    if (!isRef(p) || refId(p) === cur.id) return null;
+    if (!isRef(p) || refId(p) === cur.id) break;
     cur = store.get(refId(p));
   }
-  return null;
+  _tenant.set(atom.id, { gen: storeGen, val });
+  return val;
 }
 // a global atom is visible to all; otherwise the actor must share its tenant
 function visible(actor, atom) {
@@ -367,8 +390,14 @@ function visible(actor, atom) {
 // it filters a single in-memory Map; a sharded build swaps this for one store
 // per tenant (e.g. SQLite/LMDB opened lazily, with the core models replicated).
 // ---------------------------------------------------------------------------
+const _scope = new WeakMap(); // actor obj -> { gen, list }
 function getStore(actor) {
-  return { all: () => [...store.values()].filter((a) => visible(actor, a)) };
+  let hit = _scope.get(actor);
+  if (!hit || hit.gen !== storeGen) {
+    hit = { gen: storeGen, list: [...store.values()].filter((a) => visible(actor, a)) };
+    _scope.set(actor, hit);
+  }
+  return { all: () => hit.list };
 }
 
 // ---------------------------------------------------------------------------
@@ -378,12 +407,40 @@ function getStore(actor) {
 // file); unset ATOMIC_STORE keeps the kernel pure in-memory (the demo).
 // ---------------------------------------------------------------------------
 const ROOT = process.env.ATOMIC_STORE || null;
+const _dirs = new Set(); // shard dirs we've already mkdir'd this process — skip the syscall
 const shardOf = (atom) => tenantOf(atom) || '_global';
+
+// Encryption at rest (opt-in). Set ATOMIC_KEY to a 64-char hex key or any
+// passphrase (stretched with scrypt). When set, each shard-log line is written
+// as `enc:<base64(iv12 ‖ tag16 ‖ ciphertext)>` under AES-256-GCM — confidential
+// and tamper-evident (GCM auth tag). Unset → plaintext NDJSON (the demo default).
+// Reads accept either form per line, so turning the key on is forward-only and a
+// store written without it still loads.
+const KEY = process.env.ATOMIC_KEY
+  ? (/^[0-9a-f]{64}$/i.test(process.env.ATOMIC_KEY)
+      ? Buffer.from(process.env.ATOMIC_KEY, 'hex')
+      : scryptSync(process.env.ATOMIC_KEY, 'atomic-shard-v1', 32))
+  : null;
+function serializeLine(atom) {
+  if (!KEY) return JSON.stringify(atom);
+  const iv = randomBytes(12);
+  const c = createCipheriv('aes-256-gcm', KEY, iv);
+  const ct = Buffer.concat([c.update(JSON.stringify(atom), 'utf8'), c.final()]);
+  return 'enc:' + Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64');
+}
+function parseLine(line) {
+  if (!line.startsWith('enc:')) return JSON.parse(line);
+  if (!KEY) throw new Err(500, 'shard is encrypted but ATOMIC_KEY is not set');
+  const buf = Buffer.from(line.slice(4), 'base64');
+  const d = createDecipheriv('aes-256-gcm', KEY, buf.subarray(0, 12));
+  d.setAuthTag(buf.subarray(12, 28));
+  return JSON.parse(Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString('utf8'));
+}
 function persist(atom) {
   if (!ROOT) return;
   const dir = path.join(ROOT, shardOf(atom));
-  fs.mkdirSync(dir, { recursive: true });
-  fs.appendFileSync(path.join(dir, 'log.ndjson'), JSON.stringify(atom) + '\n');
+  if (!_dirs.has(dir)) { fs.mkdirSync(dir, { recursive: true }); _dirs.add(dir); }
+  fs.appendFileSync(path.join(dir, 'log.ndjson'), serializeLine(atom) + '\n');
 }
 function loadAll() {
   if (!ROOT || !fs.existsSync(ROOT)) return false;
@@ -392,7 +449,7 @@ function loadAll() {
     const f = path.join(ROOT, shard, 'log.ndjson');
     if (!fs.existsSync(f)) continue;
     for (const line of fs.readFileSync(f, 'utf8').split('\n'))
-      if (line.trim()) { const a = JSON.parse(line); store.set(a.id, a); n++; }
+      if (line.trim()) { const a = parseLine(line); store.set(a.id, a); n++; }
   }
   return n > 0;
 }
@@ -431,6 +488,16 @@ function changeset(before, after) {
   return changes;
 }
 
+// Commit an in-place mutation: stamp the new version + provenance and persist.
+// Every mutator (merge / update / replace / retire / hook patch) ends here, so
+// "what it means to durably change an atom" lives in exactly one place.
+function bump(atom, by) {
+  atom.lifecycle.version++;
+  atom.lifecycle.updatedAt = now();
+  atom.lifecycle.updatedBy = ref(by);
+  persist(atom);
+}
+
 function create(modelId, body, actor) {
   const modelAtom = getAtom(modelId);
   const fields = Object.keys(body.attr || {});
@@ -450,10 +517,7 @@ function create(modelId, body, actor) {
     const before = { ...existing.attr };
     const merge = modelAtom.attr.behavior?.merge || 'merge';
     existing.attr = merge === 'replace' ? attr : { ...existing.attr, ...attr };
-    existing.lifecycle.version++;
-    existing.lifecycle.updatedAt = now();
-    existing.lifecycle.updatedBy = ref(actor.id);
-    persist(existing);
+    bump(existing, actor.id);
     logIt(existing.id, 'merge', actor.id, changeset(before, existing.attr), actor._session);
     return existing;
   }
@@ -488,32 +552,11 @@ function create(modelId, body, actor) {
   return atom;
 }
 
-function update(id, body, actor, ifMatch) {
-  const atom = getAtom(id);
-  if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
-  const modelId = refId(atom.model);
-  const fields = Object.keys(body.attr || {});
-  if (!fields.every((f) => allows(actor, `${modelId}.${f}`, 'update')))
-    throw new Err(403, `${actor.id} cannot update ${modelId}`);
-  if (ifMatch != null && Number(ifMatch) !== atom.lifecycle.version)
-    throw new Err(409, `version conflict: have ${atom.lifecycle.version}, sent ${ifMatch}`);
-
-  const before = { ...atom.attr };
-  atom.attr = validate(modelId, { ...atom.attr, ...body.attr });
-  attenuate(actor, modelId, atom.attr);
-  if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies update of ${modelId}`);
-  if (body.hooks) atom.lifecycle.hooks = body.hooks; // (re)register lifecycle hooks
-  atom.lifecycle.version++;
-  atom.lifecycle.updatedAt = now();
-  atom.lifecycle.updatedBy = ref(actor.id);
-  persist(atom);
-  logIt(id, 'update', actor.id, changeset(before, atom.attr), actor._session);
-  return atom;
-}
-
-// PUT — replace an existing atom's attr wholesale (idempotent), keeping its
-// id and provenance (createdAt/createdBy). PATCH merges; PUT replaces.
-function replace(id, body, actor, ifMatch) {
+// PATCH merges body.attr into the current attr; PUT replaces it wholesale. Both
+// keep the atom's id and provenance (createdAt/createdBy), bump the version, and
+// append to the ledger — the only differences are the next-attr expression and
+// the log op label, so they share one body.
+function writeAtom(id, body, actor, ifMatch, mode) {
   const atom = getAtom(id);
   if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
   const modelId = refId(atom.model);
@@ -523,16 +566,16 @@ function replace(id, body, actor, ifMatch) {
   if (ifMatch != null && Number(ifMatch) !== atom.lifecycle.version)
     throw new Err(409, `version conflict: have ${atom.lifecycle.version}, sent ${ifMatch}`);
   const before = { ...atom.attr };
-  atom.attr = validate(modelId, body.attr || {});
+  atom.attr = validate(modelId, mode === 'replace' ? (body.attr || {}) : { ...atom.attr, ...body.attr });
   attenuate(actor, modelId, atom.attr);
-  if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies replace of ${modelId}`);
-  atom.lifecycle.version++;
-  atom.lifecycle.updatedAt = now();
-  atom.lifecycle.updatedBy = ref(actor.id);
-  persist(atom);
-  logIt(id, 'replace', actor.id, changeset(before, atom.attr), actor._session);
+  if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies ${mode} of ${modelId}`);
+  if (mode === 'update' && body.hooks) atom.lifecycle.hooks = body.hooks; // (re)register lifecycle hooks
+  bump(atom, actor.id);
+  logIt(id, mode, actor.id, changeset(before, atom.attr), actor._session);
   return atom;
 }
+const update  = (id, body, actor, ifMatch) => writeAtom(id, body, actor, ifMatch, 'update');
+const replace = (id, body, actor, ifMatch) => writeAtom(id, body, actor, ifMatch, 'replace');
 
 // Hooks (the Logic primitive). A hook is an atom { run: <script>, grants: [...] }
 // registered in some atom's lifecycle.hooks (see runHooks). After a write, each
@@ -546,10 +589,7 @@ function patchAtom(atom, fields, hook) {
       throw new Err(403, `hook ${hook.id} is not granted write on ${modelId}.${f}`);
   const before = { ...atom.attr };
   atom.attr = { ...atom.attr, ...fields };
-  atom.lifecycle.version++;
-  atom.lifecycle.updatedAt = now();
-  atom.lifecycle.updatedBy = ref(hook.id);
-  persist(atom);
+  bump(atom, hook.id);
   logIt(atom.id, 'hook', hook.id, changeset(before, atom.attr));
 }
 // a hook may upsert a related atom (e.g. the census district it links to) under
@@ -600,10 +640,7 @@ function retire(id, actor) {
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies delete of ${refId(atom.model)}`);
   atom.lifecycle.status = 'retired';
-  atom.lifecycle.version++;
-  atom.lifecycle.updatedAt = now();
-  atom.lifecycle.updatedBy = ref(actor.id);
-  persist(atom);
+  bump(atom, actor.id);
   logIt(id, 'delete', actor.id, [{ path: 'status', from: 'active', to: 'retired' }], actor._session);
   return atom;
 }
@@ -785,25 +822,10 @@ function page(title, body, fab, foot) {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/style.css?v=${CSS.length}">
-<header><h1><a href="/">Atomic</a></h1><p style="max-width:80vw">A data substrate where schema, data, identity, permissions, and every surface are all atoms — one organism, generated from the same core atoms and rendered on any surface.</p>${foot ? `<p>${foot}</p>` : ''}</header>
+<header><h1><a href="/">Atomic</a></h1><p>${esc(getAtom('0').manifest || '')}</p>${foot ? `<p>${foot}</p>` : ''}</header>
 <nav>${fab || ''}</nav>
 <main>${body}</main>
-<script>
-(function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
-document.querySelectorAll('table').forEach(function(t){
- if(t.closest('form')||!t.tHead)return; // only data grids (with a thead) sort
- var body=t.tBodies[0]||t;
- t.tHead.querySelectorAll('th').forEach(function(th,ci){
-  th.addEventListener('click',function(){
-   var dir=th.getAttribute('data-dir')==='1'?-1:1;
-   t.tHead.querySelectorAll('th').forEach(function(o){o.removeAttribute('data-dir');});
-   th.setAttribute('data-dir',dir);
-   var rows=Array.prototype.slice.call(body.rows);
-   rows.sort(function(a,b){var x=((a.cells[ci]||{}).innerText||'').trim(),y=((b.cells[ci]||{}).innerText||'').trim();
-    var nx=num(x),ny=num(y);var c=(nx!==null&&ny!==null)?nx-ny:x.localeCompare(y);return c*dir;});
-   rows.forEach(function(r){body.appendChild(r);});});});});
-})();
-</script>`;
+<script src="/app.js?v=${APP.length}" defer></script>`;
 }
 
 function renderTable(modelId, atoms, actor) {
@@ -880,40 +902,8 @@ function renderForm(modelId, atom, actor) {
     : `<tr><th>id</th><td><input name="$id" placeholder="auto"></td></tr>`)
     + `<tr><th>model</th><td><a href="/${esc(modelId)}">atom://${esc(modelId)}</a></td></tr>`;
   const manifestRow = `<tr><th>manifest</th><td><input name="$manifest" value="${editing ? esc(atom.manifest || '') : ''}" placeholder="free-text label"></td></tr>`;
-  return `<form><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows}</table></figure><p><button>Submit</button></p>${suggest}</form>
-<script>
-var F=document.querySelector('form select[name="$method"]').closest('form');
-function setPath(root,path,val){var ks=path.split('.'),o=root;
- for(var i=0;i<ks.length-1;i++){var k=ks[i],nn=/^[0-9]+$/.test(ks[i+1]);if(o[k]===undefined)o[k]=nn?[]:{};o=o[k];}
- o[ks[ks.length-1]]=val;}
-F.querySelectorAll('button[type="button"]').forEach(function(btn){btn.onclick=function(){
- var box=btn.parentElement,name=box.getAttribute('data-name');
- var items=box.querySelectorAll(':scope > fieldset'),last=items.length-1,c=items[last].cloneNode(true);
- c.querySelectorAll('[name]').forEach(function(el){
-  el.name=el.name.split(name+'.'+last+'.').join(name+'.'+items.length+'.');
-  if(el.type==='checkbox')el.checked=false;else el.value='';});
- box.insertBefore(c,btn);};});
-var createUrl=${JSON.stringify('/' + modelId)}, atomUrl=${JSON.stringify(editing ? '/' + atom.id : '')};
-F.onsubmit=async function(e){e.preventDefault();
-var method=e.target.querySelector('[name="$method"]').value;
-var url=method==='POST'?createUrl:atomUrl;
-var opts={method:method,headers:{'content-type':'application/json'}};
-if(method==='DELETE'){if(!confirm('Delete '+atomUrl+'?'))return;}
-else{var body={},attr={},bad=null;
- e.target.querySelectorAll('[name]').forEach(function(el){var n=el.name;
-  if(n==='$method')return;
-  if(n==='$id'){if(el.value)body.id=el.value;return;}
-  if(n==='$manifest'){body.manifest=el.value;return;}
-  var val;
-  if(el.type==='checkbox')val=el.checked;
-  else if(el.dataset.kind==='json'){if(el.value==='')return;try{val=JSON.parse(el.value);}catch(_){bad=n;return;}}
-  else{if(el.value==='')return;val=el.dataset.kind==='number'?Number(el.value):el.value;}
-  setPath(attr,n,val);});
- if(bad){alert('invalid JSON in '+bad);return;}
- body.attr=attr;opts.body=JSON.stringify(body);}
-var r=await fetch(url,opts);
-if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:atomUrl);}else{var j=await r.json();alert(j.error||'error');}};
-</script>`;
+  // the form is data-driven; /app.js reads these targets and wires submit + repeaters
+  return `<form data-create="${esc('/' + modelId)}" data-atom="${editing ? esc('/' + atom.id) : ''}"><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows}</table></figure><p><button>Submit</button></p>${suggest}</form>`;
 }
 
 // the top nav: indexes the actor can reach, then every model it can touch below.
@@ -1055,58 +1045,83 @@ function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // https when the request arrived over TLS directly or via a proxy (nginx sets
+  // x-forwarded-proto). Drives the Secure cookie flag and the magic-link origin.
+  const tls = req.socket.encrypted || (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  // Defense-in-depth headers on every response. The CSP locks scripts to our own
+  // same-origin /app.js (there is no inline script anywhere), styles to our sheet
+  // plus Google Fonts, and connect/img/form-action to same-origin only.
+  const SECURITY = { 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer' };
+  const CSP = "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+    + "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
+    + "base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
   const send = (code, val, html) => {
-    res.writeHead(code, { 'content-type': html ? 'text/html' : 'application/json' });
+    res.writeHead(code, { 'content-type': html ? 'text/html' : 'application/json',
+      ...SECURITY, ...(html ? { 'content-security-policy': CSP } : {}) });
     res.end(html ? val : JSON.stringify(val, null, 2));
   };
   const redirect = (location, setCookie) => {
-    const h = { location }; if (setCookie) h['set-cookie'] = setCookie;
+    const h = { location, ...SECURITY }; if (setCookie) h['set-cookie'] = setCookie;
     res.writeHead(302, h); res.end();
   };
+  // a tracked-session cookie. HttpOnly (no JS access), SameSite=Lax (CSRF defense:
+  // the cookie is withheld on cross-site POST, and writes are JSON-only), Secure
+  // over https, 7-day lifetime. Pass maxAge 0 to clear it.
+  const sessionCookie = (sid, maxAge = 604800) =>
+    `atomic_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${tls ? '; Secure' : ''}`;
   try {
     const url = new URL(req.url, 'http://x');
     const cookies = parseCookies(req);
-    const origin = `http://${req.headers.host || 'localhost'}`;
+    const origin = `${tls ? 'https' : 'http'}://${req.headers.host || 'localhost'}`;
     const path = decodeURIComponent(url.pathname).replace(/^\//, '');
     const wantsHtml = (req.headers.accept || '').includes('text/html') ||
                       url.searchParams.get('as') === 'html';
 
     if (req.method === 'GET' && path === 'style.css') {
-      res.writeHead(200, { 'content-type': 'text/css' }); return res.end(CSS);
+      res.writeHead(200, { 'content-type': 'text/css', ...SECURITY }); return res.end(CSS);
+    }
+    if (req.method === 'GET' && path === 'app.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript', ...SECURITY }); return res.end(APP);
     }
 
     // --- sign-in: magic link -> tracked session cookie ---
     if (req.method === 'POST' && path === 'auth') {
       const { email } = await readBody(req);
       const tok = [...store.values()].find((a) => a.model === 'atom://token' && a.attr.email === email);
-      if (!tok) return send(404, { error: 'no token for that email' });
-      const code = randomUUID();
-      magic.set(code, { token: tok.id, exp: Date.now() + 15 * 60000 });
-      const link = `${origin}/auth/verify?code=${code}`;
-      const sent = await sendMagicLink(email, link);
-      if (wantsHtml) return send(200, page('Check your email', sent
-        ? `<p>A sign-in link was emailed to <code>${esc(email)}</code>. It expires in 15 minutes.</p>`
-        : `<p>Email is not configured — use this link:</p><p><a href="${link}">${esc(link)}</a></p>`), true);
-      return send(200, sent ? { sent: true } : { link });
+      // Never reveal whether an email maps to a token (no enumeration oracle):
+      // issue a link only if it does, but always answer the same shape.
+      let link = null;
+      if (tok) {
+        const code = randomUUID();
+        magic.set(code, { token: tok.id, exp: Date.now() + 15 * 60000 });
+        link = `${origin}/auth/verify?code=${code}`;
+        await sendMagicLink(email, link);
+      }
+      // dev convenience only: with no mailer configured, surface the link for a
+      // real token so local sign-in works. An unknown email still reveals nothing.
+      const devLink = link && !SENDGRID ? link : null;
+      if (wantsHtml) return send(200, page('Check your email', devLink
+        ? `<p>Email is not configured — use this link:</p><p><a href="${devLink}">${esc(devLink)}</a></p>`
+        : `<p>If that email has an account, a sign-in link is on its way. It expires in 15 minutes.</p>`), true);
+      return send(200, devLink ? { link: devLink } : { sent: true });
     }
     if (req.method === 'GET' && path === 'auth/verify') {
       const code = url.searchParams.get('code');
       const rec = code && magic.get(code);
       if (!rec || rec.exp < Date.now()) return send(401, { error: 'invalid or expired link' });
       magic.delete(code);
-      const sid = newSession(rec.token);
-      return redirect('/', `atomic_session=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`);
+      return redirect('/', sessionCookie(newSession(rec.token)));
     }
     if (req.method === 'GET' && path === 'auth/open') {
       const id = url.searchParams.get('token');
       const t = id && store.get(id);
       if (!t || t.model !== 'atom://token' || t.attr.login !== 'open') return send(403, { error: 'not an open-login token' });
-      return redirect('/', `atomic_session=${newSession(t.id)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`);
+      return redirect('/', sessionCookie(newSession(t.id)));
     }
     if (req.method === 'GET' && path === 'auth/logout') {
       const sid = cookies['atomic_session'];
       if (sid && store.has(sid)) store.get(sid).lifecycle.status = 'retired';
-      return redirect('/', 'atomic_session=; Path=/; Max-Age=0');
+      return redirect('/', sessionCookie('', 0));
     }
 
     const actor = actorFromReq(req, cookies);
@@ -1177,84 +1192,75 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Bootstrap — joey seeds atom://0 and the core models; then a CRM tenant
+// Core atoms — the substrate's own schema: the genesis identities, the core
+// model definitions, the expiration conditions/policies, and the core indexes.
+// ONE source of truth, consumed two ways: bootstrap() seeds them into a fresh
+// store; migrate() ensures any that an older store is missing. Schema, identity,
+// and queries are all just atoms, so they all live in the same list.
 // ---------------------------------------------------------------------------
-
-function bootstrap() {
+function coreAtoms() {
   // system/seed atoms reference the 'never' policy — the substrate's own schema
   // must not expire out from under itself
-  const lc = (by, parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(), createdBy: ref(by), parent: ref(parent), expiration: 'atom://policy-never' });
-  const model = (id, label, fields, extra = {}) => seed({
-    id, model: 'atom://model', manifest: label,
-    attr: { label, version: 1, fields, ...extra }, lifecycle: lc('0'),
-  });
+  const lc = (by = '0', parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(), createdBy: ref(by), parent: ref(parent), expiration: 'atom://policy-never' });
+  const model = (id, label, fields, extra = {}) => ({ id, model: 'atom://model', manifest: label, attr: { label, version: 1, fields, ...extra }, lifecycle: lc('0') });
+  const atom = (id, kind, manifest, attr, by = '0') => ({ id, model: `atom://${kind}`, manifest, attr, lifecycle: lc(by) });
+  return [
+    // genesis: joey is the root authority; atom://0 is the public/anonymous
+    // identity that also describes the app (no data grants — what an
+    // unauthenticated caller sees).
+    atom('joey', 'token', 'Joey — admin', { email: 'joey@emailjoey.com', grants: [{ path: '**', mode: 'all' }] }, 'joey'),
+    atom('0', 'token', 'A data substrate where schema, data, identity, permissions, and every surface are all atoms — one organism, generated from the same core atoms and rendered on any surface.', {}, 'joey'),
 
-  // genesis: joey -> atom://0 -> core models
-  // joey is the root authority; atom://0 is the public/anonymous identity that
-  // also describes the app (no data grants — it is what an unauthenticated caller sees).
-  seed({ id: 'joey', model: 'atom://token', manifest: 'Joey — admin',
-    attr: { email: 'joey@emailjoey.com', grants: [{ path: '**', mode: 'all' }] }, lifecycle: lc('joey') });
-  seed({ id: '0', model: 'atom://token', manifest: 'Atomic (public root + anonymous identity)',
-    attr: { name: 'Atomic',
-      description: 'A data substrate where schema, data, identity, and the UI surface are all atoms.',
-      grants: [] }, lifecycle: lc('joey') });
+    // core model definitions (the kernel's own types are model atoms)
+    model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
+      indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } }),
+    model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
+      grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' } }),
+    model('grant',  'Grant',  { path: { kind: 'text', required: true },
+      mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } }),
+    model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } }),
+    model('tenant', 'Tenant', { name: { kind: 'text', required: true } }),
+    model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
+      params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } }),
+    model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
+      actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
+      at: { kind: 'datetime' }, changes: { kind: 'list' } }),
+    model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
+      createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } }),
+    model('hook',   'Hook',   { label: { kind: 'text' }, run: { kind: 'text', required: true },
+      grants: { kind: 'list', of: 'embed://grant' } }),
+    // a condition is an atom { field, op, value } — a single reusable predicate.
+    // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
+    model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
+      op: { kind: 'enum', values: ['eq', 'ne', 'in', 'older', 'newer'] }, value: { kind: 'json' } }),
+    // a policy is a set of condition atoms; lifecycle.expiration points at one.
+    // An atom expires when ALL the policy's conditions hold (none → never expires).
+    model('policy', 'Policy', { label: { kind: 'text' },
+      conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } }),
 
-  // core model definitions (the kernel's own types are model atoms)
-  model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
-    indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } });
-  model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
-    grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' } });
-  model('grant',  'Grant',  { path: { kind: 'text', required: true },
-    mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } });
-  model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } });
-  model('tenant', 'Tenant', { name: { kind: 'text', required: true } });
-  model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
-    params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } });
-  model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
-    actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
-    at: { kind: 'datetime' }, changes: { kind: 'list' } });
-  model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
-    createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } });
-  model('hook',   'Hook',   { label: { kind: 'text' }, run: { kind: 'text', required: true },
-    grants: { kind: 'list', of: 'embed://grant' } });
-  // a condition is an atom { field, op, value } — a single reusable predicate.
-  // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
-  model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
-    op: { kind: 'enum', values: ['eq', 'ne', 'in', 'older', 'newer'] }, value: { kind: 'json' } });
-  // a policy is a set of condition atoms; lifecycle.expiration points at one.
-  // An atom expires when ALL the policy's conditions hold (none → never expires).
-  model('policy', 'Policy', { label: { kind: 'text' },
-    conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } });
+    // root expiration conditions + policies — every atom's lifecycle.expiration
+    // points at a policy; policies are made of condition atoms.
+    atom('cond-stale-3y', 'condition', 'Not updated in 3 years', { label: 'Not updated in 3 years', field: 'updatedAt', op: 'older', value: '3y' }),
+    atom('policy-never',   'policy', 'Never expires', { label: 'Never', conditions: [] }),
+    atom('policy-default', 'policy', 'Expires 3 years after last update', { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }),
 
-  // root expiration conditions + policies — every atom's lifecycle.expiration
-  // points at a policy; policies are made of condition atoms.
-  seed({ id: 'cond-stale-3y', model: 'atom://condition', manifest: 'Not updated in 3 years',
-    attr: { label: 'Not updated in 3 years', field: 'updatedAt', op: 'older', value: '3y' }, lifecycle: lc('0') });
-  seed({ id: 'policy-never',   model: 'atom://policy', manifest: 'Never expires',
-    attr: { label: 'Never', conditions: [] }, lifecycle: lc('0') });
-  seed({ id: 'policy-default', model: 'atom://policy', manifest: 'Expires 3 years after last update',
-    attr: { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }, lifecycle: lc('0') });
+    // core indexes (queries are atoms too) — named <model>.<qualifier>; also the
+    // worked examples of the grammar. dotted ids route via whole-path match.
+    atom('log.byAtom', 'index', 'Full change history for one atom', { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } }, match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }),
+    atom('atom.byDate', 'index', 'Atoms across all models, newest first', { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }),
+    atom('model.all', 'index', 'Every model in the substrate', { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }),
+    atom('atom.byModel', 'index', 'Atoms of a chosen model', { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }),
+  ];
+}
 
-  // core indexes (queries are atoms too) — named <model>.<qualifier>; also the
-  // worked examples of the grammar. dotted ids route via whole-path match.
-  seed({ id: 'log.byAtom', model: 'atom://index', manifest: 'Full change history for one atom',
-    attr: { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } },
-      match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }, lifecycle: lc('0') });
-  seed({ id: 'atom.byDate', model: 'atom://index', manifest: 'Atoms across all models, newest first',
-    attr: { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }],
-      page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }, lifecycle: lc('0') });
-  // the catalog of every model (a 'root index of models')
-  seed({ id: 'model.all', model: 'atom://index', manifest: 'Every model in the substrate',
-    attr: { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }, lifecycle: lc('0') });
-  // atoms by model — pick a model, list its atoms (match on the top-level model field)
-  seed({ id: 'atom.byModel', model: 'atom://index', manifest: 'Atoms of a chosen model',
-    attr: { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } },
-      match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }, lifecycle: lc('0') });
-  // Demo tenants A / B / C are loaded from seed-a.mjs / seed-b.mjs / seed-c.mjs
-  // (POSTed through the API as the admin) so they never bloat the kernel.
-
+// ---------------------------------------------------------------------------
+// Bootstrap — fresh store: seed every core atom, then log each as genesis.
+// Demo tenants A / B / C / D are loaded from seed-*.mjs (POSTed through the API
+// as the admin) so they never bloat the kernel.
+// ---------------------------------------------------------------------------
+function bootstrap() {
+  for (const a of coreAtoms()) seed(a);
   buildInverse();
-
   // genesis ledger: every seeded atom is itself a logged change — everything is logged
   for (const a of [...store.values()]) {
     if (a.model === 'atom://log') continue;
@@ -1263,27 +1269,24 @@ function bootstrap() {
   }
 }
 
-// Migration hook — runs on every durable load. Idempotently ensures the current
-// core atoms exist, so a store written by an earlier kernel gains anything added
-// since, and backfills lifecycle.expiration on atoms that predate the field. We
-// don't always need it (a fresh store is seeded by bootstrap), but the append-only
-// log + replay means a live store can always be evolved forward.
+// Migration — runs on every durable load. Idempotently ensures every core atom
+// exists, so a store written by an earlier kernel gains anything added since,
+// and backfills lifecycle.expiration on atoms that predate the field. A fresh
+// store is seeded by bootstrap instead; the append-only log + replay means a
+// live store can always be evolved forward.
 function migrate() {
-  const lc0 = () => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(),
-    createdBy: ref('0'), parent: ref('0'), expiration: 'atom://policy-never' });
-  const ensure = (a) => { if (!store.has(a.id)) seed(a); };
-  ensure({ id: 'condition', model: 'atom://model', manifest: 'Condition', attr: { label: 'Condition', version: 1,
-    fields: { label: { kind: 'text' }, field: { kind: 'text', required: true }, op: { kind: 'enum', values: ['eq','ne','in','older','newer'] }, value: { kind: 'json' } } }, lifecycle: lc0() });
-  ensure({ id: 'policy', model: 'atom://model', manifest: 'Policy', attr: { label: 'Policy', version: 1,
-    fields: { label: { kind: 'text' }, conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } } }, lifecycle: lc0() });
-  ensure({ id: 'cond-stale-3y', model: 'atom://condition', manifest: 'Not updated in 3 years',
-    attr: { label: 'Not updated in 3 years', field: 'updatedAt', op: 'older', value: '3y' }, lifecycle: lc0() });
-  ensure({ id: 'policy-never', model: 'atom://policy', manifest: 'Never expires', attr: { label: 'Never', conditions: [] }, lifecycle: lc0() });
-  ensure({ id: 'policy-default', model: 'atom://policy', manifest: 'Expires 3 years after last update', attr: { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }, lifecycle: lc0() });
-  ensure({ id: 'log.byAtom', model: 'atom://index', manifest: 'Full change history for one atom', attr: { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } }, match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }, lifecycle: lc0() });
-  ensure({ id: 'atom.byDate', model: 'atom://index', manifest: 'Atoms across all models, newest first', attr: { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }, lifecycle: lc0() });
-  ensure({ id: 'model.all', model: 'atom://index', manifest: 'Every model in the substrate', attr: { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }, lifecycle: lc0() });
-  ensure({ id: 'atom.byModel', model: 'atom://index', manifest: 'Atoms of a chosen model', attr: { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }, lifecycle: lc0() });
+  const core = coreAtoms();
+  let added = 0;
+  for (const a of core) if (!store.has(a.id)) { seed(a); added++; }
+  // the root atom is the app's own self-description, carried in its manifest
+  // (it holds no data — attr is empty). Keep an older store's copy tracking the
+  // canonical definition; the header tagline renders straight from this manifest.
+  const root = store.get('0'), def0 = core.find((a) => a.id === '0');
+  if (root && def0 && (root.manifest !== def0.manifest || Object.keys(root.attr || {}).length)) {
+    root.manifest = def0.manifest;
+    root.attr = {}; // atom://0 holds no data, only its label
+    bump(root, '0');
+  }
   let n = 0;
   for (const a of store.values()) {
     if (a.lifecycle && typeof a.lifecycle === 'object' && !a.lifecycle.expiration) {
@@ -1292,7 +1295,75 @@ function migrate() {
     }
   }
   buildInverse();
-  if (n) console.log(`migrate: backfilled expiration on ${n} atoms`);
+  if (added || n) console.log(`migrate: +${added} core atoms, backfilled expiration on ${n}`);
+}
+
+// ---------------------------------------------------------------------------
+// Governance — `node kernel.mjs --audit` (or `npm run audit`). A self-check over
+// the loaded store, in the spirit of a fsck: it asserts the substrate's own
+// invariants and exits non-zero on any finding, so it slots into CI / a cron.
+// Point it at a real store with ATOMIC_STORE=… (and ATOMIC_KEY=… if encrypted).
+// ---------------------------------------------------------------------------
+function audit() {
+  const PSEUDO = new Set(['atom']); // atom://atom is the universal pseudo-model, not a stored atom
+  const atoms = [...store.values()];
+  const findings = [];
+  const report = (label, bad) => {
+    console.log(`${bad.length ? 'FAIL' : ' ok '}  ${label}${bad.length ? `  (${bad.length})` : ''}`);
+    for (const b of bad.slice(0, 8)) console.log(`        - ${b}`);
+    if (bad.length > 8) console.log(`        … ${bad.length - 8} more`);
+    if (bad.length) findings.push(label);
+  };
+  const refsIn = (v) => { // every atom:// id reachable inside a value (attr or lifecycle)
+    const out = [];
+    (function walk(x) {
+      if (isRef(x)) out.push(refId(x));
+      else if (Array.isArray(x)) x.forEach(walk);
+      else if (x && typeof x === 'object') Object.values(x).forEach(walk);
+    })(v);
+    return out;
+  };
+
+  // every atom's model is a real model atom
+  report('every atom resolves to a model', atoms.filter((a) => {
+    const m = store.get(refId(a.model));
+    return !m || m.model !== 'atom://model';
+  }).map((a) => `${a.id} → ${a.model}`));
+
+  // every atom:// reference in data resolves (the 'atom' pseudo-model excepted)
+  const dangling = new Set();
+  for (const a of atoms) for (const id of [...refsIn(a.attr), ...refsIn(a.lifecycle)])
+    if (!PSEUDO.has(id) && !store.has(id)) dangling.add(`${a.id} → atom://${id}`);
+  report('every reference resolves', [...dangling]);
+
+  // every atom's attr conforms to its model's declared schema
+  report('every atom conforms to its schema', atoms.filter((a) => {
+    try { validate(refId(a.model), a.attr); return false; } catch { return true; }
+  }).map((a) => a.id));
+
+  // every grant is well-formed: a known mode and a non-empty path
+  const MODES = new Set(['read', 'create', 'update', 'delete', 'write', 'all']);
+  const badGrants = [];
+  for (const a of atoms) for (const g of (a.attr?.grants || []))
+    if (!g || !g.path || !MODES.has(g.mode)) badGrants.push(`${a.id}: ${JSON.stringify(g)}`);
+  report('every grant is well-formed', badGrants);
+
+  // every ledger entry is well-formed: a known op, with a subject + actor.
+  // (Global contiguity is NOT an invariant — tenants are independent shards a
+  //  node may carry or drop, which legitimately gaps the global log counter.)
+  const OPS = new Set(['genesis', 'create', 'merge', 'update', 'replace', 'delete', 'hook']);
+  report('every ledger entry is well-formed', atoms.filter((a) => a.model === 'atom://log')
+    .filter((a) => !OPS.has(a.attr?.op) || !isRef(a.attr?.atom) || !isRef(a.attr?.actor))
+    .map((a) => `${a.id}: op=${a.attr?.op}`));
+
+  // every atom's parent resolves (the tenant walk has no dangling ancestor)
+  report('every parent resolves', atoms.filter((a) => {
+    const p = a.lifecycle?.parent;
+    return isRef(p) && refId(p) !== a.id && !store.has(refId(p));
+  }).map((a) => `${a.id} → ${a.lifecycle.parent}`));
+
+  console.log(`\naudit: ${store.size} atoms, ${findings.length} finding${findings.length === 1 ? '' : 's'}`);
+  return findings.length ? 1 : 0;
 }
 
 if (loadAll()) {                 // durable store on disk -> replay it
@@ -1302,6 +1373,9 @@ if (loadAll()) {                 // durable store on disk -> replay it
 } else {
   bootstrap();                   // fresh -> seed (and persist, if ATOMIC_STORE is set)
 }
+
+if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens
+
 const PORT = process.env.PORT || 7777;
 server.listen(PORT, () => {
   console.log(`atomic kernel on http://localhost:${PORT}  (${store.size} atoms${ROOT ? `, persisted -> ${ROOT}` : ', in-memory'})`);

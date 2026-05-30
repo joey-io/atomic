@@ -134,7 +134,7 @@ ok((await (await J('joey', 'GET', '/wp?as=html', null, { accept: 'text/html' }))
 // --- full-text + pagination --------------------------------------------------
 ok((await jsonOf('tk-all', '/widget?q=Alpha')).length > 0, 'full-text matches');
 ok((await jsonOf('tk-all', '/widget?q=zzznope')).length === 0, 'full-text empties');
-ok((await jsonOf('joey', '/recent?limit=1')).length === 1, 'index pagination limit');
+ok((await jsonOf('joey', '/atom.byDate?limit=1')).length === 1, 'index pagination limit');
 
 // --- sessions: open login + magic link + logout ------------------------------
 await J('joey', 'PATCH', '/tk-read', { attr: { login: 'open' } }); // tk-read can't patch itself; do as joey
