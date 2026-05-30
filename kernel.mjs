@@ -519,6 +519,18 @@ function bump(atom, by) {
   persist(atom);
 }
 
+// a writer may point an atom's lifecycle.expiration at any policy they can see
+// (their own tenant's, or a global one); absent → the supplied fallback. This is
+// how a user automates retention of their own data without operator help.
+function resolveExpiration(body, actor, fallback) {
+  if (body.expiration === undefined) return fallback;
+  if (!isRef(body.expiration)) throw new Err(400, 'expiration must be a policy reference');
+  const pol = getAtom(refId(body.expiration));
+  if (pol.model !== 'atom://policy') throw new Err(400, `${body.expiration} is not a policy`);
+  if (!visible(actor, pol)) throw new Err(403, `cannot use policy ${body.expiration}`);
+  return body.expiration;
+}
+
 function create(modelId, body, actor) {
   const modelAtom = getAtom(modelId);
   const fields = Object.keys(body.attr || {});
@@ -571,7 +583,8 @@ function create(modelId, body, actor) {
       status: 'active', version: 1,
       modelVersion: modelAtom.attr.version || 1,
       createdAt: now(), updatedAt: now(), createdBy: ref(actor.id), parent: ref(parentId),
-      expiration: ref('policy-default'),          // default policy: expire 3y after last update
+      expiration: resolveExpiration(body, actor, ref('policy-default')), // a chosen policy, else the default
+
       ...(body.hooks ? { hooks: body.hooks } : {}), // hooks registered on this atom
     },
   };
@@ -601,6 +614,7 @@ function writeAtom(id, body, actor, ifMatch, mode) {
   attenuate(actor, modelId, atom.attr);
   if (!ruleOk(actor, atom, 'write')) throw new Err(403, `write rule denies ${mode} of ${modelId}`);
   if (mode === 'update' && body.hooks) atom.lifecycle.hooks = body.hooks; // (re)register lifecycle hooks
+  if (body.expiration !== undefined) atom.lifecycle.expiration = resolveExpiration(body, actor, atom.lifecycle.expiration); // re-point retention policy
   bump(atom, actor.id);
   logIt(id, mode, actor.id, changeset(before, atom.attr), actor._session);
   return atom;
@@ -653,6 +667,9 @@ async function runHooks(atom, event) {
   for (const hr of refs) {
     const h = store.get(isRef(hr) ? refId(hr) : hr);
     if (!h || h.model !== 'atom://hook' || h.lifecycle?.status === 'retired') continue;
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(String(h.attr.run || ''))) { // never import a path-traversing run
+      console.error(`hook ${h.id}: unsafe run "${h.attr.run}" — skipped`); continue;
+    }
     try {
       const mod = await import(new URL(`./scripts/${h.attr.run}.mjs`, import.meta.url));
       await mod.default(atom, {
@@ -1012,9 +1029,13 @@ function renderForm(modelId, atom, actor) {
       .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}<option value="embed://${esc(mm.id)}"></option></datalist>`).join('');
   // the methods this actor may run here, from its grants (the auth schema)
   const methods = [];
+  // a mutating method shows only when BOTH the grant (canOp) and the per-atom
+  // write rule allow it — so e.g. Billy sees an edit form on his OWN index but
+  // not on a shared/global one his grant covers yet the rule forbids.
+  const mayWrite = !editing || ruleOk(actor, atom, 'write');
   if (!editing && canOp(actor, modelId, 'create')) methods.push('POST', 'IMPORT');
-  if (editing && canOp(actor, modelId, 'update')) methods.push('PATCH', 'PUT');
-  if (editing && canOp(actor, modelId, 'delete')) methods.push('DELETE');
+  if (editing && mayWrite && canOp(actor, modelId, 'update')) methods.push('PATCH', 'PUT');
+  if (editing && mayWrite && canOp(actor, modelId, 'delete')) methods.push('DELETE');
   if (!methods.length) return '';
   const LABEL = { POST: 'POST · create', IMPORT: 'IMPORT · bulk CSV', PUT: 'PUT · replace', PATCH: 'PATCH · update', DELETE: 'DELETE · delete' };
   // IMPORT mode (revealed by app.js when chosen): a template to fill + a dropzone
@@ -1122,6 +1143,9 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
     body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
+  // the index's own create/edit form — POST a new report on the model page, or
+  // PATCH/PUT/DELETE one you own here (renderForm gates by grant + the write rule)
+  body += renderForm('index', indexAtom, actor);
   const ps = new URLSearchParams(values); ps.delete('as'); ps.set('as', 'csv');
   const exp = `<a href="/${esc(indexAtom.id)}?${esc(ps.toString())}" download>export CSV</a>`;
   return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, navSelect(actor, indexAtom.id) + exp, footer(actor));
@@ -1368,6 +1392,11 @@ function coreAtoms() {
   const lc = (by = '0', parent = '0') => ({ status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(), createdBy: ref(by), parent: ref(parent), expiration: 'atom://policy-never' });
   const model = (id, label, fields, extra = {}) => ({ id, model: 'atom://model', manifest: label, attr: { label, version: 1, fields, ...extra }, lifecycle: lc('0') });
   const atom = (id, kind, manifest, attr, by = '0') => ({ id, model: `atom://${kind}`, manifest, attr, lifecycle: lc(by) });
+  // "you own it within your tenant": a user-authorable automation (index, hook,
+  // condition, policy) may only be written by someone in its own tenant. So a
+  // tenant user manages their OWN automations, but the shared/global ones
+  // (tenant-less, seeded by root) stay writable only by root (null == null).
+  const own = { rules: { write: 'tenant == actor.tenant' } };
   return [
     // genesis: joey is the root authority; atom://0 is the public/anonymous
     // identity that also describes the app (no data grants — what an
@@ -1385,14 +1414,17 @@ function coreAtoms() {
     model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } }),
     model('tenant', 'Tenant', { name: { kind: 'text', required: true } }),
     model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
-      params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } }),
+      params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } }, own),
     model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
       actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
       at: { kind: 'datetime' }, changes: { kind: 'list' } }),
     model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
       createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } }),
-    model('hook',   'Hook',   { label: { kind: 'text' }, run: { kind: 'text', required: true },
-      grants: { kind: 'list', of: 'embed://grant' } }),
+    // `run` names a vetted script in scripts/ — constrained to a bare basename
+    // (no slashes/dots) so it can never traverse out of the scripts directory.
+    model('hook',   'Hook',   { label: { kind: 'text' },
+      run: { kind: 'text', required: true, pattern: '^[a-z0-9][a-z0-9-]*$' },
+      grants: { kind: 'list', of: 'embed://grant' } }, own),
     // a one-way schema transform: moves a model from version `from` to `to`. The
     // model atom exists and validates; applying migrations on read is still TODO.
     model('migration', 'Migration', { model: { kind: 'ref', to: 'atom://model' },
@@ -1406,11 +1438,11 @@ function coreAtoms() {
     // a condition is an atom { field, op, value } — a single reusable predicate.
     // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
     model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
-      op: { kind: 'enum', values: ['eq', 'ne', 'in', 'older', 'newer'] }, value: { kind: 'json' } }),
+      op: { kind: 'enum', values: ['eq', 'ne', 'in', 'older', 'newer'] }, value: { kind: 'json' } }, own),
     // a policy is a set of condition atoms; lifecycle.expiration points at one.
     // An atom expires when ALL the policy's conditions hold (none → never expires).
     model('policy', 'Policy', { label: { kind: 'text' },
-      conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } }),
+      conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } }, own),
 
     // root expiration conditions + policies — every atom's lifecycle.expiration
     // points at a policy; policies are made of condition atoms.
@@ -1450,8 +1482,18 @@ function bootstrap() {
 // live store can always be evolved forward.
 function migrate() {
   const core = coreAtoms();
-  let added = 0;
-  for (const a of core) if (!store.has(a.id)) { seed(a); added++; }
+  let added = 0, refreshed = 0;
+  for (const a of core) {
+    if (!store.has(a.id)) { seed(a); added++; continue; }
+    // keep the core MODEL definitions current: their schema (fields/rules/etc.)
+    // is the substrate's own, versioned with the kernel — so an older store gains
+    // new field kinds, write rules, and validation as the kernel evolves. Only
+    // core models are refreshed; tenant data and demo models are never touched.
+    if (a.model === 'atom://model') {
+      const cur = store.get(a.id);
+      if (JSON.stringify(cur.attr) !== JSON.stringify(a.attr)) { cur.attr = a.attr; bump(cur, '0'); refreshed++; }
+    }
+  }
   // the root atom is the app's own self-description, carried in its manifest
   // (it holds no data — attr is empty). Keep an older store's copy tracking the
   // canonical definition; the header tagline renders straight from this manifest.
@@ -1469,7 +1511,7 @@ function migrate() {
     }
   }
   buildInverse();
-  if (added || n) console.log(`migrate: +${added} core atoms, backfilled expiration on ${n}`);
+  if (added || refreshed || n) console.log(`migrate: +${added} core atoms, refreshed ${refreshed} core models, backfilled expiration on ${n}`);
 }
 
 // ---------------------------------------------------------------------------
