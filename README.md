@@ -34,9 +34,9 @@ An atom is a raw data record. Every atom has the same five fields.
     "version": 3,
     "modelVersion": 1,
     "createdAt": "2026-05-28T12:00:00Z",
-    "createdBy": "atom://u-amy",
+    "createdBy": "atom://acme.members.amy@acme.com",
     "updatedAt": "2026-05-28T15:20:00Z",
-    "updatedBy": "atom://u-amy"
+    "updatedBy": "atom://acme.members.amy@acme.com"
   }
 }
 ```
@@ -125,15 +125,14 @@ The system is made of atoms. The kernel's own types are model atoms, so the kern
 |`index`    |A stored query or constraint over a model's atoms.                         |
 |`migration`|A one-way transform that moves a model from one version to the next.       |
 |`token`    |A credential. Resolves to an actor and carries grants.                     |
-|`user`     |A person who can authenticate and act: email, tenant, and grants.          |
-|`tenant`   |An isolation boundary. Atoms, grants, and rules are scoped to it.          |
+|`tenant`   |An organization: a set of emails permissioned to models and indexes. The unit of isolation and the only place access is defined.|
 |`log`      |An append-only entry recording one change to one atom. The ledger.         |
 |`file`     |A stored blob, addressed like any atom.                                    |
 |`config`   |Kernel and tenant settings.                                                |
 |`plugin`   |A bundle of models, indexes, and handlers installed together.              |
 |`hook`     |A handler that runs on a write — the transform side of Logic.              |
 
-Everything else — companies, contacts, deals, signups — is an application model built the same way. There is no privileged layer: defining a type, granting access, recording a change, and storing a record are all atom CRUD.
+There is no `user` type. A user is an email with grants, held inside a tenant. Everything else — companies, contacts, deals, signups — is an application model built the same way. There is no privileged layer: defining a type, granting access, recording a change, and storing a record are all atom CRUD.
 
 ## References
 
@@ -144,7 +143,7 @@ A model's field definitions use two reference schemes:
 
 `embed://` appears only in model definitions, never in stored records. A record holds resolved values, not the `embed://` string. Any model can be embedded by referencing it with `embed://`. The same model can also be used as a standalone atom elsewhere via `atom://`.
 
-Use `atom://` when the target is a record that exists on its own and may be shared (a company, a user). Use `embed://` for a field group that belongs to one parent and is not shared (an address).
+Use `atom://` when the target is a record that exists on its own and may be shared (a company, a deal). Use `embed://` for a field group that belongs to one parent and is not shared (an address).
 
 ```json
 {
@@ -371,43 +370,38 @@ The kernel commits only if the stored version still equals `3`. Otherwise it ret
 
 ## Identity and access
 
-Authentication and authorization are part of the kernel. A user is an atom. Access is granted by path.
+Authentication and authorization are part of the kernel. Identity is an email. Permissions live in the tenant. There is no user atom.
 
-### User
+### Tenant
 
-`user` is a core model. A user atom has an email, a tenant, and a list of grants. The signed-in user atom is the `actor` that rules and grants are evaluated against. Any atom that fits this shape — an email and a set of grants — is a user.
+A tenant is an atom. It holds a set of emails, each permissioned to particular refs — the models and indexes that email may read or write. An organization is a tenant. A team, a workspace, or a single account is a tenant. Anything with an email can be a member; the only difference between an administrator and an end user is the set of grants on their email.
 
 ```json
 {
-  "id": "user",
-  "model": "atom://model",
-  "manifest": "A person who can authenticate and act",
+  "id": "acme",
+  "model": "atom://tenant",
+  "manifest": "Acme, Inc.",
   "attr": {
-    "label": "User",
-    "version": 1,
-    "fields": {
-      "email": {
-        "kind": "text",
-        "required": true,
-        "unique": true
+    "name": "Acme, Inc.",
+    "members": {
+      "amy@acme.com": {
+        "name": "Amy Chen",
+        "team": "atom://team-west",
+        "grants": [
+          { "path": "**", "mode": "write" }
+        ]
       },
-      "name": {
-        "kind": "text"
+      "sam@acme.com": {
+        "name": "Sam Lee",
+        "grants": [
+          { "path": "contact.*", "mode": "read" },
+          { "path": "openDeals", "mode": "read" }
+        ]
       },
-      "tenant": {
-        "kind": "ref",
-        "to": "atom://tenant"
-      },
-      "grants": {
-        "kind": "list"
-      }
-    },
-    "indexes": {
-      "byEmail": {
-        "on": [
-          "email"
-        ],
-        "role": "identity"
+      "dana@customer.com": {
+        "grants": [
+          { "path": "ticket.*", "mode": "write" }
+        ]
       }
     }
   },
@@ -415,34 +409,37 @@ Authentication and authorization are part of the kernel. A user is an atom. Acce
 }
 ```
 
+Each member is an email mapped to its grants. A member is addressed by a path into the tenant — `atom://acme.members.amy@acme.com` — so edges that point at a person, such as `deal.owner` or `lifecycle.createdBy`, reference a member that way. New atoms are created in the actor's tenant, and access across tenants is denied unless a grant allows it.
+
 ### Magic-link sign-in
 
-The kernel signs users in by email. There are no passwords.
+The kernel signs people in by email. There are no passwords.
 
-- `POST /auth` with `{ "email": "amy@northwind.com" }` finds the user through the `byEmail` index, mints a short-lived `token` atom, and emails a link containing it.
-- Opening the link exchanges the token for a session. The session resolves to the user atom, which becomes `actor`.
+- `POST /auth` with `{ "email": "amy@acme.com" }` mints a short-lived `token` atom and emails a link containing it.
+- Opening the link starts a session. The kernel finds the tenants whose members include that email and resolves the member entry. The email and its grants are the `actor`.
 - A magic-link `token` is single-use and short-lived. `token` is a kernel model, logged like any atom.
+
+### Why permissions live in the tenant
+
+The tenant atom is the only place access is defined. Only a writer of the tenant can add a member or change a grant, so access is minted by editing one guarded atom, scoped to that tenant. There are no user atoms that could hold their own permissions, so access cannot be created out of band. To audit who can do what, read one atom and its log.
 
 ### Callers
 
-A caller is anything that holds a token: a person signed in by magic link, or an integration issued a token directly. An integration token is long-lived and carries its own grants. Grants attach to the user or to the token, and the `actor` is whatever the token resolves to. Access is checked the same way for both. An integration such as an outreach tool gets a token with only the grants it needs — there is no separate webhook or callback concept; an external system is just an API caller.
-
-### Tenant
-
-Every user belongs to a `tenant`. New atoms are created in the actor's tenant. Grants and rules are evaluated within it. Access across tenants is denied unless a grant allows it.
+A caller is anything that presents a token: a person signed in by magic link, or an integration issued a token directly. A token names its tenant and resolves to a member or to its own grants. The `actor` is whatever the token resolves to. An integration such as an outreach tool gets a token with only the grants it needs. There is no separate webhook or callback concept — an external system is just an API caller.
 
 ### Grants
 
-A grant gives the actor access to a path, for read or write. A path may use wildcards, so one grant covers many attributes across many atoms.
+A grant gives an email access to a ref — a model, an index, or a single attribute path — for read or write. A path may use wildcards, so one grant covers many attributes across many atoms.
 
 - A grant is `{ "path": "<path>", "mode": "read" | "write" }`.
 - `*` matches one segment. `**` matches any number.
-- The path is an ordinary path, so a grant can reach across edges.
+- The path is an ordinary path, so a grant can name a model (`contact.*`), an index (`openDeals`), or reach across edges.
 
 |Grant path          |Covers                                          |
 |--------------------|------------------------------------------------|
-|`contact.*`         |every field of every contact                    |
+|`contact.*`         |every field of every contact (a model)          |
 |`contact.email`     |only the email field of contacts                |
+|`openDeals`         |the results of an index                         |
 |`company.*.deals.**`|deals reached through any company field         |
 |`**`                |everything in the tenant (an admin)             |
 
@@ -488,7 +485,7 @@ Each record stores the `modelVersion` it was written under. When a record is beh
 
 ## Example: CRM
 
-Three models define a CRM. `contact` and `deal` hold an `atom://company` edge. The `inverse` on each edge makes `company.contacts` and `company.deals` queryable without a separate declaration. `company.owner` is an `atom://user` edge used by the contact write rule. `company.hq` embeds an address with `embed://address`. The models below show optional `display` hints; the kernel would render them from field kinds without those hints.
+Three models define a CRM. `contact` and `deal` hold an `atom://company` edge. The `inverse` on each edge makes `company.contacts` and `company.deals` queryable without a separate declaration. `company.owner` references a member of the tenant (addressed as `atom://acme.members.amy@acme.com`) and is used by the contact write rule. `company.hq` embeds an address with `embed://address`. The models below show optional `display` hints; the kernel would render them from field kinds without those hints.
 
 ### Models
 
@@ -511,7 +508,7 @@ Three models define a CRM. `contact` and `deal` hold an `atom://company` edge. T
       "hq": "embed://address",
       "owner": {
         "kind": "ref",
-        "to": "atom://user"
+        "to": "atom://tenant"
       },
       "tier": {
         "kind": "enum",
@@ -648,7 +645,7 @@ Three models define a CRM. `contact` and `deal` hold an `atom://company` edge. T
       },
       "owner": {
         "kind": "ref",
-        "to": "atom://user"
+        "to": "atom://tenant"
       }
     },
     "display": {
@@ -677,26 +674,7 @@ Three models define a CRM. `contact` and `deal` hold an `atom://company` edge. T
 
 ### Records
 
-One company, its owner, two contacts, and a deal. `hq` holds resolved address values (no `embed://` in stored data). The `company` edges all point at `atom://northwind`.
-
-```json
-{
-  "id": "u-amy",
-  "model": "atom://user",
-  "manifest": "Amy Chen, account executive",
-  "attr": {
-    "name": "Amy Chen",
-    "team": "atom://team-west"
-  },
-  "lifecycle": {
-    "status": "active",
-    "version": 1,
-    "modelVersion": 1,
-    "createdAt": "2026-01-10T09:00:00Z",
-    "createdBy": "atom://u-root"
-  }
-}
-```
+One company, two contacts, and a deal. The owner and the `createdBy`/`updatedBy` actors are members of the `acme` tenant, addressed as `atom://acme.members.amy@acme.com`. `hq` holds resolved address values (no `embed://` in stored data). The `company` edges all point at `atom://northwind`.
 
 ```json
 {
@@ -713,7 +691,7 @@ One company, its owner, two contacts, and a deal. `hq` holds resolved address va
       "zip": "98101",
       "country": "US"
     },
-    "owner": "atom://u-amy",
+    "owner": "atom://acme.members.amy@acme.com",
     "tier": "enterprise"
   },
   "lifecycle": {
@@ -721,7 +699,7 @@ One company, its owner, two contacts, and a deal. `hq` holds resolved address va
     "version": 1,
     "modelVersion": 1,
     "createdAt": "2026-05-20T09:00:00Z",
-    "createdBy": "atom://u-amy"
+    "createdBy": "atom://acme.members.amy@acme.com"
   }
 }
 ```
@@ -742,9 +720,9 @@ One company, its owner, two contacts, and a deal. `hq` holds resolved address va
     "version": 3,
     "modelVersion": 1,
     "createdAt": "2026-05-28T12:00:00Z",
-    "createdBy": "atom://u-amy",
+    "createdBy": "atom://acme.members.amy@acme.com",
     "updatedAt": "2026-05-28T15:20:00Z",
-    "updatedBy": "atom://u-amy"
+    "updatedBy": "atom://acme.members.amy@acme.com"
   }
 }
 ```
@@ -765,7 +743,7 @@ One company, its owner, two contacts, and a deal. `hq` holds resolved address va
     "version": 1,
     "modelVersion": 1,
     "createdAt": "2026-05-28T12:05:00Z",
-    "createdBy": "atom://u-amy"
+    "createdBy": "atom://acme.members.amy@acme.com"
   }
 }
 ```
@@ -780,14 +758,14 @@ One company, its owner, two contacts, and a deal. `hq` holds resolved address va
     "amount": 120000,
     "stage": "qualified",
     "company": "atom://northwind",
-    "owner": "atom://u-amy"
+    "owner": "atom://acme.members.amy@acme.com"
   },
   "lifecycle": {
     "status": "active",
     "version": 1,
     "modelVersion": 1,
     "createdAt": "2026-05-25T16:00:00Z",
-    "createdBy": "atom://u-amy"
+    "createdBy": "atom://acme.members.amy@acme.com"
   }
 }
 ```
@@ -897,7 +875,7 @@ Outreach needs no special webhook. An external system is an API caller. It authe
   "model": "atom://token",
   "manifest": "Outreach integration credential",
   "attr": {
-    "tenant": "atom://tenant-acme",
+    "tenant": "atom://acme",
     "grants": [
       {
         "path": "contact.*",
@@ -924,7 +902,7 @@ curl -X POST https://crm.example/contact \
   }'
 ```
 
-The kernel resolves the token to its actor, checks the `contact.*` write grant, validates the body against the contact model, and writes. A write to a path the token does not grant — a deal, a user — is denied. The `byEmail` identity index dedups, so re-sending the same contact merges into the existing one instead of creating a duplicate.
+The kernel resolves the token to its actor, checks the `contact.*` write grant, validates the body against the contact model, and writes. A write to a path the token does not grant — a deal, or the tenant's members — is denied. The `byEmail` identity index dedups, so re-sending the same contact merges into the existing one instead of creating a duplicate.
 
 ### The ledger
 
