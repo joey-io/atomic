@@ -591,7 +591,20 @@ function create(modelId, body, actor) {
   if (!evalRule(modelAtom.attr.rules?.write, actor, atom))
     throw new Err(403, `write rule denies create of ${modelId}`);
   seed(atom);
-  if (modelId === 'model') buildInverse(); // a new model may declare inverse edges
+  if (modelId === 'model') {
+    buildInverse(); // a new model may declare inverse edges
+    // creator-owns: defining a type mints full ownership of it for a tenant user,
+    // so they can immediately CRUD its instances. Attenuation can't self-grant a
+    // brand-new type, and creating it IS the legitimate mint — the type is empty,
+    // so this grants nothing over pre-existing data. Root already holds **.
+    if (tenantOf(actor) !== null) {
+      const tok = store.get(actor.id);
+      if (tok?.model === 'atom://token') {
+        const grants = tok.attr.grants || (tok.attr.grants = []);
+        if (!grants.some((x) => x.path === `${id}.*`)) { grants.push({ path: `${id}.*`, mode: 'all' }); bump(tok, actor.id); }
+      }
+    }
+  }
   logIt(id, 'create', actor.id, changeset({}, attr), actor._session);
   return atom;
 }
@@ -1339,6 +1352,9 @@ const server = http.createServer(async (req, res) => {
         if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
         result = atoms;
       } else if (headAtom.model === 'atom://model' && segs.length === 0) {
+        // a tenant-scoped model is invisible (and unaddressable) outside its tenant;
+        // global/core models (tenant-less) stay listable by everyone.
+        if (!visible(actor, headAtom)) throw new Err(404, `no atom ${head}`);
         // a blank template to fill for import (gated on create — you template what you can import)
         if (as === 'template') {
           if (!canOp(actor, head, 'create')) throw new Err(403, `${actor.id} cannot import ${head}`);
@@ -1406,7 +1422,7 @@ function coreAtoms() {
 
     // core model definitions (the kernel's own types are model atoms)
     model('model',  'Model',  { label: { kind: 'text' }, fields: { kind: 'map', required: true },
-      indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } }),
+      indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } }, own),
     model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
       grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list' } }),
     model('grant',  'Grant',  { path: { kind: 'text', required: true },
