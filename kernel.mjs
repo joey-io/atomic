@@ -528,9 +528,14 @@ function renderForm(modelId) {
         return `<p><label>${esc(k)} <select name="${esc(k)}">${def.values.map((v) => `<option>${esc(v)}</option>`).join('')}</select></label></p>`;
       if (def.kind === 'boolean')
         return `<p><label><input type="checkbox" name="${esc(k)}"> ${esc(k)}</label></p>`;
+      if (def.kind === 'ref' && def.to) {
+        const opts = [...store.values()]
+          .filter((a) => a.model === def.to && a.lifecycle?.status !== 'retired')
+          .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('');
+        return `<p><label>${esc(k)} <select name="${esc(k)}" data-kind="ref"><option value="">—</option>${opts}</select></label></p>`;
+      }
       const type = (def.kind === 'integer' || def.kind === 'number') ? 'number' : 'text';
-      const ph = def.kind === 'ref' ? ' placeholder="atom://…"' : '';
-      return `<p><label>${esc(k)} <input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}"${ph}></label></p>`;
+      return `<p><label>${esc(k)} <input type="${type}" name="${esc(k)}" data-kind="${esc(def.kind)}"></label></p>`;
     }).join('');
   return `<h1>Add ${esc(m.attr.label || modelId)}</h1><form id="add">${inputs}<button>Create</button></form>
 <script>
