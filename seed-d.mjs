@@ -117,13 +117,13 @@ await atom('house', 'd-house', T, { name: 'The Henderson House', address: '14 Ma
 // rooms: 3 bedrooms + family room + kitchen + 2 bathrooms.
 // NOTE: every atom id is globally unique in the store, so rooms are namespaced
 // `d-rm-*` and residents `d-res-*` — a room and a person must never share an id.
-await atom('room', 'd-rm-master',  T, { name: 'Master Bedroom', kind: 'bedroom', shared: true,  house: A('d-house') }, 'Master Bedroom');
-await atom('room', 'd-rm-maya',    T, { name: "Maya's Room",    kind: 'bedroom', shared: false, house: A('d-house') }, "Maya's Room");
-await atom('room', 'd-rm-theo',    T, { name: "Theo's Room",    kind: 'bedroom', shared: false, house: A('d-house') }, "Theo's Room");
-await atom('room', 'd-rm-family',  T, { name: 'Family Room',    kind: 'family',  shared: true,  house: A('d-house') }, 'Family Room');
-await atom('room', 'd-rm-kitchen', T, { name: 'Kitchen',        kind: 'kitchen', shared: true,  house: A('d-house') }, 'Kitchen');
-await atom('room', 'd-rm-bath-m',  T, { name: 'Master Bath',    kind: 'bathroom', shared: true, house: A('d-house') }, 'Master Bath');
-await atom('room', 'd-rm-bath-h',  T, { name: 'Hall Bath',      kind: 'bathroom', shared: true, house: A('d-house') }, 'Hall Bath');
+await atom('room', 'd-rm-master',  T, { name: 'Master Bedroom', kind: 'bedroom',  shared: true,  house: A('d-house') }, 'Master Bedroom');
+await atom('room', 'd-rm-maya',    T, { name: "Maya's Room",    kind: 'bedroom',  shared: false, house: A('d-house') }, "Maya's Room");
+await atom('room', 'd-rm-theo',    T, { name: "Theo's Room",    kind: 'bedroom',  shared: false, house: A('d-house') }, "Theo's Room");
+await atom('room', 'd-rm-family',  T, { name: 'Family Room',    kind: 'family',   shared: true,  house: A('d-house') }, 'Family Room');
+await atom('room', 'd-rm-kitchen', T, { name: 'Kitchen',        kind: 'kitchen',  shared: true,  house: A('d-house') }, 'Kitchen');
+await atom('room', 'd-rm-bath-m',  T, { name: 'Master Bath',    kind: 'bathroom', shared: true,  house: A('d-house') }, 'Master Bath');
+await atom('room', 'd-rm-bath-h',  T, { name: 'Hall Bath',      kind: 'bathroom', shared: true,  house: A('d-house') }, 'Hall Bath');
 
 // residents: 2 adults (Billy + Robin share the master) + 2 kids (own bedrooms)
 await atom('resident', 'd-res-billy', T, { name: 'Billy Henderson', role: 'adult', age: 41, house: A('d-house'), bedroom: A('d-rm-master') }, 'Billy Henderson');

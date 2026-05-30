@@ -280,7 +280,7 @@ atom://openDeals?company=atom://northwind
 }
 ```
 
-An index may range over every atom with `over: atom://atom` — the universal type — and `sort` may name a `lifecycle` field such as `createdAt`. An index that declares `page: { cursor, limit }` is paginated with `?before=<cursor>&limit=<n>`. Two kernel indexes use this: `recent` (`over: atom://atom`, `sort: [{ createdAt: desc }]`, paginated) is the cross-model activity feed, and `atomLog` (`over: atom://log`, `match: { atom: params.atom }`) is one atom's full history.
+An index may range over every atom with `over: atom://atom` — the universal type — and `sort` may name a `lifecycle` field such as `createdAt`. An index that declares `page: { cursor, limit }` is paginated with `?before=<cursor>&limit=<n>`. Two kernel indexes use this: `atom.byDate` (`over: atom://atom`, `sort: [{ createdAt: desc }]`, paginated) is the cross-model activity feed, and `log.byAtom` (`over: atom://log`, `match: { atom: params.atom }`) is one atom's full history.
 
 ## Rendering
 
@@ -455,25 +455,24 @@ So `"lifecycle": "atom://0"` on a kernel atom means "created at genesis by `atom
 {
   "id": "0",
   "model": "atom://token",
-  "manifest": "Atomic — public root and anonymous identity",
-  "attr": {
-    "name": "Atomic",
-    "description": "A data substrate where schema, data, identity, and the UI surface are all atoms.",
-    "grants": []
-  },
+  "manifest": "A data substrate where schema, data, identity, permissions, and every surface are all atoms — one organism, generated from the same core atoms and rendered on any surface.",
+  "attr": {},
   "lifecycle": {
     "status": "active",
     "version": 1,
     "modelVersion": 1,
     "createdAt": "2026-01-01T00:00:00Z",
-    "createdBy": "atom://joey"
+    "updatedAt": "2026-01-01T00:00:00Z",
+    "createdBy": "atom://joey",
+    "parent": "atom://0",
+    "expiration": "atom://policy-never"
   }
 }
 ```
 
 ### The root is atom://0
 
-The root of the surface is `atom://0` itself. `GET /` returns the `atom://0` atom; rendered, it shows that atom's fields (its name and description) like any other record. The homepage is not special-cased — it is the root atom, drawn by the same machinery as every atom. `atom://0` is world-readable, so an unauthenticated caller sees the app's address and description but, holding no data grants, no records. A signed-out browser is offered a form to create a session; reading data requires one.
+The root of the surface is `atom://0` itself. `GET /` returns the `atom://0` atom; rendered, it shows that atom — id, model, and its manifest tagline — like any other record. The homepage is not special-cased — it is the root atom, drawn by the same machinery as every atom. `atom://0` is world-readable, so an unauthenticated caller sees the app's address and description but, holding no data grants, no records. A signed-out browser is offered a form to create a session; reading data requires one.
 
 ### Attenuation
 
@@ -501,7 +500,7 @@ A new atom is born into its creator's tenant: `parent` defaults to the writer's 
 
 A grant gives a token access to a ref — a model, an index, or a single attribute path — for read or write. A path may use wildcards, so one grant covers many attributes across many atoms.
 
-- A grant is `{ "path": "<path>", "mode": "read" | "create" | "update" | "delete" | "write" }`. The mode is the operation, and the HTTP method selects it: `GET`→read, `POST`→create, `PUT`/`PATCH`→update, `DELETE`→delete. `write` is the mutation superset, and any grant implies read.
+- A grant is `{ "path": "<path>", "mode": "read" | "create" | "update" | "delete" | "write" | "all" }`. The mode is the operation, and the HTTP method selects it: `GET`→read, `POST`→create, `PUT`/`PATCH`→update, `DELETE`→delete. `write` is the mutation superset (create + update + delete) and does **not** imply read; only `read` (or `all`) grants read.
 - `*` matches one segment. `**` matches any number.
 - The path is an ordinary path, so a grant can name a model (`contact.*`), an index (`openDeals`), or reach across edges.
 
