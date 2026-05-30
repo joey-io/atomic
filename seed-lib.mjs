@@ -53,6 +53,7 @@ export async function defineModels() {
   });
   await model('advocate', 'Advocate', {
     name: { kind: 'text', required: true },
+    email: { kind: 'email' },
     district: { kind: 'ref', to: 'atom://district', inverse: 'advocates' },
   });
   await model('story', 'Story', {
