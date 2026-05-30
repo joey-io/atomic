@@ -720,12 +720,12 @@ const atomValue = (v, actor) => {
 function renderFields(map, actor) {
   const rows = Object.entries(map).map(([k, v]) => {
     const cell = (k === 'id' && typeof v === 'string' && !isRef(v)) ? link(actor, v) : atomValue(v, actor);
-    return `<tr><th>${esc(k)}</th><td>${cell}</td></tr>`;
+    return `<tr><td>${esc(k)}</td><td>${cell}</td></tr>`;
   }).join('');
-  return `<figure><table>${rows}</table></figure>`;
+  return `<figure><table><thead><tr><th>field</th><th>value</th></tr></thead><tbody>${rows}</tbody></table></figure>`;
 }
 
-function page(title, body, fab) {
+function page(title, body, fab, foot) {
   return `<!doctype html><meta charset=utf8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
@@ -736,6 +736,7 @@ function page(title, body, fab) {
 <header><h1><a href="/">Atomic</a></h1></header>
 <nav>${fab || ''}</nav>
 <main>${body}</main>
+${foot ? `<footer>${foot}</footer>` : ''}
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
@@ -767,9 +768,9 @@ function renderTable(modelId, atoms, actor) {
 // a form to create a session (sign in) — a session is itself an atom
 function sessionForm() {
   const open = [...store.values()].filter((a) => a.model === 'atom://token' && a.attr.login === 'open');
-  const buttons = open.map((t) => `<button onclick="location.href='/auth/open?token=${esc(t.id)}'">${esc(t.attr.email || t.id)}</button>`).join(' ');
-  return `${open.length ? `<p>${buttons}</p>` : ''}<form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com" required> <button>send magic link</button></p></form>
-<p><small>a one-time sign-in link is emailed to a registered token's address</small></p>`;
+  const items = open.map((t) => `<li><a href="/auth/open?token=${esc(t.id)}">demo as Advocacy Website Token</a></li>`).join('');
+  return `<form method="post" action="/auth"><p><input name="email" type="email" placeholder="you@example.com" required></p><p><button>send magic link</button></p></form>
+${open.length ? `<ul>${items}</ul>` : ''}`;
 }
 
 // one form generated from the model's field kinds, with a method picker built
@@ -874,14 +875,42 @@ function navSelect(actor, current) {
     + (models ? `<optgroup label="models">${models}</optgroup>` : '')
     + (indexes ? `<optgroup label="indexes">${indexes}</optgroup>` : '')
     + `</select>`;
-  return actor.id === '0' ? sel : `${sel} <a href="/auth/logout">sign out</a>`;
+  return sel;
+}
+
+// the signed-in footer: identity + sign out, shown on every page once authed
+function footer(actor) {
+  if (!actor || actor.id === '0') return '';
+  return `signed in as ${atomValue(ref(actor.id), actor)} <a href="/auth/logout">sign out</a>`;
+}
+
+// Signed-in root: the workspace drawn plainly as a mind map — every model the
+// actor can reach, its ref fields (the schema edges), and the atoms under it
+// the actor may open. Nested <ul>s, nothing fancier.
+function workspaceMap(actor) {
+  const all = getStore(actor).all();
+  const models = all.filter((a) => a.model === 'atom://model' && canTouch(actor, a.id));
+  const branch = (m) => {
+    const fields = m.attr.fields || {};
+    const refs = Object.entries(fields)
+      .filter(([, d]) => d && typeof d === 'object' && d.kind === 'ref')
+      .map(([f, d]) => `<li>${esc(f)} → ${link(actor, refId(d.to))}</li>`).join('');
+    const insts = all.filter((a) => a.id !== m.id && refId(a.model) === m.id
+      && a.lifecycle?.status !== 'retired' && canSee(actor, a.id));
+    const shown = insts.slice(0, 12).map((a) => `<li>${link(actor, a.id)}</li>`).join('');
+    const more = insts.length > 12 ? `<li><small>… ${insts.length - 12} more</small></li>` : '';
+    const kids = (refs ? `<li>refs<ul>${refs}</ul></li>` : '')
+      + (insts.length ? `<li>atoms<ul>${shown}${more}</ul></li>` : '');
+    return `<li>${link(actor, m.id)} <small>${esc(m.attr.label || m.id)}</small>${kids ? `<ul>${kids}</ul>` : ''}</li>`;
+  };
+  return `<ul>${models.map(branch).join('')}</ul>`;
 }
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
   const table = canOp(actor, modelId, 'read') ? renderTable(modelId, atoms, actor) : ''; // hidden without read
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
-    renderForm(modelId, null, actor) + table, navSelect(actor, modelId));
+    renderForm(modelId, null, actor) + table, navSelect(actor, modelId), footer(actor));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -922,7 +951,7 @@ function renderIndexPage(indexAtom, atoms, actor, values = {}) {
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
     body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, navSelect(actor, indexAtom.id));
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, navSelect(actor, indexAtom.id), footer(actor));
 }
 
 // every place a ref to `target` appears in a value, with its dotted field path
@@ -947,7 +976,7 @@ function renderRefMap(rows, actor) {
   const head = ['referenced by', 'model', 'via'].map((c) => `<th>${esc(c)}</th>`).join('');
   const body = rows.slice(0, 200).map((r) =>
     `<tr><td>${link(actor, r.id)}</td><td>${atomValue('atom://' + r.model, actor)}</td><td>${esc(r.via)}</td></tr>`).join('');
-  return `<p>referenced by — ${rows.length}</p><figure><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></figure>`;
+  return `<figure><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></figure>`;
 }
 
 function renderAtom(atom, actor) {
@@ -955,7 +984,7 @@ function renderAtom(atom, actor) {
   // the UI mirrors the schema: render the whole atom — id, model, manifest,
   // attr, lifecycle — then the ref map (everything that references it)
   const body = renderFields(atom, actor) + renderForm(modelId, atom, actor) + renderRefMap(referencedBy(atom, actor), actor);
-  return page(atom.manifest || atom.id, body, navSelect(actor, refId(atom.model)));
+  return page(atom.manifest || atom.id, body, navSelect(actor, refId(atom.model)), footer(actor));
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,8 +1067,8 @@ const server = http.createServer(async (req, res) => {
       const a = getAtom('0');
       if (!wantsHtml) return send(200, a);
       let body = renderFields(a, actor);
-      body += isAnon ? sessionForm() : `<p>signed in as ${atomValue(ref(actor.id), actor)}</p>`;
-      return send(200, page(a.manifest || 'atom://0', body, navSelect(actor, '')), true);
+      body += isAnon ? sessionForm() : workspaceMap(actor);
+      return send(200, page(a.manifest || 'atom://0', body, navSelect(actor, ''), footer(actor)), true);
     }
     // no anonymous access beyond the root
     if (isAnon) {
@@ -1052,7 +1081,7 @@ const server = http.createServer(async (req, res) => {
       if (head === 'atom' && segs.length === 0) {
         const atoms = sortBy(getStore(actor).all().filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
           .map((a) => redact(actor, a));
-        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms, actor), navSelect(actor, '')), true);
+        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms, actor), navSelect(actor, ''), footer(actor)), true);
         return send(200, atoms);
       }
       const headAtom = getAtom(head);

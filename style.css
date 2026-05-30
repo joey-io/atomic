@@ -18,8 +18,9 @@
   --radius-sm: 8px;
   --cell: 9px 14px;
   --gap: 10px;
-  --title: 3vw;
+  --title: 12vw;
   --nest: rgba(0, 0, 0, .01); /* translucent so nested figures accumulate/darken */
+  --nest-line: rgba(0, 0, 0, .1); /* figure border: same hue as --nest, heavier */
   --asc: " ↑";
   --desc: " ↓";
 }
@@ -35,11 +36,12 @@ body {
   margin: 0;
 }
 header { max-width: 1120px; margin: 0 auto; padding: 24px 24px 0 }
-h1 { margin: 0; font-size: var(--title); font-weight: 700; letter-spacing: -.02em; line-height: 1.1 }
+h1 { margin: 0; padding-bottom: 1rem; font-size: var(--title); font-weight: 700; letter-spacing: -.02em; line-height: 1.1 }
 h1 a { color: var(--fg) }
 h1 a:hover { text-decoration: none }
 main { display: block; max-width: 1120px; margin: 0 auto; padding: 8px 24px 64px }
 nav { max-width: 1120px; margin: 0 auto; padding: 6px 24px 8px; display: flex; gap: var(--gap); align-items: center }
+footer { max-width: 1120px; margin: 0 auto; padding: 16px 24px 32px; color: var(--muted); font-size: .82rem; display: flex; gap: var(--gap); align-items: center; border-top: 1px solid var(--line) }
 p { margin: 14px 0 }
 small { color: var(--muted) }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em }
@@ -47,41 +49,25 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .
 a { color: var(--accent); text-decoration: none }
 a:hover { text-decoration: underline }
 
-/* a <figure> is the scroll container for any table */
-figure { margin: 14px 0; overflow-x: auto; max-width: 100%; background: var(--nest); border-radius: 1rem; padding: 1rem }
-table { width: 100%; border-collapse: separate; border-spacing: 0; background: transparent }
-th, td { text-align: left; vertical-align: top; white-space: nowrap }
-
-/* key/value + form tables (a bare <table>, no <thead>) read as label : value */
-table:not(:has(thead)) th {
-  text-align: right; width: 1%; white-space: nowrap;
-  color: var(--muted); font-weight: 500; padding: 6px 14px 6px 0;
-}
-table:not(:has(thead)) td { padding: 6px 0 }
-
-/* data grids (a <table> with a <thead>) get the bordered, sortable card look */
-table:has(thead) {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-table:has(thead) th, table:has(thead) td { padding: var(--cell); border-bottom: 1px solid var(--line) }
-table:has(thead) thead th {
-  background: var(--head);
+/* ONE table component, everywhere. A <figure> scrolls it; every table is a grid
+   with a sortable <thead>. Same cells, same headers, same separators — no
+   variants, no exceptions. Rule #1: everything is the same. */
+figure { margin: 14px 0; overflow-x: auto; max-width: 100%; background: var(--nest); border: 1px solid var(--nest-line); border-radius: 1rem; padding: 1rem }
+table { width: 100%; border-collapse: collapse; background: transparent }
+th, td { text-align: left; vertical-align: top; white-space: nowrap; padding: var(--cell) }
+td { border-bottom: 1px solid var(--line) }
+thead th {
   color: var(--muted);
   font-weight: 600;
   font-size: .76rem;
   letter-spacing: .04em;
   text-transform: uppercase;
-  border-bottom: 1px solid var(--line-strong);
   cursor: pointer;
   user-select: none;
 }
-table:has(thead) thead th:hover { color: var(--fg) }
-table:has(thead) tbody tr:nth-child(even) > td { background: var(--row) }
-table:has(thead) tbody tr:hover > td { background: var(--accent-weak) }
-table:has(thead) tbody tr:last-child > td { border-bottom: 0 }
+thead th:hover { color: var(--fg) }
+tbody tr:hover > td { background: var(--accent-weak) }
+tbody tr:last-child > td { border-bottom: 0 }
 thead th[data-dir="1"]::after { content: var(--asc); color: var(--accent) }
 thead th[data-dir="-1"]::after { content: var(--desc); color: var(--accent) }
 
