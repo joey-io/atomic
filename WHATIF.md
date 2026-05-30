@@ -262,6 +262,7 @@ Because look at what `atomic.mjs` actually hand-rolls. Then look at the column o
 | `manifest` full-text search             | `FTS5` — a full-text engine, not a `LIKE` scan          |
 | `ref` / typed edges                     | `FOREIGN KEY` + a join table for inverse edges          |
 | Hooks on create/update/delete           | `TRIGGER` — fires on exactly those, in the engine       |
+| Schema migration (versioned, on read)   | `ALTER TABLE` — the mechanism, but you own the versioning |
 | Optimistic concurrency (`version`)      | a `version` column + `WHERE version = ?`                |
 | Append-only log                         | an insert-only table, or the WAL itself                 |
 | Durable persistence, replayed on boot   | **the file.** WAL, crash recovery, fsync — decades-hard |

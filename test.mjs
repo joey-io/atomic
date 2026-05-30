@@ -165,11 +165,94 @@ ok(await code('joey', 'POST', '/hook', { id: 'h-bad', attr: { run: '../../x', gr
 // sessions are bearer credentials, never served through the surface
 ok(await code('joey', 'GET', '/' + cookie.split('=')[1]) === 404, 'a session atom is unreadable, even by root');
 
+// --- schema migration: version-bump rewrite on read -------------------------
+// gadget v1: a record written under the old shape, then evolved forward by a
+// chain of migrations (rename → default → custom). The kernel brings it forward.
+await J('joey', 'POST', '/model', { id: 'gadget', attr: { label: 'Gadget', version: 1, fields: {
+  title: { kind: 'text', required: true }, label: { kind: 'text' } } } });
+await J('joey', 'POST', '/gadget', { id: 'g1', attr: { title: 'Hello World', label: 'old value' } });
+ok((await jsonOf('joey', '/g1')).lifecycle.modelVersion === 1, 'record is born at the model version (1)');
+
+// v2 — rename `label` → `name` (a kernel `rename` op). Ship the new model def, then the migration.
+await J('joey', 'PUT', '/gadget', { attr: { label: 'Gadget', version: 2, fields: {
+  title: { kind: 'text', required: true }, name: { kind: 'text' } } } });
+await J('joey', 'POST', '/migration', { id: 'gadget@1-2', attr: { model: 'atom://gadget', from: 1, to: 2, op: 'rename', spec: { from: 'label', to: 'name' } } });
+let g = await jsonOf('joey', '/g1');
+ok(g.attr.name === 'old value' && g.attr.label === undefined, 'migration: rename moved label → name');
+ok(g.lifecycle.modelVersion === 2, 'migration bumped modelVersion to 2');
+
+// v3 — add `status` with a default (a kernel `default` op)
+await J('joey', 'PUT', '/gadget', { attr: { label: 'Gadget', version: 3, fields: {
+  title: { kind: 'text', required: true }, name: { kind: 'text' }, status: { kind: 'text' } } } });
+await J('joey', 'POST', '/migration', { id: 'gadget@2-3', attr: { model: 'atom://gadget', from: 2, to: 3, op: 'default', spec: { field: 'status', value: 'active' } } });
+ok((await jsonOf('joey', '/g1')).attr.status === 'active', 'migration: default filled the new field');
+
+// v4 — a custom handler derives `slug` from `title` (scripts/test-migrate.mjs)
+await J('joey', 'PUT', '/gadget', { attr: { label: 'Gadget', version: 4, fields: {
+  title: { kind: 'text', required: true }, name: { kind: 'text' }, status: { kind: 'text' }, slug: { kind: 'text' } } } });
+await J('joey', 'POST', '/migration', { id: 'gadget@3-4', attr: { model: 'atom://gadget', from: 3, to: 4, op: 'custom', run: 'test-migrate' } });
+g = await jsonOf('joey', '/g1');
+ok(g.attr.slug === 'hello-world' && g.lifecycle.modelVersion === 4, 'migration: custom handler computed slug, version now 4');
+// migration rewrites the record — the rewrite is logged as a `migrate` op
+ok((await jsonOf('joey', '/log.byAtom?atom=atom://g1')).some((l) => l.attr.op === 'migrate'), 'migration rewrite is recorded in the ledger');
+// a migration run name is locked to a safe basename (no path-traversal import)
+ok(await code('joey', 'POST', '/migration', { id: 'mig-bad', attr: { model: 'atom://gadget', from: 9, to: 10, op: 'custom', run: '../../x' } }) === 400, 'migration run rejects path traversal');
+
+// --- security regressions ----------------------------------------------------
+// H1: a dotted path is a read like any other — it must honor tenant scope, the
+// per-attribute read grant, and rules, exactly like the whole-atom view.
+ok((await (await J('tk-all', 'GET', '/w1.name')).json()) === 'Alpha', 'path read of a visible field works');
+ok(await code('tk2', 'GET', '/w1.name') === 404, 'path read cannot cross tenant (t2 → t1 atom)');
+ok(await code('tk-nameonly', 'GET', '/w1.size') === 404, 'path read is redacted (no grant on widget.size)');
+ok((await (await J('tk-nameonly', 'GET', '/w1.name')).json()) === 'Alpha', 'path read of a granted field still works');
+ok(await code('tk-read', 'GET', '/joey.email') === 404, 'path read cannot leak another token’s field');
+ok(await code('tk-read', 'GET', '/joey.grants') === 404, 'path read cannot leak another token’s grants');
+
+// H2: roles are attenuated too — a token cannot wear a role that grants more than
+// the issuer holds (else "mint a ** role, then wear it" bypasses attenuation).
+await J('joey', 'POST', '/role', { id: 'role-admin', attr: { label: 'Admin', grants: [{ path: '**', mode: 'all' }] } });
+ok(await code('tk-mid', 'POST', '/token', { attr: { email: 'r1@x.com', roles: ['atom://role-admin'] } }) === 403, 'attenuation: cannot wear a role exceeding own grants');
+ok(await code('tk-mid', 'POST', '/token', { attr: { email: 'r2@x.com', roles: ['atom://role-reader'] } }) === 201, 'attenuation: a role within own grants is allowed');
+
+// global system tokens are superuser-only: even a token-read grant can't surface
+// the root admin token to a tenant user (it isn't shared reference data).
+await mk('tk-tokread', 't1', [{ path: 'token.*', mode: 'read' }]);
+ok(await code('tk-tokread', 'GET', '/joey') === 404, 'tenant user with token-read cannot see the global admin token');
+ok(await code('tk-tokread', 'GET', '/joey.email') === 404, 'nor read its fields via a path');
+ok(await code('joey', 'GET', '/joey') === 200, 'a superuser still sees the admin token');
+
+// M2: retiring a token revokes its Bearer credential immediately.
+await mk('tk-revoke', 't1', [{ path: 'widget.*', mode: 'read' }]);
+ok(await code('tk-revoke', 'GET', '/widget') === 200, 'live token reads');
+await J('joey', 'DELETE', '/tk-revoke');
+ok(await code('tk-revoke', 'GET', '/widget') === 401, 'retired token no longer authenticates (Bearer)');
+
+// M3: a malformed migration (to <= from) cannot loop-rewrite the record on every read.
+await J('joey', 'PUT', '/gadget', { attr: { label: 'Gadget', version: 5, fields: {
+  title: { kind: 'text', required: true }, name: { kind: 'text' }, status: { kind: 'text' }, slug: { kind: 'text' } } } });
+await J('joey', 'POST', '/migration', { id: 'gadget@bad', attr: { model: 'atom://gadget', from: 4, to: 4, op: 'default', spec: { field: 'noop', value: 1 } } });
+const lz = (await jsonOf('joey', '/log.byAtom?atom=atom://g1')).length;
+await jsonOf('joey', '/g1'); await jsonOf('joey', '/g1'); await jsonOf('joey', '/g1');
+ok((await jsonOf('joey', '/log.byAtom?atom=atom://g1')).length === lz && (await jsonOf('joey', '/g1')).lifecycle.modelVersion === 4, 'malformed migration is inert — no rewrite-on-read loop');
+
+// M4: an oversized request body is rejected, not buffered to exhaustion.
+ok(await code('joey', 'POST', '/widget', { attr: { name: 'x'.repeat(9 * 1024 * 1024) } }) === 413, 'oversized body rejected with 413');
+
+// L1: a self-embedding model renders without overflowing the stack.
+await J('joey', 'POST', '/model', { id: 'loopy', attr: { label: 'Loopy', version: 1, fields: { self: 'embed://loopy', n: { kind: 'text' } } } });
+ok((await J('joey', 'GET', '/loopy', null, { accept: 'text/html' })).status === 200, 'self-embedding model page renders (no stack overflow)');
+
+// L2: an id with HTML/URL metacharacters is rejected.
+ok(await code('joey', 'POST', '/widget', { id: '<script>', attr: { name: 'x' } }) === 400, 'unsafe id rejected');
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();
 ok((await jsonOf('joey', '/w1')).attr.name === 'Alpha', 'atom persists across restart');
 ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook-written field persists');
+// the migrated shape is durable — the rewrite was persisted, not recomputed each read
+g = await jsonOf('joey', '/g1');
+ok(g.attr.name === 'old value' && g.attr.status === 'active' && g.attr.slug === 'hello-world' && g.lifecycle.modelVersion === 4, 'migrated shape persists across restart');
 
 srv.kill();
 console.log(`\n${pass} passed, ${fail} failed`);
