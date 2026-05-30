@@ -48,7 +48,7 @@ a { color: var(--accent); text-decoration: none }
 a:hover { text-decoration: underline }
 
 /* a <figure> is the scroll container for any table */
-figure { margin: 14px 0; overflow-x: auto; max-width: 100%; background: var(--nest) }
+figure { margin: 14px 0; overflow-x: auto; max-width: 100%; background: var(--nest); border-radius: 1rem; padding: 1rem }
 table { width: 100%; border-collapse: separate; border-spacing: 0; background: transparent }
 th, td { text-align: left; vertical-align: top; white-space: nowrap }
 
