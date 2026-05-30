@@ -611,7 +611,7 @@ if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:at
 // the FAB: a floating select of the current route's peers, plus a home option
 function peerSelect(peers, current) {
   const opts = [`<option value="/">atom://0</option>`]
-    .concat(peers.map((p) => `<option value="/${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.label)}</option>`)).join('');
+    .concat(peers.map((p) => `<option value="/${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.id)} — ${esc(p.label)}</option>`)).join('');
   return `<select onchange="if(this.value)location.href=this.value">${opts}</select>`;
 }
 const modelPeers = (actor) => [...store.values()].filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map((a) => ({ id: a.id, label: a.attr.label || a.id }));
