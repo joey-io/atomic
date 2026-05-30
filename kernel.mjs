@@ -241,6 +241,7 @@ const canTouch = (actor, name) =>
 const canRead = (actor, target) => allows(actor, target, 'read');
 
 function redact(actor, atom) {
+  if (atom.id === '0') return atom; // the public root atom — the address everyone sees
   const modelId = refId(atom.model);
   const attr = {};
   for (const [k, v] of Object.entries(atom.attr || {})) {
@@ -472,25 +473,16 @@ function page(title, body, fab) {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
-<style>body{font:14px 'Google Sans Code',ui-monospace,'Cascadia Code',Menlo,monospace;margin:1.25rem;color:#111;max-width:100%;overflow-wrap:anywhere}
-a{color:#06c}.tw{overflow-x:auto;max-width:100%;border:1px solid #eee;border-radius:4px}
-table{border-collapse:collapse;width:auto}
+<style>
+body{font:14px 'Google Sans Code',ui-monospace,monospace;margin:1.25rem}
+.tw{overflow-x:auto;max-width:100%}
+table{border-collapse:collapse}
 td,th{border:1px solid #ddd;padding:4px 10px;text-align:left;white-space:nowrap}
-th{background:#f6f6f6;cursor:pointer;user-select:none}th:hover{background:#ececec}
-th[data-dir="1"]::after{content:" \\2191"}th[data-dir="-1"]::after{content:" \\2193"}
-h1{font-size:1.1rem}code{background:#f3f3f3;padding:1px 4px;border-radius:3px}
-input,select,textarea{font:inherit;padding:2px 4px}textarea{width:100%;min-width:22rem;resize:vertical}
-form table th{text-align:right;background:none;cursor:default;color:#555;font-weight:normal}
-form table th:hover{background:none}form table th::after{content:""}
-form table td{width:100%}form .tw{display:inline-block;border:0}
-.list{display:block}.item{border:1px solid #eee;border-radius:4px;padding:4px 6px;margin:3px 0}
-table.form.sub{margin:0;border:0}.addItem{margin-top:4px}
-select.fab{position:fixed;left:50%;bottom:1rem;transform:translateX(-50%);z-index:9;
-font:inherit;background:#111;color:#fff;border:0;border-radius:999px;padding:.6rem 1.2rem;
-max-width:250px;box-shadow:0 2px 8px rgba(0,0,0,.25);cursor:pointer}
-body{padding-bottom:5rem}</style>
+th{cursor:pointer}th[data-dir="1"]::after{content:" ↑"}th[data-dir="-1"]::after{content:" ↓"}
+form table th{text-align:right;cursor:default}form table th::after{content:""}
+</style>
+<p>${fab || peerSelect([], '')}</p>
 ${body}
-${fab || peerSelect(modelPeers(), '')}
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
@@ -518,44 +510,15 @@ function renderTable(modelId, atoms) {
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
 
-// atom://0 as the public, JSON-LD-shaped description of the app
-function appDescriptor(origin) {
-  const a = getAtom('0');
-  const cat = (m) => [...store.values()].filter((x) => x.model === m)
-    .map((x) => ({ '@id': ref(x.id), name: x.attr.label || x.id, url: `${origin}/${x.id}` }));
-  return {
-    '@context': 'https://schema.org',
-    '@type': 'WebAPI',
-    '@id': 'atom://0',
-    name: a.attr.name || 'Atomic',
-    description: a.attr.description || '',
-    provider: 'atom://joey',
-    models: cat('atom://model'),
-    indexes: cat('atom://index'),
-    potentialAction: { '@type': 'AuthenticateAction', target: `${origin}/auth`, method: 'magic-link' },
-  };
-}
-
-function renderApp(d) {
-  const li = (xs) => xs.map((x) => `<li>${esc(x.name)} <code>${esc(x['@id'])}</code></li>`).join('');
-  return page(d.name, `<p>${esc(d.description)}</p>
-<h1>Models</h1><ul>${li(d.models)}</ul>
-<h1>Indexes</h1><ul>${li(d.indexes)}</ul>
-<h1>Sign in</h1>
-<p><button data-email="amy@acme.com">Sign in as Amy (admin)</button>
-<button data-email="view@acme.com">Sign in as View (read-only contacts)</button></p>
-<form method="post" action="/auth">
-<p><label>or email <input name="email" type="email" placeholder="you@example.com"></label>
-<button>Send magic link</button></p></form>
-<script>
-document.querySelectorAll('button[data-email]').forEach(function(b){
-  b.onclick=async function(){
-    var r=await fetch('/auth',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:b.dataset.email})});
-    var j=await r.json();
-    if(j.link){location.href=j.link;}else{alert(j.error||'no token for that email');}
-  };
-});
-</script>`);
+// a form to create a session (sign in) — a session is itself an atom
+function sessionForm() {
+  return `<h2>create a session</h2>
+<p><button data-email="amy@acme.com">amy@acme.com (admin)</button>
+<button data-email="view@acme.com">view@acme.com (read-only)</button></p>
+<form method="post" action="/auth"><p>email <input name="email" type="email" placeholder="you@example.com"> <button>send magic link</button></p></form>
+<script>document.querySelectorAll('button[data-email]').forEach(function(b){b.onclick=async function(){
+var r=await fetch('/auth',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:b.dataset.email})});
+var j=await r.json();if(j.link){location.href=j.link;}else{alert(j.error||'no token');}};});</script>`;
 }
 
 // one form generated from the model's field kinds, with a method picker built
@@ -651,15 +614,15 @@ if(r.ok){location.href=method==='DELETE'?createUrl:(method==='POST'?createUrl:at
 function peerSelect(peers, current) {
   const opts = [`<option value="/">atom://0</option>`]
     .concat(peers.map((p) => `<option value="/${esc(p.id)}"${p.id === current ? ' selected' : ''}>${esc(p.label)}</option>`)).join('');
-  return `<select class="fab" onchange="if(this.value)location.href=this.value">${opts}</select>`;
+  return `<select onchange="if(this.value)location.href=this.value">${opts}</select>`;
 }
-const modelPeers = () => [...store.values()].filter((a) => a.model === 'atom://model').map((a) => ({ id: a.id, label: a.attr.label || a.id }));
-const indexPeers = () => [...store.values()].filter((a) => a.model === 'atom://index').map((a) => ({ id: a.id, label: a.attr.label || a.id }));
+const modelPeers = (actor) => [...store.values()].filter((a) => a.model === 'atom://model' && canTouch(actor, a.id)).map((a) => ({ id: a.id, label: a.attr.label || a.id }));
+const indexPeers = (actor) => [...store.values()].filter((a) => a.model === 'atom://index' && (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over)))).map((a) => ({ id: a.id, label: a.attr.label || a.id }));
 
 function renderModelPage(modelId, atoms, actor) {
   const m = getAtom(modelId);
   return page(`${m.attr.label || modelId} — ${atoms.length}`,
-    renderForm(modelId, null, actor) + renderTable(modelId, atoms), peerSelect(modelPeers(), modelId));
+    renderForm(modelId, null, actor) + renderTable(modelId, atoms), peerSelect(modelPeers(actor), modelId));
 }
 
 // cross-model table for indexes that span all models (over: atom://atom)
@@ -671,7 +634,7 @@ function renderCrossTable(atoms) {
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
 
-function renderIndexPage(indexAtom, atoms) {
+function renderIndexPage(indexAtom, atoms, actor) {
   const over = refId(indexAtom.attr.over);
   let body = over === 'atom' ? renderCrossTable(atoms) : renderTable(over, atoms);
   const pg = indexAtom.attr.page;
@@ -680,7 +643,7 @@ function renderIndexPage(indexAtom, atoms) {
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
     body += `<p><a href="/${indexAtom.id}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, peerSelect(indexPeers(), indexAtom.id));
+  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, peerSelect(indexPeers(actor), indexAtom.id));
 }
 
 function renderAtom(atom, actor) {
@@ -690,16 +653,6 @@ function renderAtom(atom, actor) {
   const peers = [...store.values()].filter((a) => a.model === atom.model && a.lifecycle?.status !== 'retired')
     .map((a) => ({ id: a.id, label: a.manifest || a.attr?.name || a.id }));
   return page(atom.manifest || atom.id, body, peerSelect(peers, atom.id));
-}
-
-function renderHome(h) {
-  const models = h.models.map((m) =>
-    `<li><a href="/${m.id}">${esc(m.label)}</a> <code>atom://${m.id}</code></li>`).join('');
-  const idx = h.indexes.map((i) =>
-    `<li><a href="/${i.id}">${esc(i.label)}</a> <small>over ${esc(i.over)}</small></li>`).join('');
-  return page('Atomic', `<p>signed in as <code>${esc(h.actor)}</code> · ${h.atoms} atoms · ${h.ledger} in the ledger · <a href="/auth/logout">sign out</a></p>
-<h1>Models</h1><ul>${models || '<li><em>none visible</em></li>'}</ul>
-<h1>Indexes</h1><ul>${idx || '<li><em>none visible</em></li>'}</ul>`);
 }
 
 // ---------------------------------------------------------------------------
@@ -766,36 +719,27 @@ const server = http.createServer(async (req, res) => {
     const isAnon = actor.id === '0';
     const [head, ...segs] = path.split('.');
 
-    // anonymous caller -> the app describes itself at the root (atom://0, JSON-LD)
-    if (req.method === 'GET' && path === '' && isAnon) {
-      const d = appDescriptor(origin);
-      return send(200, wantsHtml ? renderApp(d) : d, wantsHtml);
+    // the root is atom://0 — render it like any atom; anon also gets a create-session form
+    if (req.method === 'GET' && path === '') {
+      const a = getAtom('0');
+      if (!wantsHtml) return send(200, a);
+      let body = `<p>id <code>0</code> · model ${atomValue(a.model)}</p>` + renderFields(a.attr || {});
+      body += isAnon ? sessionForm()
+        : `<p>signed in as ${atomValue(ref(actor.id))} · <a href="/auth/logout">sign out</a></p>`;
+      return send(200, page(a.manifest || 'atom://0', body, peerSelect(modelPeers(actor), '')), true);
     }
-    // no anonymous access to anything else: browsers land on the descriptor, APIs get 401
+    // no anonymous access beyond the root
     if (isAnon) {
       if (wantsHtml) return redirect('/');
       return send(401, { error: 'authenticate: POST /auth { email } or Authorization: Bearer <token>' });
     }
 
     if (req.method === 'GET') {
-      if (path === '') {
-        const models = [...store.values()]
-          .filter((a) => a.model === 'atom://model' && canTouch(actor, a.id))
-          .map((a) => ({ id: a.id, label: a.attr.label || a.id, url: `/${a.id}` }));
-        const indexes = [...store.values()]
-          .filter((a) => a.model === 'atom://index' &&
-            (canTouch(actor, a.id) || canTouch(actor, refId(a.attr.over))))
-          .map((a) => ({ id: a.id, label: a.attr.label || a.id, over: a.attr.over, url: `/${a.id}` }));
-        const home = { atomic: 'minimal kernel', actor: ref(actor.id),
-          atoms: store.size, ledger: logSeq, models, indexes };
-        if (wantsHtml) return send(200, renderHome(home), true);
-        return send(200, home);
-      }
       // atom://atom is the universal type — every atom, newest first
       if (head === 'atom' && segs.length === 0) {
         const atoms = sortBy([...store.values()].filter((a) => a.lifecycle?.status !== 'retired'), '-createdAt')
           .map((a) => redact(actor, a));
-        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms)), true);
+        if (wantsHtml) return send(200, page('atom — every atom', renderCrossTable(atoms), peerSelect(modelPeers(actor), '')), true);
         return send(200, atoms);
       }
       const headAtom = getAtom(head);
@@ -803,7 +747,7 @@ const server = http.createServer(async (req, res) => {
       let result;
       if (headAtom.model === 'atom://index') {
         const atoms = runIndex(headAtom, url.search, actor);
-        if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms), true);
+        if (wantsHtml) return send(200, renderIndexPage(headAtom, atoms, actor), true);
         result = atoms;
       } else if (headAtom.model === 'atom://model' && segs.length === 0) {
         const atoms = listModel(head, q, actor);
