@@ -630,8 +630,11 @@ const atomValue = (v) => {
 
 // render an atom's fields (a map) as the key/value atom table
 function renderFields(map) {
-  const rows = Object.entries(map)
-    .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${atomValue(v)}</td></tr>`).join('');
+  const rows = Object.entries(map).map(([k, v]) => {
+    const cell = (k === 'id' && typeof v === 'string' && !isRef(v))
+      ? `<a href="/${esc(v)}">atom://${esc(v)}</a>` : atomValue(v);
+    return `<tr><th>${esc(k)}</th><td>${cell}</td></tr>`;
+  }).join('');
   return `<div class="tw"><table>${rows}</table></div>`;
 }
 
