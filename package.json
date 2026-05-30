@@ -1,0 +1,10 @@
+{
+  "name": "atomic",
+  "version": "0.0.1",
+  "description": "Atomic — a data substrate where schema, data, identity, and the UI surface are all atoms.",
+  "type": "module",
+  "scripts": {
+    "start": "node kernel.mjs"
+  },
+  "license": "MIT"
+}
