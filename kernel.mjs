@@ -822,7 +822,7 @@ function page(title, body, fab, foot) {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/style.css?v=${CSS.length}">
-<header><h1><a href="/">Atomic</a></h1><p>${esc(getAtom('0').manifest || '')}</p>${foot ? `<p>${foot}</p>` : ''}</header>
+<header><h1><a href="/">Atomic</a></h1>${foot ? `<p>${foot}</p>` : ''}</header>
 <nav>${fab || ''}</nav>
 <main>${body}</main>
 <script src="/app.js?v=${APP.length}" defer></script>`;
