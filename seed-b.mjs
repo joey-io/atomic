@@ -14,12 +14,15 @@ await hook('census-district', 'census-district',
   [{ path: 'advocate.cd', mode: 'write' }, { path: 'census.*', mode: 'write' }]);
 
 // the "website" role: a reusable bundle of grants for public advocate intake —
-// write-only on the advocate fields a public form may submit, and nothing else.
+// write-only on the advocate fields a public form may submit, plus read on the
+// reference data such a form needs: states and congressional districts.
 await role('role-website', 'Website intake', [
   { path: 'advocate.name', mode: 'write' },
   { path: 'advocate.email', mode: 'write' },
   { path: 'advocate.address', mode: 'write' },
   { path: 'advocate.district', mode: 'write' },
+  { path: 'census.**', mode: 'read' },   // congressional districts (all fields)
+  { path: 'state.**', mode: 'read' },    // US states (all fields)
 ]);
 
 // CapConnect: open (one-click) login that wears the website role. Pure write-only

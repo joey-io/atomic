@@ -36,25 +36,12 @@ body {
   margin: 0;
 }
 header { max-width: 1120px; margin: 0 auto; padding: 24px 24px 0 }
-h1 { margin: 0; padding-bottom: 1rem; font-size: var(--title); font-weight: 700; letter-spacing: -.02em; line-height: 1.1 }
+h1 { margin: 0; font-size: var(--title); font-weight: 700; letter-spacing: -.02em; line-height: 1.1 }
 h1 a { color: var(--fg) }
 h1 a:hover { text-decoration: none }
-/* the atom mark — a small ASCII atom drawn to the right of the logo */
-h1 a::after {
-  content: " .---. \A( (o) )\A '---' ";
-  white-space: pre;
-  display: inline-block;
-  vertical-align: middle;
-  margin-left: .5em;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: .18em;
-  line-height: 1.05;
-  font-weight: 400;
-  color: var(--accent);
-}
 main { display: block; max-width: 1120px; margin: 0 auto; padding: 8px 24px 64px }
-nav { max-width: 1120px; margin: 0 auto; padding: 6px 24px 8px; display: flex; gap: var(--gap); align-items: center }
-footer { max-width: 1120px; margin: 0 auto; padding: 16px 24px 32px; color: var(--muted); font-size: .82rem; display: flex; gap: var(--gap); align-items: center; border-top: 1px solid var(--line) }
+nav { max-width: 1120px; margin: 0 auto; padding: 1rem 24px 8px; display: flex; gap: var(--gap); align-items: center }
+header p { margin: 0; color: var(--muted); font-size: .82rem }
 p { margin: 14px 0 }
 small { color: var(--muted) }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em }

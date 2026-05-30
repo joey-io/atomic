@@ -785,10 +785,9 @@ function page(title, body, fab, foot) {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/style.css?v=${CSS.length}">
-<header><h1><a href="/">Atomic</a></h1></header>
+<header><h1><a href="/">Atomic</a></h1>${foot ? `<p>${foot}</p>` : ''}</header>
 <nav>${fab || ''}</nav>
 <main>${body}</main>
-${foot ? `<footer>${foot}</footer>` : ''}
 <script>
 (function(){function num(s){return /^-?[\\d,]+(\\.\\d+)?$/.test(s)?parseFloat(s.replace(/,/g,'')):null;}
 document.querySelectorAll('table').forEach(function(t){
@@ -929,7 +928,7 @@ function navSelect(actor, current) {
     + `</select>`;
 }
 
-// the signed-in footer: identity + sign out, shown on every page once authed
+// the signed-in identity line (shown under the logo): who + sign out
 function footer(actor) {
   if (!actor || actor.id === '0') return '';
   return `signed in as ${atomValue(ref(actor.id), actor)} <a href="/auth/logout">sign out</a>`;
@@ -1017,6 +1016,7 @@ function referencedBy(atom, actor) {
   const target = ref(atom.id), out = [];
   for (const a of getStore(actor).all()) {
     if (a.id === atom.id || a.lifecycle?.status === 'retired') continue;
+    if (!canSee(actor, a.id)) continue;   // only backlinks the actor may actually read
     for (const via of findRefs(a.attr, target, '')) out.push({ id: a.id, model: refId(a.model), via, label: a.manifest || a.attr?.name || a.id });
     for (const via of findRefs(a.lifecycle, target, '')) out.push({ id: a.id, model: refId(a.model), via: `lifecycle.${via}`, label: a.manifest || a.attr?.name || a.id });
   }
