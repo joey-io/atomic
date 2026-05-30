@@ -51,9 +51,11 @@ An atom is a raw data record. Every atom has the same five fields.
 
 `id` is opaque and never changes. References stay valid when data changes. Domain timestamps such as `closedAt` go in `attr`. `lifecycle` holds operational metadata only.
 
+`createdBy` and `updatedBy` are the tokens that wrote the atom — the actors defined in Identity and access. When `lifecycle` is written as a bare reference such as `"lifecycle": "atom://0"`, it is shorthand: the atom was created by that token — here `atom://0`, the root — and carries default operational metadata. The kernel models use this shorthand because `atom://0` created them.
+
 ## Model
 
-A model is an atom that defines a type. It lists the type's fields, indexes, and rules. The kernel's own types — `model`, `index`, `hook`, `migration`, `token`, `config`, `file`, `log`, `plugin`, `tenant` — are themselves model atoms.
+A model is an atom that defines a type. It lists the type's fields, indexes, and rules. The kernel's own types are themselves model atoms, listed under Kernel atoms below.
 
 An atom names its model with the `model` pointer. The kernel uses that pointer to decide which rules, indexes, and migrations apply. On every write, the kernel validates the atom's `attr` against the model's `fields`. Validation is schema validation: it checks field kinds, `required`, `unique`, enum values, and defaults. A model is a Zod schema in this sense. The pointer answers "what type is this atom"; the schema answers "is this atom valid."
 
@@ -397,7 +399,29 @@ Edges that point at a person — `deal.owner`, `lifecycle.createdBy` — referen
 
 ### atom://0 — the root
 
-`atom://0` is the first atom: the root token. It is the only token scoped to the core models — `model`, `index`, `token`, `tenant`, `migration`, and the rest of the kernel types. It created them, which is why every kernel atom's `lifecycle` is `atom://0`. Only `atom://0`, or a token it has granted that scope, can create atoms of the core types. An application token descends from `atom://0` with narrower grants: it can create contacts and deals, but not new token, tenant, or model types. Every capability in the system traces back to `atom://0`, and the chain is in the log.
+`atom://0` is the first token. It holds `**` and is the origin of the core models — `model`, `index`, `token`, `tenant`, `migration`, and the rest of the kernel types — which carry `atom://0` as their `createdBy`. Only `atom://0`, or a token it has granted that scope, can create atoms of the core types. An application token descends from `atom://0` with narrower grants: it can create contacts and deals, but not new model, token, or tenant types. Every capability traces back to `atom://0`, and the chain is in the log.
+
+`atom://0` is not special-cased. Like every atom it has a lifecycle, and it was created by `atom://joey` — the founding operator, written when the store is initialized. The regress ends there: the install seeds `atom://joey` and `atom://0` together.
+
+```json
+{
+  "id": "0",
+  "model": "atom://token",
+  "manifest": "Root token",
+  "attr": {
+    "grants": [
+      { "path": "**", "mode": "write" }
+    ]
+  },
+  "lifecycle": {
+    "status": "active",
+    "version": 1,
+    "modelVersion": 1,
+    "createdAt": "2026-01-01T00:00:00Z",
+    "createdBy": "atom://joey"
+  }
+}
+```
 
 ### Attenuation
 
@@ -417,7 +441,7 @@ Every atom records the token that created it in `lifecycle.createdBy` and the to
 
 ### Tenant
 
-A tenant is the organization and the isolation boundary. A token belongs to one tenant. New atoms are created in the token's tenant, and access across tenants is denied unless a grant allows it. The tenant's tokens are its members, reached through the inverse of `token.tenant`.
+A tenant is the organization and the isolation boundary. A token belongs to one tenant. New atoms are created in the token's tenant, and access across tenants is denied unless a grant allows it. An atom's tenant is its creator's tenant — `createdBy.tenant` — so it is not stored on the atom separately. The tenant's tokens are its members, reached through the inverse of `token.tenant`.
 
 ### Grants
 
@@ -478,6 +502,8 @@ Each record stores the `modelVersion` it was written under. When a record is beh
 ## Example: CRM
 
 Three models define a CRM. `contact` and `deal` hold an `atom://company` edge. The `inverse` on each edge makes `company.contacts` and `company.deals` queryable without a separate declaration. `company.owner` references the token that owns the account (`atom://tok-amy`) and is used by the contact write rule. `company.hq` embeds an address with `embed://address`. The models below show optional `display` hints; the kernel would render them from field kinds without those hints.
+
+The model definitions are created by `atom://0` — defining a type needs `model` scope, which only the root and the tokens it grants hold. The records that follow are created by `atom://tok-amy`, an application token without that scope.
 
 ### Models
 
@@ -795,7 +821,7 @@ A public website collects signups. The form is a model atom that embeds the cont
       }
     },
     "rules": {
-      "read": "actor.team == 'sales'",
+      "read": "actor.tenant == atom://acme",
       "write": "true"
     }
   },
@@ -803,7 +829,7 @@ A public website collects signups. The form is a model atom that embeds the cont
 }
 ```
 
-`write: "true"` lets anyone submit. `read` keeps submissions internal to the sales team.
+`write: "true"` lets anyone submit, including an unauthenticated caller. `read` keeps submissions internal to the tenant.
 
 The form is made from the contact model. Because `contact` is `embed://contact`, the person inputs come straight from the contact model's fields. The contact model is defined once and drives both the CRM's contact records and this public form. The `source` and `consent` fields are added by the registration model on top of the embedded contact.
 
@@ -830,7 +856,7 @@ curl -X POST https://crm.example/registration \
   }'
 ```
 
-The kernel validates the embedded `contact` values against the contact model, fills `source` from its default, generates `id` and `lifecycle`, and stores the registration. The stored record holds resolved values, with no `embed://` string and no `id` or `lifecycle` on the embedded contact:
+The kernel validates the embedded `contact` values against the contact model, fills `source` from its default, generates `id` and `lifecycle` — `createdBy` is the anonymous token `atom://anon`, since the rule permits public writes — and stores the registration. The stored record holds resolved values, with no `embed://` string and no `id` or `lifecycle` on the embedded contact:
 
 ```json
 {
@@ -859,7 +885,7 @@ The kernel validates the embedded `contact` values against the contact model, fi
 
 ## Example: outreach through the API
 
-Outreach needs no special webhook. An external system is an API caller. It authenticates with a token, and the token carries grants. The outreach tool's token has one grant: write to the contact model.
+Outreach needs no special webhook. An external system is an API caller. It authenticates with a token, and the token carries grants. The outreach tool's token has one grant: write to the contact model. An admin token (`atom://tok-amy`) issued it, so by attenuation its grant is a subset of that admin's — its `createdBy` is that admin, not the root.
 
 ```json
 {
@@ -875,7 +901,7 @@ Outreach needs no special webhook. An external system is an API caller. It authe
       }
     ]
   },
-  "lifecycle": "atom://0"
+  "lifecycle": "atom://tok-amy"
 }
 ```
 
