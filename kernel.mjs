@@ -416,19 +416,25 @@ function runIndex(indexAtom, search, actor) {
 // ---------------------------------------------------------------------------
 
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-// a cell renders refs as links, scalars as text, and sub-objects as nested
-// tables (the same component as the parent), recursively
-const cell = (v) => {
+
+// The atom component. Everything rendered is an atom: a value is a ref (a link
+// to another atom), a scalar, a list, or an atom inside an atom (an embedded
+// map) — which renders with this same component, recursively.
+const atomValue = (v) => {
   if (v == null) return '';
   if (isRef(v)) return `<a href="/${esc(refId(v))}">${esc(v)}</a>`;
   if (Array.isArray(v))
-    return v.every((x) => typeof x !== 'object' || isRef(x)) ? v.map(cell).join(', ') : v.map(cell).join('');
-  if (typeof v === 'object') {
-    const rows = Object.entries(v).map(([k, val]) => `<tr><th>${esc(k)}</th><td>${cell(val)}</td></tr>`).join('');
-    return `<div class="tw"><table>${rows}</table></div>`;
-  }
+    return v.every((x) => typeof x !== 'object' || isRef(x)) ? v.map(atomValue).join(', ') : v.map(atomValue).join('');
+  if (typeof v === 'object') return renderFields(v); // an atom inside an atom
   return esc(v);
 };
+
+// render an atom's fields (a map) as the key/value atom table
+function renderFields(map) {
+  const rows = Object.entries(map)
+    .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${atomValue(v)}</td></tr>`).join('');
+  return `<div class="tw"><table>${rows}</table></div>`;
+}
 
 function page(title, body) {
   return `<!doctype html><meta charset=utf8>
@@ -468,7 +474,7 @@ function renderTable(modelId, atoms) {
   const head = ['id', ...cols].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
     `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td>` +
-    cols.map((c) => `<td>${cell(a.attr?.[c])}</td>`).join('') + '</tr>').join('');
+    cols.map((c) => `<td>${atomValue(a.attr?.[c])}</td>`).join('') + '</tr>').join('');
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
 
@@ -495,10 +501,21 @@ function renderApp(d) {
   return page(d.name, `<p>${esc(d.description)}</p>
 <h1>Types</h1><ul>${li(d.models)}</ul>
 <h1>Queries</h1><ul>${li(d.indexes)}</ul>
-<h1>Sign in</h1><form method="post" action="/auth">
-<p><label>email <input name="email" type="email" placeholder="amy@acme.com"></label></p>
-<button>Send magic link</button></form>
-<p><small>demo: <code>amy@acme.com</code> (admin) · <code>view@acme.com</code> (read-only contacts)</small></p>`);
+<h1>Sign in</h1>
+<p><button data-email="amy@acme.com">Sign in as Amy (admin)</button>
+<button data-email="view@acme.com">Sign in as View (read-only contacts)</button></p>
+<form method="post" action="/auth">
+<p><label>or email <input name="email" type="email" placeholder="you@example.com"></label>
+<button>Send magic link</button></p></form>
+<script>
+document.querySelectorAll('button[data-email]').forEach(function(b){
+  b.onclick=async function(){
+    var r=await fetch('/auth',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:b.dataset.email})});
+    var j=await r.json();
+    if(j.link){location.href=j.link;}else{alert(j.error||'no token for that email');}
+  };
+});
+</script>`);
 }
 
 // add form generated from the model's field kinds; POSTs JSON with the session cookie
@@ -537,7 +554,7 @@ function renderModelPage(modelId, atoms, actor) {
 function renderCrossTable(atoms) {
   const head = ['id', 'model', 'manifest', 'createdAt'].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = atoms.map((a) =>
-    `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td><td>${cell(a.model)}</td>` +
+    `<tr><td><a href="/${esc(a.id)}">${esc(a.id)}</a></td><td>${atomValue(a.model)}</td>` +
     `<td>${esc(a.manifest || '')}</td><td>${esc(a.lifecycle?.createdAt || '')}</td></tr>`).join('');
   return `<div class="tw"><table><tr>${head}</tr>${rows}</table></div>`;
 }
@@ -555,9 +572,7 @@ function renderIndexPage(indexAtom, atoms) {
 }
 
 function renderAtom(atom) {
-  const rows = Object.entries(atom.attr || {})
-    .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${cell(v)}</td></tr>`).join('');
-  return page(atom.manifest || atom.id, `<div class="tw"><table>${rows}</table></div>`);
+  return page(atom.manifest || atom.id, renderFields(atom.attr || {}));
 }
 
 function renderHome(h) {
