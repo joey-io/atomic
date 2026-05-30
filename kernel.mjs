@@ -603,7 +603,12 @@ function bootstrap() {
   seed({ id: 'tok-outreach', model: 'atom://token', manifest: 'Outreach integration',
     attr: { tenant: 'atom://acme', grants: [{ path: 'contact.*', mode: 'write' }] }, lifecycle: lc('tok-amy') });
   seed({ id: 'anon', model: 'atom://token', manifest: 'Anonymous public caller',
-    attr: { grants: [{ path: 'registration.*', mode: 'write' }] }, lifecycle: lc('0') });
+    attr: { grants: [
+      { path: 'company.*', mode: 'read' },
+      { path: 'contact.*', mode: 'read' },
+      { path: 'deal.*', mode: 'read' },
+      { path: 'registration.*', mode: 'write' },
+    ] }, lifecycle: lc('0') });
 
   // demo records — so the live instance has data to navigate (in-memory: reseeded each start)
   seed({ id: 'northwind', model: 'atom://company', manifest: 'Northwind Traders, enterprise account',
