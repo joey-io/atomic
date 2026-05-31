@@ -63,6 +63,9 @@ npm start
 # durable: point ATOMIC_STORE at a directory (creates <dir>/atoms.db, WAL mode)
 ATOMIC_STORE=./data npm start
 
+# scale-out: point ATOMIC_DB at a Postgres URL (needs the optional `pg` dependency)
+ATOMIC_DB=postgres://localhost/atomic npm start
+
 # load four demo tenants (a PAC, an advocacy program, a hybrid, a household)
 npm run seed
 
