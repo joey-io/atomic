@@ -370,8 +370,26 @@ const embedOf = (def) =>
 
 class Err extends Error { constructor(code, msg) { super(msg); this.code = code; } }
 
-async function getAtom(id) {
+// Control-plane cache. The few atoms read over and over for every decision — the
+// schema (models), identity (tokens, roles), retention (policies, conditions),
+// tenancy (tenants), and queries/automations (indexes, hooks, migrations) — are
+// small and change rarely, yet a list re-reads the same policy/condition/tenant once
+// per row. Caching them turns those repeats into Map hits instead of a store round-
+// trip + JSON parse each (the per-atom fan-out the async refactor made expensive).
+// Data atoms are never cached. Kept fresh on write (persist/seed); single-process,
+// like the other gen-keyed memos. getCached returns atom-or-undefined (no throw).
+const _ctl = new Map();
+const CONTROL_MODELS = new Set(['atom://model', 'atom://token', 'atom://role', 'atom://policy',
+  'atom://condition', 'atom://tenant', 'atom://index', 'atom://hook', 'atom://migration']);
+async function getCached(id) {
+  const c = _ctl.get(id);
+  if (c !== undefined) return c;
   const a = await store.get(id);
+  if (a && CONTROL_MODELS.has(a.model)) _ctl.set(id, a);
+  return a;
+}
+async function getAtom(id) {
+  const a = await getCached(id);
   if (!a) throw new Err(404, `no atom ${id}`);
   return a;
 }
@@ -386,7 +404,7 @@ let storeGen = 0;
 // Put an atom straight into the store (bootstrap / seed — bypasses checks).
 // Every write funnels a log atom through seed(), so bumping here invalidates
 // the read memos after any mutation, not just direct seeds.
-async function seed(atom) { await store.set(atom.id, atom); if (store.setIndex) await store.setIndex(atom.id, await shardOf(atom), atom.model, await indexRows(atom)); storeGen++; return atom; }
+async function seed(atom) { await store.set(atom.id, atom); if (store.setIndex) await store.setIndex(atom.id, await shardOf(atom), atom.model, await indexRows(atom)); if (CONTROL_MODELS.has(atom.model)) _ctl.set(atom.id, atom); storeGen++; return atom; }
 
 // ---------------------------------------------------------------------------
 // Inverse-edge registry (built from model atoms)
@@ -791,7 +809,7 @@ async function tenantOf(atom) {
     if (cur.model === 'atom://tenant') { val = cur.id; break; }
     const p = cur.lifecycle?.parent;
     if (!isRef(p) || refId(p) === cur.id) break;
-    cur = await store.get(refId(p));
+    cur = await getCached(refId(p));
   }
   _tenant.set(atom.id, { gen: storeGen, val });
   return val;
@@ -1095,7 +1113,7 @@ async function indexRows(atom) {
   return rows;
 }
 // durable write-back; also refreshes the atom's secondary-index rows. Bumps the gen.
-async function persist(atom) { await store.set(atom.id, atom); if (store.setIndex) await store.setIndex(atom.id, await shardOf(atom), atom.model, await indexRows(atom)); storeGen++; }
+async function persist(atom) { await store.set(atom.id, atom); if (store.setIndex) await store.setIndex(atom.id, await shardOf(atom), atom.model, await indexRows(atom)); if (CONTROL_MODELS.has(atom.model)) _ctl.set(atom.id, atom); storeGen++; }
 
 // --- Transactions. A batch of mutations that commits all-or-nothing. Each store
 // driver implements transact(fn): runs fn inside one transaction (SQLite/Postgres
@@ -1118,7 +1136,7 @@ async function tx(fn) {
   try {
     return await store.transact(async () => {
       try { return await fn(); }
-      catch (e) { storeGen++; throw e; }         // reverted state invalidates the read memos
+      catch (e) { storeGen++; _ctl.clear(); throw e; } // reverted state invalidates the read memos + the control cache
     });
   } finally { _txDepth--; release(); }
 }
@@ -1533,11 +1551,11 @@ function evalCondition(atom, cond) {
 async function isExpired(atom) {
   const exp = atom?.lifecycle?.expiration;
   if (!exp) return false;
-  const pol = await store.get(isRef(exp) ? refId(exp) : exp);
+  const pol = await getCached(isRef(exp) ? refId(exp) : exp);
   const conds = pol?.attr?.conditions;
   if (!Array.isArray(conds) || !conds.length) return false;   // no conditions → never
   for (const c of conds)
-    if (!evalCondition(atom, await store.get(isRef(c) ? refId(c) : c))) return false;
+    if (!evalCondition(atom, await getCached(isRef(c) ? refId(c) : c))) return false;
   return true;
 }
 
