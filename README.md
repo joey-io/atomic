@@ -1,6 +1,7 @@
 # Atomic
 
-> A data substrate where schema, data, identity, permissions, queries, and the UI are all the same shape — an **atom**.
+> One record shape for everything — data, schema, identity, permissions, queries, the
+> audit log, even the UI. Each is an **atom**, and one kernel governs them all.
 
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
@@ -8,48 +9,52 @@
 ![tests](https://img.shields.io/badge/tests-148%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Atomic is a dependency-free, single-file kernel for graph-relational data. Every record — a row of data, a type definition, a permission grant, a saved query, an audit-log entry, even a test — is one shape:
+Atomic is a single-file, dependency-free kernel for graph-relational data. Every record it
+holds — a row of data, a type definition, a permission grant, a saved query, an audit-log
+entry, even a test — is the same shape:
 
 ```json
 { "id": "...", "model": "atom://...", "manifest": "...", "attr": { }, "lifecycle": { } }
 ```
 
-One kernel validates, stores, queries, permissions, and renders all of them. There is no separate ORM, API layer, query builder, or UI framework, and no generated code to keep in sync. The HTTP API and the web UI are both generated from the same atoms.
+One kernel validates, stores, queries, permissions, and renders all of them. The HTTP API
+and the web UI are both generated from the atoms themselves, so there is no separate ORM,
+query builder, permission system, or UI framework to wire together — and no generated code
+to keep in sync. The whole thing is `atomic.mjs`: about 2,900 lines, zero required
+dependencies.
 
-The whole kernel is `atomic.mjs` (~2,800 lines, zero required dependencies). Persistence is embedded SQLite via Node's built-in `node:sqlite` — a single file, no `node_modules` — or, for scale-out, Postgres (the one optional dependency, loaded only when `ATOMIC_DB` is set).
-
----
-
-## Contents
-
-[Features](#features) · [Quick start](#quick-start) · [Concepts](#concepts) · [HTTP API](#http-api) · [Identity & access](#identity--access) · [Lifecycle](#lifecycle-hooks-expiration-migration) · [The generated UI](#the-generated-ui) · [Persistence](#persistence) · [Configuration](#configuration) · [Scripts](#scripts) · [Testing & governance](#testing--governance) · [Project layout](#project-layout) · [Status](#status) · [License](#license)
+[Why](#why) · [Quick start](#quick-start) · [Concepts](#concepts) · [How it works](#how-it-works) · [HTTP API](#http-api) · [Identity & access](#identity--access) · [Lifecycle](#lifecycle) · [The generated UI](#the-generated-ui) · [Persistence](#persistence) · [Configuration](#configuration) · [CLI](#cli) · [Testing & governance](#testing--governance) · [Status](#status) · [License](#license)
 
 ---
 
-## Features
+## Why
 
-- **One shape, one format.** Records, schema, identity, permissions, queries, migrations, the audit log, and tests are all atoms of plain JSON, addressed the same way (`atom://id`).
-- **Schema as data.** A `model` atom defines a type's fields, validation, indexes, and rules. Validation is Zod-style: kinds, `required`, `unique`, enums, ranges, patterns, and semantic formats (`email`/`url`/`uuid`).
-- **Reusable shapes.** `embed://<model>` inlines another model's fields as a first-class, reusable schema fragment — addressable, requireable, and flattened into dotted columns in CSV.
-- **Typed edges.** `ref` fields are graph edges; declaring an `inverse` makes backlinks queryable. Dotted **paths** (`/<id>.field.edge…`) traverse the graph under the reader's permissions.
-- **Permissions as data.** `grant` and `role` atoms; a token's effective grants are its own plus its roles'. Tenancy is structural (`lifecycle.parent`) — the tree decides who may write.
-- **Index-backed reads.** Declare a field `filterable`/`sortable` and the kernel maintains a generic secondary index over it (plus built-in `createdAt`/`updatedAt`); filtering, range, sort, and pagination are then pushed entirely into SQL — a read never materializes the model's full set, so a filtered/sorted page over a 100M-row model stays milliseconds, scoped per tenant. (Above the store port: the index holds opaque `(model, field, value, id)` rows; the store never learns the schema. Under `ATOMIC_KEY`, values are blind-hashed — equality only, no range/sort.)
-- **Transactions.** `POST /tx` applies a batch of writes all-or-nothing; any failure rolls the whole batch back.
-- **Referential integrity.** A `ref` field carries an `onDelete` policy — `restrict` (the default: refuse to delete a still-referenced atom), `cascade` (delete the referrers too), or `null` (clear the referring cells). Enforced at delete time, inside the transaction, so a base can never end up pointing at a ghost — and a half-applied cascade can't corrupt it. (Honored on declared `inverse` edges, so the append-only ledger's own refs aren't treated as edges.)
-- **One-click bases.** `POST /base { name }` (or `node atomic.mjs --new-base "<name>"`) provisions a tenant + an open-login token in one transaction and returns a **share URL** — open it and you're one-clicked into that base as a full, tenant-confined session. A base is also one file: `node atomic.mjs --export-base <tenant> > base.ndjson`.
-- **Hooks.** Capability atoms that run a vetted server script on create/update/delete under their *own* grants.
-- **Lazy lifecycle.** Non-destructive expiration (retention policies) and forward-only schema migration, both applied on read.
-- **CSV import/export**, generated from the model, with an optional atomic (transactional) import.
-- **Editable grid.** Every model table is inline-editable exactly where the viewer holds an update grant — single-field `PATCH` with optimistic concurrency.
-- **Self-tests & governance.** `--check` runs the substrate's own acceptance tests (which are themselves atoms); `--audit` is a structural fsck.
-- **Durable, ACID, optionally encrypted at rest** (AES-256-GCM) — or purely in-memory.
-- **Hardened HTTP surface**: strict CSP, security headers, `HttpOnly`/`SameSite` session cookies, no email-enumeration oracle, size-capped bodies.
+A typical application splits one idea across many representations: a SQL schema, an ORM, a
+stack of migration files, a REST or GraphQL layer, a permissions module, a UI framework, and
+the generated glue that holds them together. Every boundary between those layers is a place
+where they can drift apart, and most of the work of building software is keeping them aligned.
+
+Atomic removes the boundaries. There is one record — the atom — and the things that would
+normally be *other systems* are just more atoms:
+
+- A **type** is an atom (a `model`). The schema is data you can read, query, diff, and migrate
+  with the same tools you use on everything else.
+- A **permission** is an atom (a `grant`). Access control is data, not code.
+- A **saved query** is an atom (a `query`). So is the **audit log**, a **migration**, and a
+  **test**.
+
+Because the schema is data, the API and the UI are *derived* from it at request time rather
+than generated to disk. Define a model and you immediately have a validated REST endpoint, a
+CSV import/export, a permission surface, and a rendered, editable web page for it — with
+nothing to regenerate and nothing to fall out of sync. That is the entire bet: **collapse the
+stack into one shape, and let one kernel govern it.**
 
 ---
 
 ## Quick start
 
-**Requirements:** Node ≥ 22.5 (for `node:sqlite`). Node ≥ 24 runs it unflagged; on 22.x the SQLite binding is behind an experimental flag (in-memory mode needs nothing).
+**Requirements:** Node ≥ 22.5 (for the built-in `node:sqlite`). Node ≥ 24 runs it unflagged;
+on 22.x the SQLite binding is behind an experimental flag. In-memory mode needs nothing.
 
 ```bash
 # in-memory (nothing persists) — http://localhost:3040
@@ -58,30 +63,35 @@ npm start
 # durable: point ATOMIC_STORE at a directory (creates <dir>/atoms.db, WAL mode)
 ATOMIC_STORE=./data npm start
 
-# run the test suite, the self-tests, and the governance audit
-npm test         # 148 assertions over HTTP
-npm run check    # the kernel's own test atoms
-npm run audit    # structural invariants (exits non-zero on any finding)
-
 # load four demo tenants (a PAC, an advocacy program, a hybrid, a household)
 npm run seed
+
+# verify
+npm test         # 148 black-box HTTP assertions
+npm run check    # the kernel's own tests, which are themselves atoms
+npm run audit    # structural invariants (exits non-zero on any finding)
 ```
 
-**Authentication.** A token's public id is never a credential. Humans sign in by magic-link (`POST /auth { email }` → a link → a session cookie; in dev with no mailer configured, the link is returned in the response). Integrations present a token's **API secret** as `Authorization: Bearer <secret>` — minted and shown **once** when the token is created. The admin can also be given a fixed secret via the `ATOMIC_ADMIN_SECRET` env var (used by `npm run seed` and CI); otherwise the admin is magic-link only.
+**Signing in.** A token's public id is never a credential. Humans sign in by magic-link
+(`POST /auth { email }` → a link → a session cookie; with no mailer configured in dev, the
+link is returned in the response). Integrations present a token's **API secret** as
+`Authorization: Bearer <secret>` — shown once when the token is created. An admin can be given
+a fixed secret via `ATOMIC_ADMIN_SECRET` (used by `npm run seed` and CI); otherwise the admin
+is magic-link only.
 
 ---
 
 ## Concepts
 
-Atomic has six primitives:
+Atomic has six primitives.
 
 | Primitive | What it is |
 |-----------|------------|
-| **Atom**  | A record: `{ id, model, manifest, attr, lifecycle }`. |
-| **Model** | An atom that defines a type — its fields, indexes, and rules. Validates an atom's `attr` on write. |
-| **Index** | An atom describing a stored query or constraint over a model's atoms. |
-| **Path**  | A dotted expression that reads across fields and edges. |
-| **Logic** | A rule (path predicate) or a transform (a vetted handler / hook). |
+| **Atom**  | A record: `{ id, model, manifest, attr, lifecycle }`. Everything is one. |
+| **Model** | An atom that defines a type — its fields, validation, and rules. Validates an atom's `attr` on write. |
+| **Query** | An atom describing a saved query over a model's atoms — `{ over, match, sort, page }` — run by id and rendered as a table. |
+| **Path**  | A dotted expression that reads across fields and edges, under the reader's permissions. |
+| **Logic** | A rule (a path predicate) or a transform (a vetted handler / hook). |
 | **Log**   | An append-only atom recording every change. |
 
 ### The atom
@@ -107,15 +117,19 @@ Atomic has six primitives:
 }
 ```
 
-- `id` — opaque, immutable. The reference route is `atom://id`.
-- `model` — pointer to the model atom that defines this record's type.
-- `manifest` — free-text label, full-text indexed.
-- `attr` — the record's values; the model validates them. `ref` values are edges.
-- `lifecycle` — kernel-managed: status, version (write count), `modelVersion`, `parent` (tenant), and created/updated actor + time.
+- `id` — opaque and immutable. The reference to this atom is `atom://7b8f-2f0c`.
+- `model` — a pointer to the model atom that defines this record's type.
+- `manifest` — a free-text label, full-text indexed.
+- `attr` — the record's values; the model validates them. A value that is an `atom://` ref is
+  a graph edge.
+- `lifecycle` — kernel-managed: status, version (a write counter), the `modelVersion` the atom
+  was written under, the `parent` (its tenant), and the creating/updating actor and time.
 
 ### The model
 
-A model is an atom whose `attr.fields` declares the type. The kernel's own types (`model`, `token`, `index`, `log`, …) are themselves model atoms.
+A model is an atom whose `attr.fields` declares a type. The kernel's own types — `model`,
+`token`, `query`, `log`, and the rest — are themselves model atoms, which is what makes the
+schema queryable.
 
 ```json
 {
@@ -132,33 +146,74 @@ A model is an atom whose `attr.fields` declares the type. The kernel's own types
 }
 ```
 
-**Field kinds:** `text`, `longtext`, `email`, `url`, `uuid`, `datetime`, `integer`, `number`, `boolean`, `enum` (`values`), `ref` (`to`, `inverse`, `onDelete`), `list` (`of`), `map`, `json`, and `embed` (`of`). Common modifiers: `required`, `unique`, `default`, `min`/`max`, `minLength`/`maxLength`, `pattern`, enum `values`, and `filterable`/`sortable` (index the field — see Index-backed reads).
+**Field kinds:** `text`, `longtext`, `email`, `url`, `uuid`, `datetime`, `integer`, `number`,
+`boolean`, `enum` (`values`), `ref` (`to`, `inverse`, `onDelete`), `list` (`of`), `map`,
+`json`, and `embed` (`of`). Common modifiers: `required`, `unique`, `default`, `min`/`max`,
+`minLength`/`maxLength`, `pattern`, and `filterable`/`sortable` (index the field — see
+[indexed reads](#how-it-works)).
 
 ### References: `atom://` vs `embed://`
 
-- **`atom://x`** — an edge to a standalone, shareable atom. Stored as a live link; reads see `x`'s current values.
-- **`embed://x`** (or `{ kind: "embed", of: "atom://x", required: true }`) — inline another model's shape here. The values are stored in the parent's `attr` and validated against `x`; they carry no `id` or `lifecycle`. The *same* shape can be reused under multiple fields (`home` and `work` both `embed://address`).
+- **`atom://x`** is an edge to a standalone, shareable atom. It is stored as a live link, and
+  reads see `x`'s current values. Declaring an `inverse` on the field makes the backlink
+  queryable.
+- **`embed://x`** (equivalently `{ kind: "embed", of: "atom://x" }`) inlines another model's
+  shape directly into this atom. The values live in the parent's `attr`, are validated against
+  `x`, and carry no `id` or `lifecycle` of their own. The *same* shape can be reused under
+  multiple fields — `home` and `work` can both be `embed://address`.
+
+---
+
+## How it works
+
+Every request runs through the same short pipeline, regardless of whether it touches a
+contact, a permission grant, or a model definition:
+
+```
+resolve actor → validate against the model → check grants (per field)
+              → run hooks → append to the log → project (redact) → render (JSON or HTML)
+```
+
+Nothing in that pipeline is specific to a type. A `model` is validated and permissioned by
+exactly the same code that validates and permissions a `contact`, because both are atoms and
+the rules for each live in *their* model.
+
+**Storage is a port, not the product.** The kernel talks to storage through one narrow seam —
+read a set of atoms for an actor, write an atom, watch a model for change — and nothing above
+that seam knows where the bytes live. That makes the backend a swap: in-memory, embedded
+SQLite, or Postgres, with no change to validation, permissions, or rendering. The store holds
+opaque rows; it never learns what a `contact` *is*. All meaning stays in the kernel.
+
+**Indexed reads.** Declare a field `filterable` or `sortable` and the kernel maintains a
+generic secondary index over it (alongside built-in `createdAt`/`updatedAt`). Filtering,
+range, sort, and pagination are then pushed entirely into the store, so a read never
+materializes a model's full set — a filtered, sorted page over a 100M-row model stays in the
+millisecond range and is always scoped to one tenant. Above the store port the index is just
+opaque `(model, field, value, id)` rows; the store still learns nothing about the schema.
 
 ---
 
 ## HTTP API
 
-The surface is generated from the atoms. HTTP method maps to an operation, gated by the actor's grants:
+The surface is generated from the atoms. The HTTP method selects an operation, and the
+operation is gated by the actor's grants.
 
 | Method | Operation | Notes |
 |--------|-----------|-------|
-| `GET /<id>` | read | the atom (HTML with `Accept: text/html`, else JSON) |
-| `GET /<model>` | list | the model's atoms; `field=v`, `field>=n`, `sort=-field`, `limit`, `cursor`, CSV (index-backed on declared fields) |
+| `GET /<id>` | read | the atom (HTML with `Accept: text/html`, otherwise JSON) |
+| `GET /<model>` | list | the model's atoms; `field=v`, `field>=n`, `sort=-field`, `limit`, `cursor`, CSV (indexed on declared fields) |
 | `GET /<id>.<field>.<edge>…` | path read | traverse edges under the reader's permissions |
+| `GET /<query-id>` | run query | run a saved `query` atom by id and return its result set/page |
 | `POST /<model>` | create | one atom, a JSON array (bulk), or a `text/csv` body (import) |
-| `PATCH /<id>` | update | merge `attr`; honors `If-Match` (optimistic concurrency) |
+| `PATCH /<id>` | update | merge `attr`; honors `If-Match` for optimistic concurrency |
 | `PUT /<id>` | replace | replace `attr` wholesale |
 | `DELETE /<id>` | retire | soft-delete (sets `status: retired`) |
-| `POST /tx` | transaction | a JSON array of ops, applied all-or-nothing |
+| `POST /tx` | transaction | a JSON array of operations, applied all-or-nothing |
 | `POST /base` | provision | superuser-only; `{ name }` → a new tenant + open-login token + share URL |
 
 ```bash
 # $SECRET is a token's API secret (shown once at creation), or ATOMIC_ADMIN_SECRET.
+
 # create
 curl -X POST localhost:3040/contact -H "authorization: Bearer $SECRET" \
   -H 'content-type: application/json' \
@@ -176,6 +231,8 @@ curl -X PATCH localhost:3040/c1 -H "authorization: Bearer $SECRET" \
 
 ### Transactions
 
+`POST /tx` applies a batch of writes all-or-nothing; any failure rolls the whole batch back.
+
 ```bash
 curl -X POST localhost:3040/tx -H "authorization: Bearer $SECRET" \
   -H 'content-type: application/json' -d '[
@@ -183,112 +240,174 @@ curl -X POST localhost:3040/tx -H "authorization: Bearer $SECRET" \
     {"op":"update","id":"c1","ifMatch":2,"attr":{"name":"B"}},
     {"op":"delete","id":"c-old"}
   ]'
-# → { "ok": true, "results": [...] }   (or the whole batch rolls back on any failure)
+# → { "ok": true, "results": [...] }   (or the whole batch rolls back)
 ```
+
+### Referential integrity
+
+A `ref` field carries an `onDelete` policy — `restrict` (the default: refuse to delete a
+still-referenced atom), `cascade` (delete the referrers too), or `null` (clear the referring
+cells). It is enforced at delete time, inside the transaction, so a store can never end up
+pointing at a deleted atom and a half-applied cascade can't corrupt it.
 
 ### CSV
 
-Every model table and index result has an **export** (`?as=csv`) and a **template** (`?as=template`); embedded shapes flatten into dotted columns (`address.street`). Import is a `POST` of a `text/csv` body (or JSON array); add `?atomic=1` to make the whole import one transaction.
+Every model table and query result has an export (`?as=csv`) and a template
+(`?as=template`); embedded shapes flatten into dotted columns (`address.street`). Import is a
+`POST` of a `text/csv` body (or a JSON array); add `?atomic=1` to run the whole import as one
+transaction.
 
 ---
 
 ## Identity & access
 
-- **Tokens.** A `token` atom is an identity carrying `grants` (and/or `roles`). A token's public **id is never a credential** (ids leak through `createdBy`, refs, and path reads). Each token instead holds a high-entropy **API secret**, stored only as a hash and surfaced once at creation; present it as `Authorization: Bearer <secret>`. A session id works as a bearer too (`Bearer sess-…`), identical to the cookie.
-- **Grants.** `{ path, mode }` where mode is `read` · `create` · `update` · `delete` · `write` (the mutation superset — does **not** imply read) · `all`. Paths are `model`, `model.field`, or wildcards (`*`, `**`).
-- **Roles.** A `role` atom bundles reusable grants; a token's effective grants are its own plus its roles'. A token can only wear a role within its own grants (attenuation).
-- **Tenancy is structural.** `lifecycle.parent` forms the tenant tree. You may write an atom only if you share its tenant ancestor (or you are a tenant-less root). Global atoms (`parent atom://0`) are world-readable and root-writable.
-- **Per-field redaction.** A read returns only the fields the actor is granted; path reads honor scope, grants, and rules at every hop.
-- **Sign-in.** Magic-link via email (`POST /auth { email }` → link → session cookie), plus one-click **open-login** tokens (`login: open`) for public intake. Sessions are bearer credentials, never served through the read surface.
+- **Tokens.** A `token` atom is an identity carrying `grants` and/or `roles`. Its public **id
+  is never a credential** — ids leak through `createdBy`, refs, and path reads. Each token
+  holds a high-entropy **API secret**, stored only as a hash and shown once at creation;
+  present it as `Authorization: Bearer <secret>`. A session id works as a bearer too
+  (`Bearer sess-…`), identical to the cookie.
+- **Grants.** `{ path, mode }`, where `mode` is `read` · `create` · `update` · `delete` ·
+  `write` (the mutation superset — it does **not** imply read) · `all`. Paths are `model`,
+  `model.field`, or wildcards (`*`, `**`).
+- **Roles.** A `role` atom bundles reusable grants; a token's effective grants are its own plus
+  its roles'. A token can only wear a role within its own grants (attenuation).
+- **Tenancy is structural.** `lifecycle.parent` forms a tenant tree. You may write an atom only
+  if you share its tenant ancestor (or you are a tenant-less root). Global atoms are
+  world-readable and root-writable.
+- **Per-field redaction.** A read returns only the fields the actor is granted; path reads
+  honor scope, grants, and rules at every hop.
+- **One-click bases.** `POST /base { name }` (or `node atomic.mjs --new-base "<name>"`)
+  provisions a tenant and an open-login token in one transaction and returns a **share URL** —
+  open it and you are one-clicked into that base as a full, tenant-confined session.
 
 ---
 
-## Lifecycle: hooks, expiration, migration
+## Lifecycle
 
-- **Hooks** — a `hook` is a capability atom `{ run, grants }` registered in an atom's (or model's) `lifecycle.hooks`, keyed `create`/`update`/`delete`. It runs `scripts/<run>.mjs` under its *own* grants (the caller needs no invoke permission). `run` is locked to a safe basename. Example: `scripts/census-district.mjs` geocodes an address and links a congressional-district atom.
-- **Expiration** — `lifecycle.expiration` points at a `policy` (a set of `condition` atoms). An atom is expired when all its policy's conditions hold; expired atoms are filtered out of reads, never mutated (editing brings them back). Default policy: not updated in 3 years.
-- **Schema migration** — each model carries a `version`; each atom records the `modelVersion` it was written under. A `migration` atom is a one-way step (`rename`/`default` from `spec`, or a vetted `custom` handler). Behind atoms are brought forward on read, on schema change, and to completion on boot — then persisted and logged.
+- **Hooks.** A `hook` is a capability atom `{ run, grants }` registered in an atom's (or a
+  model's) `lifecycle.hooks`, keyed `create` / `update` / `delete`. It runs `scripts/<run>.mjs`
+  under its *own* grants — the caller needs no invoke permission, and `run` is locked to a safe
+  basename. (Example: `scripts/census-district.mjs` geocodes an address and links a
+  congressional-district atom on write.)
+- **Expiration.** `lifecycle.expiration` points at a `policy` (a set of `condition` atoms). An
+  atom is expired when all of its policy's conditions hold; expired atoms are filtered out of
+  reads but never mutated — editing one brings it back. The default policy is "not updated in
+  three years."
+- **Schema migration.** Each model carries a `version`, and each atom records the
+  `modelVersion` it was written under. A `migration` atom is a one-way step (`rename` or
+  `default` from a `spec`, or a vetted `custom` handler). Behind atoms are brought forward
+  lazily on read, on schema change, and to completion on boot — then persisted and logged.
 
 ---
 
 ## The generated UI
 
-Browsing any atom with `Accept: text/html` renders a generated interface from the same atoms: recursive atom rendering, sortable tables, model-driven create/edit forms (embed → nested table, list → repeater, ref → autocomplete), index forms, and a backlink ref-map. The stylesheet uses no classes and no ids — every rule targets a semantic element.
+Request any atom with `Accept: text/html` and the kernel renders an interface from the same
+atoms: recursive atom rendering, sortable tables, model-driven create/edit forms (embed →
+nested table, list → repeater, ref → autocomplete), query forms, and a backlink ref-map. The
+stylesheet uses no classes and no ids — every rule targets a semantic element.
 
-**Editable grid.** Every model table is inline-editable exactly where the viewer holds an update grant: text/number cells are `contenteditable`, enums become `<select>`, booleans a checkbox (refs/embeds/lists edit via the row form). An edit is a single-field `PATCH` with `If-Match`, so per-field grants and optimistic concurrency apply automatically — an unauthorized cell isn't editable, a stale version reloads the row. The client is one static, same-origin `/app.js` (no inline script, strict CSP).
+**Editable grid.** Every model table is inline-editable exactly where the viewer holds an
+update grant: text and number cells are `contenteditable`, enums become `<select>`, booleans a
+checkbox (refs, embeds, and lists edit via the row form). Each edit is a single-field `PATCH`
+with `If-Match`, so per-field grants and optimistic concurrency apply automatically — an
+unauthorized cell isn't editable, and a stale version reloads the row. The client is one
+static, same-origin `/app.js` with no inline script under a strict CSP.
 
 ---
 
 ## Persistence
 
-- **In-memory** by default (nothing persists).
-- **Durable (SQLite)** when `ATOMIC_STORE=<dir>` is set: state lives in `<dir>/atoms.db` (WAL-mode SQLite via Node's built-in `node:sqlite`, one `atom` table indexed on `shard` and `model`, plus the secondary `idx`). State is authoritative in the table — no boot-time replay — and reads are scoped to a tenant + type in SQL, so a read never materializes another tenant's atoms. Single-node, single-writer.
-- **Postgres (scale-out)** when `ATOMIC_DB=<postgres-url>` is set: the same two tables (`atom`, `idx`) on Postgres — MVCC concurrency (many writers), connection pooling, and managed backups/replication/HA. The `idx.value` is `jsonb` (numbers order numerically, strings lexically — equality, range, and sort stay index-backed, exactly as on SQLite). Transactions pin a pooled connection and route their own operations to it via `AsyncLocalStorage`, so a concurrent request can never land on a transaction's connection. The whole kernel is async behind the store port, so this is a driver swap — **zero user-facing or model changes**. (Requires the optional `pg` dependency, loaded only when `ATOMIC_DB` is set; the SQLite/in-memory paths stay dependency-free.) Migrate between drivers with `--export-all` / `--import-all`.
-- **Encrypted at rest** when `ATOMIC_KEY` is set (64-hex or a passphrase stretched with scrypt): each atom's `body` is sealed with AES-256-GCM (confidential and tamper-evident); the structural columns `id`/`shard`/`model` stay plaintext for routing and indexing. Under a key, indexed `value`s are blind-hashed — equality only, no range/sort.
+Storage sits behind the kernel's store port; selecting a driver is one environment variable
+and changes nothing above the port.
 
-The store (SQLite or Postgres) is the storage *port*, not the model — no SQL, ORM, or query builder reaches the user-facing surface; swapping the driver swaps the substrate and nothing else moves.
+- **In-memory** by default — nothing persists.
+- **SQLite** when `ATOMIC_STORE=<dir>` is set: state lives in `<dir>/atoms.db` (WAL-mode SQLite
+  via the built-in `node:sqlite`). Two tables — `atom`, indexed on tenant and type, and the
+  secondary `idx`. State is authoritative in the table with no boot-time replay, and reads are
+  scoped to a tenant and type in SQL, so a read never materializes another tenant's atoms.
+  Single-node, single-writer.
+- **Postgres** when `ATOMIC_DB=<postgres-url>` is set: the same two tables on Postgres, with
+  MVCC concurrency (many writers), connection pooling, and managed backups, replication, and
+  HA. The `idx.value` column is `jsonb`, so numbers order numerically and strings lexically —
+  equality, range, and sort stay indexed, exactly as on SQLite. Transactions pin a pooled
+  connection and route their own operations to it, so a concurrent request can never land on a
+  transaction's connection. (Postgres needs the one optional dependency, `pg`, loaded only when
+  `ATOMIC_DB` is set; the SQLite and in-memory paths stay dependency-free.)
+- **Encrypted at rest** when `ATOMIC_KEY` is set (64-hex, or a passphrase stretched with
+  scrypt): each atom's body is sealed with AES-256-GCM — confidential and tamper-evident —
+  while the structural columns stay plaintext for routing. Under a key, indexed values are
+  blind-hashed (equality only, no range or sort).
+
+Migrate between any two drivers with `node atomic.mjs --export-all` and `--import-all`.
 
 ---
 
 ## Configuration
 
-Read from the environment, with `./.env` as a fallback (gitignored).
+Read from the environment, with `./.env` as a gitignored fallback.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `PORT` | HTTP port | `3040` |
 | `ATOMIC_STORE` | Directory for the durable SQLite store | unset → in-memory |
-| `ATOMIC_DB` | Postgres connection URL → the scale-out Postgres driver (needs optional `pg`) | unset → SQLite/in-memory |
+| `ATOMIC_DB` | Postgres connection URL → the Postgres driver (needs optional `pg`) | unset → SQLite/in-memory |
 | `ATOMIC_KEY` | Encryption key (64-hex or passphrase) for AES-256-GCM at rest | unset → plaintext |
-| `ATOMIC_ADMIN_SECRET` | A fixed API secret for the admin token (`Bearer <it>`), for CI / seeds | unset → admin is magic-link only |
+| `ATOMIC_ADMIN_SECRET` | A fixed API secret for the admin token, for CI / seeds | unset → admin is magic-link only |
 | `SENDGRID_API_KEY` | Sends magic-link sign-in email | unset → dev fallback (link surfaced locally) |
 | `ATOMIC_MAIL_FROM` | From-address for sign-in email | — |
 
 ---
 
-## Scripts
+## CLI
 
 | Command | What it does |
 |---------|--------------|
-| `npm start` | Run the kernel (`node atomic.mjs`). |
-| `npm test` | Full HTTP smoke test — 148 assertions, boots a temp instance, restarts to prove durability. |
-| `npm run check` | Run the substrate's own `test` atoms (`node atomic.mjs --check`). |
-| `npm run audit` | Structural governance check (`node atomic.mjs --audit`); exits non-zero on any finding. |
-| `node atomic.mjs --new-base "<name>"` | Provision a base from the CLI and print its share URL (`ATOMIC_ORIGIN` sets the host). |
-| `node atomic.mjs --export-base <tenant>` | Dump a base (tenant + its shard) as NDJSON on stdout — a base is one file. |
-| `npm run seed` | Load four demo tenants over the API. |
+| `node atomic.mjs` | Run the kernel (`npm start`). |
+| `node atomic.mjs --check` | Run the substrate's own `test` atoms (`npm run check`). |
+| `node atomic.mjs --audit` | Structural governance check (`npm run audit`); exits non-zero on any finding. |
+| `node atomic.mjs --new-base "<name>"` | Provision a base from the CLI and print its share URL. |
+| `node atomic.mjs --export-base <tenant>` | Dump a base (a tenant and its atoms) as NDJSON — a base is one file. |
+| `node atomic.mjs --export-all` / `--import-all` | Move every atom between drivers. |
 
 ---
 
 ## Testing & governance
 
-Verification lives at two levels:
+Verification lives at two levels, and the second is itself made of atoms:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (148 assertions): validation, grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability across restart, and security regressions.
-- **`--check`** — the substrate's own acceptance suite, **as data**: a `test` atom is `{ as, method, path, body, expect }`, run over the live surface as its `as` token, asserting status plus `condition` atoms against the response. Baked-in core self-tests run on any store; a tenant can add `test` atoms for its own models. `test.mjs`'s final assertion is that `--check` itself exits green.
-- **`--audit`** — a structural fsck: every atom resolves to a model, every reference resolves, every atom conforms to its schema, every grant/ledger entry/parent is well-formed.
+- **`test.mjs`** — an independent, black-box HTTP suite (148 assertions) covering validation,
+  grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability
+  across restart, and security regressions.
+- **`--check`** — the substrate's own acceptance suite, *as data*: a `test` atom is
+  `{ as, method, path, body, expect }`, run over the live surface as its `as` token, asserting
+  status plus `condition` atoms against the response. Core self-tests run on any store; a tenant
+  can add `test` atoms for its own models. (`test.mjs`'s final assertion is that `--check`
+  exits green.)
+- **`--audit`** — a structural fsck: every atom resolves to a model, every reference resolves,
+  every atom conforms to its schema, and every grant, ledger entry, and parent is well-formed.
 
-`--audit` covers structural invariants; `--check` covers behavioural ones. Point either at a real store with `ATOMIC_STORE` / `ATOMIC_KEY`.
+`--audit` covers structural invariants; `--check` covers behavioural ones. Point either at a
+real store with `ATOMIC_STORE` / `ATOMIC_DB`.
 
 ---
 
 ## Project layout
 
 ```
-atomic.mjs        the entire kernel — store, validation, permissions, HTTP API, UI, CSV, migration
-test.mjs          black-box HTTP test suite
-seeds/            four demo tenants (seed-a…d) built on seed-lib.mjs
-scripts/          vetted hook + migration handlers (census-district, …) loaded by basename
-package.json      scripts; no dependencies
+atomic.mjs   the entire kernel — store, validation, permissions, HTTP API, UI, CSV, migration
+test.mjs     black-box HTTP test suite
+seeds/       four demo tenants (seed-a…d) built on seed-lib.mjs
+scripts/     vetted hook + migration handlers, loaded by basename
+package.json scripts; no required dependencies
 ```
 
 ---
 
 ## Status
 
-A runnable kernel, exercised by 148 test assertions and a structural audit. Pre-launch and experimental.
-
-**Built:** atoms · models & validation · `embed://` reusable shapes · refs + inverse edges · paths · grants/roles · structural tenancy · transactions (`/tx`) · referential integrity (`onDelete`) · hooks · lazy expiration · lazy schema migration · CSV import/export · editable grid · secondary `attr`-field index · **one-click base provisioning** · tests-as-atoms (`--check`) · governance audit (`--audit`) · durable/encrypted SQLite · hardened HTTP surface.
+Atomic is pre-launch and experimental. It runs, and it is exercised by 148 HTTP test
+assertions, a self-test suite, and a structural audit — but interfaces may still change.
 
 ---
 

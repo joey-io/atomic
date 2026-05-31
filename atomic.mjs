@@ -372,7 +372,7 @@ class Err extends Error { constructor(code, msg) { super(msg); this.code = code;
 
 // Control-plane cache. The few atoms read over and over for every decision — the
 // schema (models), identity (tokens, roles), retention (policies, conditions),
-// tenancy (tenants), and queries/automations (indexes, hooks, migrations) — are
+// tenancy (tenants), and queries/automations (queries, hooks, migrations) — are
 // small and change rarely, yet a list re-reads the same policy/condition/tenant once
 // per row. Caching them turns those repeats into Map hits instead of a store round-
 // trip + JSON parse each (the per-atom fan-out the async refactor made expensive).
@@ -380,7 +380,7 @@ class Err extends Error { constructor(code, msg) { super(msg); this.code = code;
 // like the other gen-keyed memos. getCached returns atom-or-undefined (no throw).
 const _ctl = new Map();
 const CONTROL_MODELS = new Set(['atom://model', 'atom://token', 'atom://role', 'atom://policy',
-  'atom://condition', 'atom://tenant', 'atom://index', 'atom://hook', 'atom://migration']);
+  'atom://condition', 'atom://tenant', 'atom://query', 'atom://hook', 'atom://migration']);
 async function getCached(id) {
   const c = _ctl.get(id);
   if (c !== undefined) return c;
@@ -724,10 +724,10 @@ const OP = { GET: 'read', POST: 'create', PUT: 'update', PATCH: 'update', DELETE
 const permits = (mode, op) =>
   mode === 'all' ? true : op === 'read' ? mode === 'read' : mode === 'write' ? true : mode === op;
 
-// field-level: may the actor do `op` on this path (model.field, index, ...)?
+// field-level: may the actor do `op` on this path (model.field, query, ...)?
 const allows = async (actor, target, op) =>
   (await grantsOf(actor)).some((x) => permits(x.mode, op) && grantMatch(x.path, target));
-// model-level: may the actor do `op` on this model/index as a whole?
+// model-level: may the actor do `op` on this model/query as a whole?
 const canOp = async (actor, name, op) =>
   (await grantsOf(actor)).some((x) => { const s = x.path.split('.')[0]; return (s === name || s === '*' || s === '**') && permits(x.mode, op); });
 // nav visibility: does the actor hold any grant touching this name?
@@ -735,7 +735,7 @@ const canTouch = async (actor, name) =>
   (await grantsOf(actor)).some((x) => { const s = x.path.split('.')[0]; return s === name || s === '*' || s === '**'; });
 const canRead = async (actor, target) => allows(actor, target, 'read');
 // May the actor see this atom AT ALL (vs. just some of its attributes)? Used to
-// gate the universal feed and index results so they never leak the id/manifest of
+// gate the universal feed and query results so they never leak the id/manifest of
 // an atom the actor holds no read grant for. Per-attribute redaction happens after.
 const readableAtom = async (actor, a) =>
   a.lifecycle?.status !== 'retired' && await canOp(actor, refId(a.model), 'read') && await ruleOk(actor, a, 'read');
@@ -839,7 +839,7 @@ async function getStore(actor) {
   let hit = _scope.get(actor);
   if (!hit || hit.gen !== storeGen) {
     // session atoms are bearer credentials, never application data: they are
-    // excluded from every actor-facing read here, so no listing, index, feed,
+    // excluded from every actor-facing read here, so no listing, query, feed,
     // ref-map, datalist, or workspace can ever surface a live cookie id.
     // tenant scoping pushed into the store: root (no tenant) sees every shard;
     // a tenant user sees only the global shard plus its own. So a read never
@@ -1233,7 +1233,7 @@ async function create(modelId, body, actor) {
 
   // POST creates. An explicit id must be a safe slug — it becomes a URL path and is
   // rendered into HTML/links, so reject anything with HTML/URL metacharacters or
-  // whitespace (allow letters, digits, and . _ - @ : so dotted index ids and
+  // whitespace (allow letters, digits, and . _ - @ : so dotted query ids and
   // `model@1-2` migration ids still work). An id that already exists is a conflict.
   if (body.id && !/^[A-Za-z0-9._@:-]+$/.test(String(body.id)))
     throw new Err(400, `invalid id "${body.id}" — use letters, digits, and . _ - @ :`);
@@ -1484,7 +1484,7 @@ async function provisionBase(name, actor) {
 }
 
 // ---------------------------------------------------------------------------
-// Read path: atoms, model tables, ad-hoc queries, stored indexes
+// Read path: atoms, model tables, ad-hoc queries, stored queries
 // ---------------------------------------------------------------------------
 
 function parseQuery(search) {
@@ -1741,14 +1741,14 @@ async function listModel(modelId, q, actor) {
   return out;
 }
 
-async function runIndex(indexAtom, search, actor) {
-  const over = refId(indexAtom.attr.over);
+async function runQuery(queryAtom, search, actor) {
+  const over = refId(queryAtom.attr.over);
   const all = over === 'atom';                 // pseudo-model atom://atom = every atom
   const params = new URLSearchParams(search);
-  const match = indexAtom.attr.match || {};
-  const sorts = indexAtom.attr.sort || [];
-  const pg = indexAtom.attr.page;
-  // Fast path: a single-model index whose match is simple equality and whose sort is
+  const match = queryAtom.attr.match || {};
+  const sorts = queryAtom.attr.sort || [];
+  const pg = queryAtom.attr.page;
+  // Fast path: a single-model query whose match is simple equality and whose sort is
   // a single indexed field maps straight onto the secondary index — pushed into SQL,
   // never materializing the model's set. atom://atom (cross-model) always scans.
   if (!all) {
@@ -1771,7 +1771,7 @@ async function runIndex(indexAtom, search, actor) {
       if (idx) return idx;
     }
   }
-  // scope the scan to the index's model AND the actor's shards — the same
+  // scope the scan to the query's model AND the actor's shards — the same
   // index-backed lever listModel uses — instead of materializing every atom in
   // scope just to drop all but one model. atom://atom legitimately spans every
   // model, so it still reads the full in-scope set (sessions excluded by getStore).
@@ -1898,7 +1898,7 @@ async function csvKinds(modelAtom, prefix = '', depth = 0) {
   }
   return out;
 }
-// export a set of atoms. modelId null → cross-model (an index over atom://atom).
+// export a set of atoms. modelId null → cross-model (a query over atom://atom).
 async function atomsCsv(modelId, atoms) {
   if (!modelId) {
     const lines = [csvRow(['id', 'model', 'manifest', 'createdAt'])];
@@ -2125,7 +2125,7 @@ async function renderForm(modelId, atom, actor) {
   // the methods this actor may run here, from its grants (the auth schema)
   const methods = [];
   // a mutating method shows only when BOTH the grant (canOp) and the per-atom
-  // write rule allow it — so e.g. Billy sees an edit form on his OWN index but
+  // write rule allow it — so e.g. Billy sees an edit form on his OWN query but
   // not on a shared/global one his grant covers yet the rule forbids.
   const mayWrite = !editing || await writable(actor, atom);
   if (!editing && await canOp(actor, modelId, 'create')) methods.push('POST', 'IMPORT');
@@ -2150,16 +2150,16 @@ async function renderForm(modelId, atom, actor) {
   return `<form data-create="${esc('/' + modelId)}" data-atom="${editing ? esc('/' + atom.id) : ''}"><figure><table>${methodRow}${idRows}${manifestRow}${fieldRows.join('')}${importRow}</table></figure><p><button>Submit</button></p>${suggest}</form>`;
 }
 
-// the top nav: indexes the actor can reach, then every model it can touch below.
+// the top nav: queries the actor can reach, then every model it can touch below.
 async function navSelect(actor, current) {
   const all = (await getStore(actor)).all().filter((a) => a.lifecycle?.status !== 'retired');
   const opt = (a) => `<option value="/${esc(a.id)}"${a.id === current ? ' selected' : ''}>atom://${esc(a.id)}</option>`;
-  const indexAtoms = await asyncFilter(all, async (a) => a.model === 'atom://index' && (await canTouch(actor, a.id) || await canTouch(actor, refId(a.attr.over))));
+  const queryAtoms = await asyncFilter(all, async (a) => a.model === 'atom://query' && (await canTouch(actor, a.id) || await canTouch(actor, refId(a.attr.over))));
   const modelAtoms = await asyncFilter(all, async (a) => a.model === 'atom://model' && await canTouch(actor, a.id));
-  const indexes = indexAtoms.map(opt).join('');
+  const queries = queryAtoms.map(opt).join('');
   const models = modelAtoms.map(opt).join('');
   return `<select data-nav><option value="/">atom://0</option>`
-    + (indexes ? `<optgroup label="indexes">${indexes}</optgroup>` : '')
+    + (queries ? `<optgroup label="queries">${queries}</optgroup>` : '')
     + (models ? `<optgroup label="models">${models}</optgroup>` : '')
     + `</select>`;
 }
@@ -2208,7 +2208,7 @@ async function renderModelPage(modelId, atoms, actor, search = '') {
     await renderForm(modelId, null, actor) + table, await navSelect(actor, modelId) + exp, await footer(actor));
 }
 
-// cross-model table for indexes that span all models (over: atom://atom)
+// cross-model table for queries that span all models (over: atom://atom)
 async function renderCrossTable(atoms, actor) {
   const head = ['id', 'model', 'manifest', 'createdAt'].map((c) => `<th>${esc(c)}</th>`).join('');
   const rows = [];
@@ -2218,9 +2218,9 @@ async function renderCrossTable(atoms, actor) {
   return `<figure><table><thead><tr>${head}</tr></thead><tbody>${rows.join('')}</tbody></table></figure>`;
 }
 
-async function renderIndexPage(indexAtom, atoms, actor, values = {}) {
-  const over = refId(indexAtom.attr.over);
-  const params = indexAtom.attr.params || {};
+async function renderQueryPage(queryAtom, atoms, actor, values = {}) {
+  const over = refId(queryAtom.attr.over);
+  const params = queryAtom.attr.params || {};
   let form = '';
   if (Object.keys(params).length) {
     const rows = Object.entries(params).map(([name, def]) => {
@@ -2239,21 +2239,21 @@ async function renderIndexPage(indexAtom, atoms, actor, values = {}) {
     const lists = targets.map((t) => `<datalist id="refs-${esc(t)}">${scope
       .filter((a) => a.model === ref(t) && a.lifecycle?.status !== 'retired')
       .map((a) => `<option value="atom://${esc(a.id)}">${esc(a.attr?.name || a.manifest || a.id)}</option>`).join('')}</datalist>`).join('');
-    form = `<form method="get" action="/${esc(indexAtom.id)}"><figure><table>${rows}</table></figure><p><button>Run</button></p>${lists}</form>`;
+    form = `<form method="get" action="/${esc(queryAtom.id)}"><figure><table>${rows}</table></figure><p><button>Run</button></p>${lists}</form>`;
   }
   let body = form + (over === 'atom' ? await renderCrossTable(atoms, actor) : await renderTable(over, atoms, actor));
-  const pg = indexAtom.attr.page;
+  const pg = queryAtom.attr.page;
   if (pg && atoms.length) {
     const last = atoms[atoms.length - 1];
     const cur = (last.lifecycle?.[pg.cursor]) ?? last.attr?.[pg.cursor];
-    body += `<p><a href="/${esc(indexAtom.id)}?before=${encodeURIComponent(cur)}">older →</a></p>`;
+    body += `<p><a href="/${esc(queryAtom.id)}?before=${encodeURIComponent(cur)}">older →</a></p>`;
   }
-  // the index's own create/edit form — POST a new report on the model page, or
+  // the query's own create/edit form — POST a new report on the model page, or
   // PATCH/PUT/DELETE one you own here (renderForm gates by grant + the write rule)
-  body += await renderForm('index', indexAtom, actor);
+  body += await renderForm('query', queryAtom, actor);
   const ps = new URLSearchParams(values); ps.delete('as'); ps.set('as', 'csv');
-  const exp = `<a href="/${esc(indexAtom.id)}?${esc(ps.toString())}" download>export CSV</a>`;
-  return page(`${indexAtom.attr.label || indexAtom.id} — ${atoms.length}`, body, await navSelect(actor, indexAtom.id) + exp, await footer(actor));
+  const exp = `<a href="/${esc(queryAtom.id)}?${esc(ps.toString())}" download>export CSV</a>`;
+  return page(`${queryAtom.attr.label || queryAtom.id} — ${atoms.length}`, body, await navSelect(actor, queryAtom.id) + exp, await footer(actor));
 }
 
 // every place a ref to `target` appears in a value, with its dotted field path
@@ -2443,14 +2443,14 @@ const server = http.createServer(async (req, res) => {
       return send(201, { tenant: ref(tenant.id), token: ref(token.id), url: `${origin}/auth/open?token=${token.id}` });
     }
 
-    // an atom id may itself contain dots (index ids like 'atom.byDate'); a whole-
+    // an atom id may itself contain dots (query ids like 'atom.byDate'); a whole-
     // path match on a real atom wins over dot-path traversal of atom://atom.
-    if (req.method === 'GET' && path && await store.has(path) && (await getAtom(path)).model === 'atom://index') {
+    if (req.method === 'GET' && path && await store.has(path) && (await getAtom(path)).model === 'atom://query') {
       const ix = await getAtom(path);
-      if (!await visible(actor, ix)) throw new Err(404, `no atom ${path}`); // can't run an index outside your tenant
-      const atoms = await runIndex(ix, url.search, actor);
+      if (!await visible(actor, ix)) throw new Err(404, `no atom ${path}`); // can't run a query outside your tenant
+      const atoms = await runQuery(ix, url.search, actor);
       if (as === 'csv') return sendCsv(`${ix.id}.csv`, await atomsCsv(refId(ix.attr.over) === 'atom' ? null : refId(ix.attr.over), atoms));
-      if (wantsHtml) return send(200, await renderIndexPage(ix, atoms, actor, Object.fromEntries(url.searchParams)), true);
+      if (wantsHtml) return send(200, await renderQueryPage(ix, atoms, actor, Object.fromEntries(url.searchParams)), true);
       return send(200, atoms);
     }
 
@@ -2467,11 +2467,11 @@ const server = http.createServer(async (req, res) => {
       const headAtom = await getAtom(head);
       const q = parseQuery(url.search);
       let result;
-      if (headAtom.model === 'atom://index') {
-        if (!await visible(actor, headAtom)) throw new Err(404, `no atom ${head}`); // can't run an index outside your tenant
-        const atoms = await runIndex(headAtom, url.search, actor);
+      if (headAtom.model === 'atom://query') {
+        if (!await visible(actor, headAtom)) throw new Err(404, `no atom ${head}`); // can't run a query outside your tenant
+        const atoms = await runQuery(headAtom, url.search, actor);
         if (as === 'csv') return sendCsv(`${headAtom.id}.csv`, await atomsCsv(refId(headAtom.attr.over) === 'atom' ? null : refId(headAtom.attr.over), atoms));
-        if (wantsHtml) return send(200, await renderIndexPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
+        if (wantsHtml) return send(200, await renderQueryPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
         result = atoms;
       } else if (headAtom.model === 'atom://model' && segs.length === 0) {
         // a tenant-scoped model is invisible (and unaddressable) outside its tenant;
@@ -2528,7 +2528,7 @@ const server = http.createServer(async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // Core atoms — the substrate's own schema: the genesis identities, the core
-// model definitions, the expiration conditions/policies, and the core indexes.
+// model definitions, the expiration conditions/policies, and the core queries.
 // ONE source of truth, consumed two ways: bootstrap() seeds them into a fresh
 // store; migrate() ensures any that an older store is missing. Schema, identity,
 // and queries are all just atoms, so they all live in the same list.
@@ -2556,7 +2556,7 @@ function coreAtoms() {
       mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } }),
     model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } }),
     model('tenant', 'Tenant', { name: { kind: 'text', required: true } }),
-    model('index',  'Index',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
+    model('query',  'Query',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
       params: { kind: 'map' }, match: { kind: 'json' }, sort: { kind: 'list' }, returns: { kind: 'text' } }),
     model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
       actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
@@ -2579,7 +2579,7 @@ function coreAtoms() {
       size: { kind: 'integer' }, data: { kind: 'longtext' } }),
     model('config', 'Config', { key: { kind: 'text', required: true }, value: { kind: 'json' } }),
     model('plugin', 'Plugin', { name: { kind: 'text', required: true }, version: { kind: 'integer' },
-      models: { kind: 'list' }, indexes: { kind: 'list' }, handlers: { kind: 'list' } }),
+      models: { kind: 'list' }, queries: { kind: 'list' }, handlers: { kind: 'list' } }),
     // a condition is an atom { field, op, value } — a single reusable predicate.
     // op `older`/`newer` compares a date field against a duration (e.g. 3y) before now.
     model('condition', 'Condition', { label: { kind: 'text' }, field: { kind: 'text', required: true },
@@ -2605,12 +2605,12 @@ function coreAtoms() {
     atom('policy-never',   'policy', 'Never expires', { label: 'Never', conditions: [] }),
     atom('policy-default', 'policy', 'Expires 3 years after last update', { label: '3 years since update', conditions: ['atom://cond-stale-3y'] }),
 
-    // core indexes (queries are atoms too) — named <model>.<qualifier>; also the
+    // core queries (queries are atoms too) — named <model>.<qualifier>; also the
     // worked examples of the grammar. dotted ids route via whole-path match.
-    atom('log.byAtom', 'index', 'Full change history for one atom', { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } }, match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }),
-    atom('atom.byDate', 'index', 'Atoms across all models, newest first', { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }),
-    atom('model.all', 'index', 'Every model in the substrate', { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }),
-    atom('atom.byModel', 'index', 'Atoms of a chosen model', { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }),
+    atom('log.byAtom', 'query', 'Full change history for one atom', { label: 'Log by atom', over: 'atom://log', params: { atom: { kind: 'ref', to: 'atom://atom' } }, match: { atom: 'params.atom' }, sort: [{ at: 'asc' }], returns: 'set' }),
+    atom('atom.byDate', 'query', 'Atoms across all models, newest first', { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }),
+    atom('model.all', 'query', 'Every model in the substrate', { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }),
+    atom('atom.byModel', 'query', 'Atoms of a chosen model', { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }),
 
     // core self-tests — the substrate's own acceptance suite, as atoms, run by
     // `--check`. These need no fixtures: they assert the core surface itself, are

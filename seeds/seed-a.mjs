@@ -1,12 +1,12 @@
 // Demo A — a PAC: 100 fundraising transactions to 20 people, a reporting chain
 // via `manager` refs, across 3 regions. Run: node seeds/seed-a.mjs
-import { tenant, defineModels, atom, index, A } from './seed-lib.mjs';
+import { tenant, defineModels, atom, query, A } from './seed-lib.mjs';
 
 await defineModels();
 await tenant('a', 'Demo A — PAC');
 
-// an index over people, filtered by region — named <model>.<qualifier>
-await index('person.byRegion', 'Person by region', 'atom://person',
+// a query over people, filtered by region — named <model>.<qualifier>
+await query('person.byRegion', 'Person by region', 'atom://person',
   { region: { kind: 'ref', to: 'atom://region' } }, { region: 'params.region' }, [{ name: 'asc' }]);
 
 const T = 'a';

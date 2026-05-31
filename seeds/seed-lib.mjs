@@ -75,8 +75,8 @@ const STATES = [
 export async function defineStates() {
   for (const [abbr, name] of STATES) await atom('state', `st-${abbr.toLowerCase()}`, '0', { name, abbr }, name);
 }
-export async function index(id, label, over, params, match, sort) {
-  okOrExists(await api('POST', '/index', { id, manifest: label, attr: { label, over, params, match, sort, returns: 'set' } }), `index ${id}`);
+export async function query(id, label, over, params, match, sort) {
+  okOrExists(await api('POST', '/query', { id, manifest: label, attr: { label, over, params, match, sort, returns: 'set' } }), `query ${id}`);
 }
 // create an atom of `m` under tenant `parent`
 export async function atom(m, id, parent, attr, manifest) {

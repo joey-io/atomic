@@ -258,7 +258,7 @@ Because look at what `atomic.mjs` actually hand-rolls. Then look at the column o
 | Model = a type's fields                 | `CREATE TABLE` — columns *are* fields                   |
 | Validation (kind, `required`, `unique`) | `CHECK`, `NOT NULL`, `UNIQUE` constraints               |
 | `attr` (open value bag)                 | the `JSON1` extension — `json_extract`, `->>`           |
-| Index (stored query / constraint)       | `CREATE INDEX`, `CREATE VIEW`                            |
+| Query (stored query) · secondary index  | `CREATE VIEW`, `CREATE INDEX`                            |
 | `manifest` full-text search             | `FTS5` — a full-text engine, not a `LIKE` scan          |
 | `ref` / typed edges                     | `FOREIGN KEY` + a join table for inverse edges          |
 | Hooks on create/update/delete           | `TRIGGER` — fires on exactly those, in the engine       |
@@ -290,7 +290,7 @@ they were always the real product:
 2. **The generated surface.** SQLite gives you SQL, not a screen. Atomic reads the schema
    and *renders* it — sortable tables, model-driven create forms (embed → nested table,
    list → repeater, ref → autocomplete), backlink maps, a nav built from models and
-   indexes. "API and UI are one, both from the schema" is not a database feature. It's the
+   queries. "API and UI are one, both from the schema" is not a database feature. It's the
    layer above.
 
 3. **Capabilities.** A SQLite `TRIGGER` runs with the connection's authority; it cannot run
@@ -484,3 +484,132 @@ Two notes where reality diverged from the plan, both for the better:
 
 The standing decision holds unchanged: the kernel is the product, storage is a port, and the port
 now happens to be SQLite — which the kernel, true to the thesis, never noticed.
+
+---
+
+# What If, part four — any substrate, even none
+
+> Parts one through three freed the **store**. This part asks the question they make
+> unavoidable: if the store is just a port the kernel talks through, what is the kernel
+> even *attached to*? A server? A box? Anything at all?
+
+We didn't only argue the port abstraction — we *exercised* it. The store has now been
+swapped **three times** under a kernel that never noticed: per-tenant NDJSON log → embedded
+SQLite (2026-05-30) → Postgres (2026-05-31). Three substrates, zero changes above the seam.
+At some point a pattern that survives three swaps stops being a refactor and becomes a
+*claim*: the kernel does not *have* a substrate. It has a port, and a port accepts anything
+that can hold a row and hand it back.
+
+So push the lever all the way. Those three swaps were all server-side files and databases.
+But nothing in `read(query, actor) → atoms` / `write(atom, actor) → atom` / `watch(model, cb)`
+says the bytes sit on a disk, in this process, or even on a server.
+
+## The kernel is pure logic
+
+Strip `atomic.mjs` to what it actually *computes* on each request and it's a short, hostless
+pipeline:
+
+```
+validate → permit → hook → log → project
+```
+
+Not one of those five steps makes a syscall only a server has. They take an atom, an actor,
+and a Store port, and they transform. A function that pure doesn't care whether it runs in a
+Node process behind nginx, a browser tab, a service worker, an edge function at the CDN, a
+CLI invocation, or a build step. Wherever there is a JavaScript runtime and *something that
+can store and return a row,* the whole kernel runs.
+
+And "something that can store and return a row" is a very low bar:
+
+| The Store port could be…        | …backed by                                                                 | Kernel changes |
+|---------------------------------|----------------------------------------------------------------------------|:--------------:|
+| an in-memory `Map`              | plain JS objects in a tab — what `npm start` already is, minus the server  | none           |
+| `localStorage` / `IndexedDB`    | the browser's own durable store — offline, no network                      | none           |
+| a `fetch()` wrapper             | *someone else's* REST/GraphQL API — Atomic as a governed lens over a system it doesn't own | none |
+| a flat file handed in           | a `.ndjson` on disk, read by a CLI run                                      | none           |
+| a channel to a peer             | another tab, a worker, a CRDT, a websocket                                 | none           |
+
+Each is one implementation of the same three methods; the validate/permit/project logic above
+the seam is byte-identical in every row. The browser case is the tell: the in-memory default
+we already ship *is* a client-side store with the server sawed off — Atomic running with no
+host at all, governing plain JavaScript data in a single tab.
+
+## So what are we, once the host is optional?
+
+Then Atomic was never a *thing in a place.* Subtract the server the way parts one through
+three subtracted the store, and what's left isn't software — it's a **theory of relational
+data,** with the kernel as its reference implementation. The theory has two halves:
+
+- **A normal form.** Any relational record — a database row, a type, a grant, a log line, a
+  DOM node, a JSON blob from a foreign API — goes into one shape: `{ id, model, manifest,
+  attr, lifecycle }`. A stable identity, a type pointer, a human label, a bag of typed values
+  where some are edges, and a parent. That's not a storage layout; it's a *claim about what
+  relational data minimally is.* Everything with structure already fits it — the README's
+  atom, part one's `<contact>`, part two's SQLite row, a `localStorage` entry. The shape is
+  substrate-independent because it's a shape, not a file.
+- **A calculus over it.** Given records in that form you can *query* them uniformly — filter,
+  traverse edges, sort, paginate, full-text — without knowing where they sit. `over / match /
+  sort / page` is an algebra on atoms, not a SQL dialect. (Renaming that primitive from
+  `index` to `query` was conceding exactly this: it was never an index, it was the query
+  calculus. The physical index is a port detail; the *query* is the theory.)
+
+Layer the three things raw data can't do for itself on top of that form — **scope** it
+(grants), **project** it (the generated surface), **extend** it (capabilities/hooks) — and you
+have the whole product. None of the three needs a server *or* a database. They need data in
+the normal form and an actor asking.
+
+So, plainly, what are we?
+
+- **Not a database.** That's the port — and we've now run three.
+- **Not a server.** That's one host for the kernel, and the cheapest to remove: it already
+  runs hostless in a tab.
+- **Not a UI framework.** The generated surface is just the *projection* half of the theory
+  aimed at HTML; aim it at JSON and it's the API. The two were always one because they're the
+  same projection.
+
+We are **a way to model any relational data as an atom, and the three operations that modeling
+makes possible — scope, project, extend — wherever the data happens to live.** A calculus plus
+its governance. The server, the SQLite file, the Postgres cluster, the DOM, the browser tab:
+each is *where we ran it this time,* none is *what it is.*
+
+## Where it strains (the case against)
+
+The honest rebuttals get *sharper* here, not softer:
+
+- **Client-side grants are UX, not security — and this is the cliff.** Parts one through three
+  kept flagging the two-door trust problem; running the kernel in the browser tears the back
+  door off its hinges. If the user's machine runs the kernel, the user *owns* the kernel — they
+  can read raw `localStorage`, patch the bundle, skip the permit check. So client-side Atomic
+  can *model, project, and query* honestly, and it can enforce grants as **interface** (hide
+  what you may not edit), but never as **security.** The instant the data isn't already the
+  actor's own to see, enforcement has to run on a host the actor doesn't control. The theory
+  runs everywhere; the *trust* still has a home. (This is just part three's "does the substrate
+  have grants?" turned on the *host*: the browser doesn't either.)
+- **A remote-API port inherits the source's lies.** Pointing the Store at someone else's
+  endpoint makes Atomic a governed lens over a system it doesn't own — elegant, but the lens is
+  only as truthful as the source, and `watch()` over a REST API is polling in a trenchcoat.
+- **Offline means reconciliation.** A browser store that accepts writes while disconnected
+  reintroduces everything the single-writer server let us dodge: conflict, merge, causal order.
+  The atom's `version` is optimistic concurrency for *one* writer; many disconnected writers
+  want a CRDT, and "everything is an atom" doesn't hand you one for free.
+- **A theory that runs anywhere can be authoritative nowhere.** Three ports were fine because
+  one was always *the* store. Spread the kernel across a tab, an edge function, and a server and
+  you must answer "who is canonical?" — or you've traded a single source of truth for a
+  distributed-systems problem.
+- **Uniformity still pays rent at the edges.** Binary blobs, multi-megabyte fields, real-time
+  streams: the normal form holds conceptually, but a `localStorage` substrate or a `fetch` port
+  will feel every place the atom shape fits worse than the native one.
+
+None of these retract the idea; they *site* it, exactly as before. The theory is substrate- and
+host-independent. The **enforcement** is not — it lives wherever you can keep the actor from
+*being* the kernel.
+
+## The one-line version
+
+> Parts one through three said the *store* is a port and proved it by swapping it three times.
+> This one says the *host* is a port too: the kernel is pure logic that runs in a browser tab
+> over `localStorage`, at the edge over a remote API, or on a server over Postgres — the same
+> five steps every time. So Atomic isn't a database, a server, or a UI. **It's a theory of
+> relational data — one normal form (the atom) and one query calculus over it — plus the three
+> things that form lets you do that raw storage can't: scope it, project it, extend it.
+> Everything else — where the bytes sit, and whether there's a server at all — is a port.**

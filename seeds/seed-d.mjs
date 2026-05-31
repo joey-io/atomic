@@ -5,7 +5,7 @@
 //
 // Billy is one of the two adults; he also gets an open-login token (atom://billy,
 // j@a-gnt.com) so he can one-click into the house from the homepage and read it.
-import { tenant, model, token, atom, index, A, AUTH } from './seed-lib.mjs';
+import { tenant, model, token, atom, query, A, AUTH } from './seed-lib.mjs';
 
 // raw PATCH (update) as the admin — used by lockToHouse() to install the graph-gated
 // write rules and Billy's house anchor after the data exists. AUTH is the admin
@@ -67,22 +67,22 @@ await model('usage', 'Usage', {
 }, { display: { row: ['resident', 'room', 'purpose'] } });
 
 // ---------------------------------------------------------------------------
-// Indexes — stored queries over the household.
+// Queries — stored queries over the household.
 // ---------------------------------------------------------------------------
-await index('room.byHouse', 'Rooms in a house', 'atom://room',
+await query('room.byHouse', 'Rooms in a house', 'atom://room',
   { house: { kind: 'ref', to: 'atom://house' } }, { house: 'params.house' }, [{ name: 'asc' }]);
-await index('room.byKind', 'Rooms by kind', 'atom://room',
+await query('room.byKind', 'Rooms by kind', 'atom://room',
   { kind: { kind: 'enum', values: ['bedroom', 'bathroom', 'family', 'kitchen', 'living', 'dining', 'garage', 'office'] } },
   { kind: 'params.kind' }, [{ name: 'asc' }]);
-await index('resident.byBedroom', 'Who sleeps in a bedroom', 'atom://resident',
+await query('resident.byBedroom', 'Who sleeps in a bedroom', 'atom://resident',
   { bedroom: { kind: 'ref', to: 'atom://room' } }, { bedroom: 'params.bedroom' }, [{ name: 'asc' }]);
-await index('belonging.byRoom', 'Stuff in a room', 'atom://belonging',
+await query('belonging.byRoom', 'Stuff in a room', 'atom://belonging',
   { room: { kind: 'ref', to: 'atom://room' } }, { room: 'params.room' }, [{ name: 'asc' }]);
-await index('belonging.byOwner', "A person's belongings", 'atom://belonging',
+await query('belonging.byOwner', "A person's belongings", 'atom://belonging',
   { owner: { kind: 'ref', to: 'atom://resident' } }, { owner: 'params.owner' }, [{ name: 'asc' }]);
-await index('usage.byRoom', 'Who uses a room', 'atom://usage',
+await query('usage.byRoom', 'Who uses a room', 'atom://usage',
   { room: { kind: 'ref', to: 'atom://room' } }, { room: 'params.room' }, [{ purpose: 'asc' }]);
-await index('usage.byResident', 'What rooms a person uses', 'atom://usage',
+await query('usage.byResident', 'What rooms a person uses', 'atom://usage',
   { resident: { kind: 'ref', to: 'atom://resident' } }, { resident: 'params.resident' }, [{ purpose: 'asc' }]);
 
 // ---------------------------------------------------------------------------
@@ -212,8 +212,8 @@ for (const [name, category, room, owner] of things)
 //     to enumerate existing tokens. He can make members, not snoop on them.
 //
 // He OWNS his automations — within his own tenant, scoped to his access tree:
-//   • index   — saved reports/views ("all electronics", "kids' belongings"). An
-//               index grants nothing; runIndex filters every result by the
+//   • query   — saved reports/views ("all electronics", "kids' belongings"). A
+//               query grants nothing; running one filters every result by the
 //               VIEWER's grants, so it can only return what Billy can read.
 //   • condition + policy — retention rules ("expire toys after a year"). Pure
 //               data predicates the kernel evaluates; no code, no grants.
@@ -223,7 +223,7 @@ for (const [name, category, room, owner] of things)
 //               script files, and `run` is locked to a bare basename (no traversal).
 // He gets `all` on each, but the kernel's `tenant == actor.tenant` write rule on
 // these models confines create/update/delete to HIS OWN — the shared/global ones
-// (room.byHouse, policy-default, …) stay read-only to him. So on his own index he
+// (room.byHouse, policy-default, …) stay read-only to him. So on his own query he
 // sees a full create/edit/delete form; on a shared one, just run + export.
 // ---------------------------------------------------------------------------
 const BILLY_GRANTS = [
@@ -234,7 +234,7 @@ const BILLY_GRANTS = [
   { path: 'belonging.**', mode: 'all'    },
   { path: 'usage.**',     mode: 'all'    },
   { path: 'token.*',      mode: 'create' }, // invite household members (attenuated)
-  { path: 'index.*',      mode: 'all'    }, // reports/views he owns
+  { path: 'query.*',      mode: 'all'    }, // reports/views he owns
   { path: 'condition.*',  mode: 'all'    }, // retention predicates he owns
   { path: 'policy.*',     mode: 'all'    }, // retention policies he owns
   { path: 'hook.*',       mode: 'all'    }, // wire vetted automations (attenuated)
