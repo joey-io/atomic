@@ -329,6 +329,18 @@ ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook-written field pe
 g = await jsonOf('joey', '/g1');
 ok(g.attr.name === 'old value' && g.attr.status === 'active' && g.attr.slug === 'hello-world' && g.lifecycle.modelVersion === 4, 'migrated shape persists across restart');
 
-srv.kill();
+// --- self-tests as atoms: the kernel runs its OWN acceptance suite (--check) -----
+// Seed a few feature test atoms (idempotent: a read + two negatives), then run the
+// kernel's --check over the populated store. This proves the substrate carries its
+// own tests as data — the core self-tests plus these seeded ones run green.
+await J('joey', 'POST', '/condition', { id: 'cond-w1-alpha', attr: { field: 'attr.name', op: 'eq', value: 'Alpha' } });
+await J('joey', 'POST', '/test', { id: 't-read-w1', attr: { label: 'tk-read reads w1', as: 'atom://tk-read', method: 'GET', path: '/w1', expect: { status: 200, conditions: ['atom://cond-w1-alpha'] } } });
+await J('joey', 'POST', '/test', { id: 't-enum-400', attr: { label: 'bad enum is rejected', as: 'atom://tk-all', method: 'POST', path: '/widget', body: { attr: { name: 'x', kind: 'z' } }, expect: { status: 400 } } });
+await J('joey', 'POST', '/test', { id: 't-read-403', attr: { label: 'read token cannot write', as: 'atom://tk-read', method: 'POST', path: '/widget', body: { attr: { name: 'z' } }, expect: { status: 403 } } });
+srv.kill(); await new Promise((r) => setTimeout(r, 300));
+const checkCode = await new Promise((res) => spawn('node', ['atomic.mjs', '--check'],
+  { env: { ...process.env, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '' }, stdio: 'inherit' }).on('exit', (c) => res(c)));
+ok(checkCode === 0, 'kernel --check runs the substrate’s own test atoms green (core + seeded)');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

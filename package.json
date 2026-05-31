@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node atomic.mjs",
     "test": "node test.mjs",
+    "check": "node atomic.mjs --check",
     "audit": "node atomic.mjs --audit",
     "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
   },

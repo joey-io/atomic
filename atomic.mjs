@@ -2101,6 +2101,16 @@ function coreAtoms() {
     // An atom expires when ALL the policy's conditions hold (none → never expires).
     model('policy', 'Policy', { label: { kind: 'text' },
       conditions: { kind: 'list', of: { kind: 'ref', to: 'atom://condition' } } }),
+    // a test is an atom that asserts a request's outcome — the substrate carries its
+    // OWN acceptance suite, as data. `node atomic.mjs --check` runs every test atom
+    // over the live HTTP surface, as its `as` token, and checks the response `status`
+    // plus any `condition` atoms (reused as the assertion language) against the body.
+    // A test is listable, editable, exportable, tenant-scoped, and in the ledger like
+    // any atom — a tenant can ship acceptance tests for its own models.
+    model('test', 'Test', { label: { kind: 'text' },
+      as: { kind: 'ref', to: 'atom://token' },
+      method: { kind: 'enum', values: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
+      path: { kind: 'text', required: true }, body: { kind: 'json' }, expect: { kind: 'json' } }),
 
     // root expiration conditions + policies — every atom's lifecycle.expiration
     // points at a policy; policies are made of condition atoms.
@@ -2114,6 +2124,18 @@ function coreAtoms() {
     atom('atom.byDate', 'index', 'Atoms across all models, newest first', { label: 'Atoms by date', over: 'atom://atom', sort: [{ createdAt: 'desc' }], page: { cursor: 'createdAt', limit: 25 }, returns: 'page' }),
     atom('model.all', 'index', 'Every model in the substrate', { label: 'All models', over: 'atom://model', sort: [{ id: 'asc' }], returns: 'set' }),
     atom('atom.byModel', 'index', 'Atoms of a chosen model', { label: 'Atoms by model', over: 'atom://atom', params: { model: { kind: 'ref', to: 'atom://model' } }, match: { model: 'params.model' }, sort: [{ createdAt: 'desc' }], returns: 'set' }),
+
+    // core self-tests — the substrate's own acceptance suite, as atoms, run by
+    // `--check`. These need no fixtures: they assert the core surface itself, are
+    // read-only (idempotent, safe to re-run), and one reuses a condition atom to
+    // check a value on the response. A `test` field `as` names the actor; `atom://0`
+    // is anonymous (no bearer). This is "the kernel supplies its own tests."
+    atom('cond-root-is-0', 'condition', "the root atom's id is 0", { label: 'root id == 0', field: 'id', op: 'eq', value: '0' }),
+    atom('test-root-readable',    'test', 'anyone can read the root atom',     { label: 'root readable by anyone', as: 'atom://0',    method: 'GET', path: '/',            expect: { status: 200, conditions: ['atom://cond-root-is-0'] } }),
+    atom('test-anon-blocked',     'test', 'anonymous cannot read data',         { label: 'anon blocked from /token', as: 'atom://0',    method: 'GET', path: '/token',       expect: { status: 401 } }),
+    atom('test-models-listable',  'test', 'the admin can list the models',      { label: 'models listable',          as: 'atom://joey', method: 'GET', path: '/model',       expect: { status: 200 } }),
+    atom('test-suite-self-visible','test', 'the suite is itself a set of atoms', { label: 'tests are atoms',          as: 'atom://joey', method: 'GET', path: '/test',        expect: { status: 200 } }),
+    atom('test-unknown-404',      'test', 'an unknown id is a 404',             { label: 'unknown id → 404',         as: 'atom://joey', method: 'GET', path: '/no-such-atom', expect: { status: 404 } }),
   ];
 }
 
@@ -2243,6 +2265,60 @@ function audit() {
   return findings.length ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Self-tests — `node atomic.mjs --check` (or `npm run check`). The substrate
+// carries its own acceptance suite as `test` atoms (see the `test` model); this
+// runs each over the live HTTP surface, as its `as` token, and checks the response
+// `status` plus any `condition` atoms — reused as the assertion language — against
+// the response body (a dotted `field` reads id / manifest / attr.x.y / lifecycle.*).
+// Read-only and negative (non-2xx) tests don't mutate, so --check is re-runnable in
+// CI. It listens on an ephemeral local port, runs, and exits non-zero on any failure.
+// ---------------------------------------------------------------------------
+async function check() {
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const at = (obj, path) => String(path).split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+  const holds = (payload, cond) => {
+    const { field, op, value } = cond?.attr || {};
+    const v = at(payload, field);
+    return op === 'eq' ? v === value : op === 'ne' ? v !== value
+      : op === 'in' ? (Array.isArray(value) && value.includes(v)) : false;
+  };
+  const tests = store.query({ model: 'atom://test' })
+    .filter((t) => t.lifecycle?.status !== 'retired')
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+  let pass = 0, fail = 0;
+  for (const t of tests) {
+    const a = t.attr || {}, exp = a.expect || {};
+    const asId = a.as ? (isRef(a.as) ? refId(a.as) : a.as) : null;
+    const headers = {};
+    if (asId && asId !== '0') headers.authorization = 'Bearer ' + asId;   // atom://0 / absent → anonymous
+    if (a.body !== undefined) headers['content-type'] = 'application/json';
+    let ok = true, why = '';
+    try {
+      const r = await fetch(base + a.path, { method: a.method || 'GET', headers,
+        body: a.body !== undefined ? JSON.stringify(a.body) : undefined });
+      if (exp.status !== undefined && r.status !== exp.status) { ok = false; why = `status ${r.status} ≠ ${exp.status}`; }
+      if (ok && (exp.conditions?.length || exp.count !== undefined)) {
+        const payload = await r.json().catch(() => null);
+        if (exp.count !== undefined) {
+          const n = Array.isArray(payload) ? payload.length : -1;
+          if (n !== exp.count) { ok = false; why = `count ${n} ≠ ${exp.count}`; }
+        }
+        for (const cref of (ok ? (exp.conditions || []) : [])) {
+          const cond = store.get(isRef(cref) ? refId(cref) : cref);
+          if (!cond || !holds(payload, cond)) { ok = false; why = `condition ${cref} failed`; break; }
+        }
+      }
+    } catch (e) { ok = false; why = e.message; }
+    ok ? pass++ : fail++;
+    console.log(`${ok ? ' ok ' : 'FAIL'}  ${t.id}: ${a.label || a.path}${ok ? '' : `  (${why})`}`);
+  }
+  console.log(`\ncheck: ${pass} passed, ${fail} failed`);
+  await new Promise((res) => server.close(res));
+  return fail ? 1 : 0;
+}
+
 if (loadAll()) {                 // durable store on disk -> replay it
   buildInverse();
   logSeq = [...store.values()].reduce((m, a) => a.id.startsWith('log-') ? Math.max(m, +a.id.slice(4) || 0) : m, 0);
@@ -2252,6 +2328,7 @@ if (loadAll()) {                 // durable store on disk -> replay it
 }
 
 if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens
+if (process.argv.includes('--check')) process.exit(await check()); // self-tests (the test atoms), then stop
 
 const PORT = process.env.PORT || 3040; // matches the seeds' default base and the documented live port
 server.listen(PORT, () => {
