@@ -56,7 +56,7 @@ ok(await code('tk-all', 'POST', '/widget', { attr: { name: 'x', size: 999 } }) =
 ok(await code('tk-all', 'POST', '/widget', { attr: { name: 'x', email: 'bad' } }) === 400, 'semantic email enforced');
 ok(await code('tk-all', 'POST', '/widget', { id: 'w1', attr: { name: 'Alpha', size: 5, kind: 'a' } }) === 201, 'valid create');
 
-// --- permits: read / write / all --------------------------------------------
+// --- permits: read / write / all ---------------------------------------------
 ok(await code('tk-name', 'POST', '/widget', { id: 'w2', attr: { name: 'Beta' } }) === 201, 'write-only token can create');
 ok((await jsonOf('tk-name', '/widget')).length === 0, 'write-only token sees no list (no read)');
 ok(await code('tk-name', 'GET', '/w1') === 404, 'write-only token cannot read a record');
@@ -77,7 +77,7 @@ ok(!(await jsonOf('tk2', '/widget')).find((a) => a.id === 'w1'), 'tenant isolati
 ok(await code('tk2', 'GET', '/w1') === 404, 'tenant isolation: t2 cannot read a t1 record');
 ok(await code('tk2', 'PATCH', '/w1', { attr: { name: 'hacked' } }) === 404, 'tenant isolation: t2 cannot write a t1 record');
 
-// --- parent-on-create (provisioning) ----------------------------------------
+// --- parent-on-create (provisioning) -----------------------------------------
 ok(await code('joey', 'POST', '/widget', { id: 'w-t2', parent: 'atom://t2', attr: { name: 'In T2' } }) === 201, 'root can place into a tenant');
 ok(await code('tk-all', 'POST', '/widget', { parent: 'atom://t2', attr: { name: 'x' } }) === 403, 'non-superuser cannot place cross-tenant');
 
@@ -100,7 +100,7 @@ ok(await code('tk-nodel', 'DELETE', '/w2') === 403, 'delete blocked without a mu
 ok(await code('tk-all', 'DELETE', '/w2') === 200, 'delete with grant retires');
 ok(!(await jsonOf('tk-all', '/widget')).find((a) => a.id === 'w2'), 'retired atom hidden from list');
 
-// --- hooks (model-registered in lifecycle; run under own grants, no invoke) --
+// --- hooks (model-registered in lifecycle; run under own grants, no invoke) ---
 await J('tk-stamp', 'POST', '/widget', { id: 'w-hook', attr: { name: 'Gamma' } });
 ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'model hook wrote a field under its own grant');
 ok(await code('tk-stamp', 'POST', '/widget', { attr: { name: 'z2', stamp: 'no' } }) === 403, 'caller cannot write the hook-only field directly');
@@ -146,7 +146,7 @@ ok(!!link, 'magic link issued (dev fallback shows link)');
 const ver = await fetch(base + link.slice(base.length), { redirect: 'manual' });
 ok((ver.headers.get('set-cookie') || '').includes('atomic_session'), 'magic link verifies into a session');
 
-// --- access invariants: the tree decides who may write ----------------------
+// --- access invariants: the tree decides who may write -----------------------
 // global/root atoms are root-only: a tenant user can't write one even WITH the grant
 await J('joey', 'POST', '/config', { id: 'cfg-g', parent: 'atom://0', attr: { key: 'k', value: 1 } });
 await mk('tk-cfg', 't1', [{ path: 'config.*', mode: 'all' }]);
@@ -165,7 +165,7 @@ ok(await code('joey', 'POST', '/hook', { id: 'h-bad', attr: { run: '../../x', gr
 // sessions are bearer credentials, never served through the surface
 ok(await code('joey', 'GET', '/' + cookie.split('=')[1]) === 404, 'a session atom is unreadable, even by root');
 
-// --- schema migration: version-bump rewrite on read -------------------------
+// --- schema migration: version-bump rewrite on read --------------------------
 // gadget v1: a record written under the old shape, then evolved forward by a
 // chain of migrations (rename → default → custom). The kernel brings it forward.
 await J('joey', 'POST', '/model', { id: 'gadget', attr: { label: 'Gadget', version: 1, fields: {
@@ -245,7 +245,7 @@ ok((await J('joey', 'GET', '/loopy', null, { accept: 'text/html' })).status === 
 // L2: an id with HTML/URL metacharacters is rejected.
 ok(await code('joey', 'POST', '/widget', { id: '<script>', attr: { name: 'x' } }) === 400, 'unsafe id rejected');
 
-// --- transactions: /tx all-or-nothing ---------------------------------------
+// --- transactions: /tx all-or-nothing ----------------------------------------
 // happy path: a batch of two creates commits together
 ok(await code('tk-all', 'POST', '/tx', [
   { op: 'create', model: 'widget', id: 'tx-a', attr: { name: 'TxA' } },
@@ -275,7 +275,7 @@ ok(!(await jsonOf('tk-all', '/widget')).find((a) => a.id === 'tx-b'), '/tx-retir
 ok(await code('tk-read', 'POST', '/tx', [{ op: 'create', model: 'widget', id: 'tx-x', attr: { name: 'No' } }]) === 403, '/tx enforces grants per op');
 ok(await code('tk-all', 'GET', '/tx-x') === 404, '/tx applied nothing when an op was unauthorized');
 
-// --- atomic import (?atomic=1) ------------------------------------------------
+// --- atomic import (?atomic=1) -----------------------------------------------
 ok(await code('tk-all', 'POST', '/widget?atomic=1', [
   { id: 'tx-e', attr: { name: 'TxE' } },
   { attr: { name: 'TxF', size: 999 } },          // size > max → invalid
@@ -287,7 +287,7 @@ const best = await (await J('tk-all', 'POST', '/widget', [
 ])).json();
 ok(best.imported === 1 && best.failed.length === 1, 'default import stays per-row best-effort');
 
-// --- reusable shapes: embed://<model> as a first-class, shared schema fragment --
+// --- reusable shapes: embed://<model> as a first-class, shared schema fragment ---
 // addr2 is a shape; person2 reuses it under TWO fields — `home` (object form,
 // required) and `work` (string shorthand). One shape, referenced twice.
 await J('joey', 'POST', '/model', { id: 'addr2', attr: { label: 'Addr2', version: 1, fields: {
@@ -318,7 +318,7 @@ ok(p5.attr.home.city === 'Town' && p5.attr.work.line1 === '7 Work', 'embed: dott
 const csvOut = await (await J('joey', 'GET', '/person2?as=csv')).text();
 ok(csvOut.includes('home.line1') && csvOut.split('\n').some((l) => l.includes('Town')), 'embed: CSV export emits dotted columns');
 
-// --- grid editor: inline single-field edits (the cells app.js wires to PATCH) ----
+// --- grid editor: inline single-field edits (the cells app.js wires to PATCH) ---
 // the model grid renders editable cells only where the actor may update the field.
 const ghtml = await (await J('tk-all', 'GET', '/widget', null, { accept: 'text/html' })).text();
 ok(ghtml.includes('data-edit') && ghtml.includes('contenteditable'), 'grid: editable cells render for a token with update grant');
@@ -342,7 +342,7 @@ ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook-written field pe
 g = await jsonOf('joey', '/g1');
 ok(g.attr.name === 'old value' && g.attr.status === 'active' && g.attr.slug === 'hello-world' && g.lifecycle.modelVersion === 4, 'migrated shape persists across restart');
 
-// --- self-tests as atoms: the kernel runs its OWN acceptance suite (--check) -----
+// --- self-tests as atoms: the kernel runs its OWN acceptance suite (--check) ---
 // Seed a few feature test atoms (idempotent: a read + two negatives), then run the
 // kernel's --check over the populated store. This proves the substrate carries its
 // own tests as data — the core self-tests plus these seeded ones run green.
