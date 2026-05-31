@@ -1,10 +1,27 @@
-// Helpers for the demo seeds. Everything is POSTed through the API as the admin
-// token, so seeding is just atom CRUD — nothing special, nothing in the kernel.
-//   ATOMIC_BASE  (default http://localhost:3040)
-//   ATOMIC_TOKEN (default joey — the admin/superuser)
+// Helpers for the demo seeds. Everything is POSTed through the API as the admin,
+// so seeding is just atom CRUD — nothing special, nothing in the kernel.
+//   ATOMIC_BASE          (default http://localhost:3040)
+//   ATOMIC_ADMIN_SECRET  the admin API secret, if one is configured
+//   ATOMIC_ADMIN_EMAIL   (default joey@emailjoey.com) — for the magic-link fallback
 const BASE = process.env.ATOMIC_BASE || 'http://localhost:3040';
-const TOKEN = process.env.ATOMIC_TOKEN || 'joey';
-const H = { authorization: 'Bearer ' + TOKEN, 'content-type': 'application/json' };
+const ADMIN_EMAIL = process.env.ATOMIC_ADMIN_EMAIL || 'joey@emailjoey.com';
+
+// A token's public id is NOT a credential. Authenticate the admin the real way: an
+// API secret if configured, else the magic-link flow (in dev the link is returned in
+// the response, since no mailer is set). The bearer is the resulting secret/session —
+// never an atom id. Exported so seed-d can reuse the same admin credential.
+async function adminBearer() {
+  if (process.env.ATOMIC_ADMIN_SECRET) return process.env.ATOMIC_ADMIN_SECRET;
+  const r = await fetch(`${BASE}/auth`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: ADMIN_EMAIL }) });
+  const { link } = await r.json().catch(() => ({}));
+  if (!link) throw new Error(`admin sign-in failed for ${ADMIN_EMAIL}: no dev link. Set ATOMIC_ADMIN_SECRET, or seed a dev instance (no SENDGRID).`);
+  const v = await fetch(link, { redirect: 'manual' });
+  const sid = (v.headers.get('set-cookie') || '').split(';')[0].split('=')[1];
+  if (!sid) throw new Error('admin sign-in failed: no session cookie');
+  return sid;
+}
+export const AUTH = 'Bearer ' + await adminBearer();
+const H = { authorization: AUTH, 'content-type': 'application/json' };
 
 async function api(method, path, body) {
   const r = await fetch(BASE + path, { method, headers: H, body: body ? JSON.stringify(body) : undefined });

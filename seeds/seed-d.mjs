@@ -5,15 +5,15 @@
 //
 // Billy is one of the two adults; he also gets an open-login token (atom://billy,
 // j@a-gnt.com) so he can one-click into the house from the homepage and read it.
-import { tenant, model, token, atom, index, A } from './seed-lib.mjs';
+import { tenant, model, token, atom, index, A, AUTH } from './seed-lib.mjs';
 
-// raw PATCH (update) as the admin token — used by lockToHouse() to install the
-// graph-gated write rules and Billy's house anchor after the data exists.
+// raw PATCH (update) as the admin — used by lockToHouse() to install the graph-gated
+// write rules and Billy's house anchor after the data exists. AUTH is the admin
+// credential resolved by seed-lib (an API secret or a magic-link session, never an id).
 const BASE = process.env.ATOMIC_BASE || 'http://localhost:3040';
-const TOK = process.env.ATOMIC_TOKEN || 'joey';
 async function patch(id, attr) {
   const r = await fetch(`${BASE}/${id}`, { method: 'PATCH',
-    headers: { authorization: 'Bearer ' + TOK, 'content-type': 'application/json' },
+    headers: { authorization: AUTH, 'content-type': 'application/json' },
     body: JSON.stringify({ attr }) });
   if (r.status !== 200) throw new Error(`patch ${id}: ${r.status} ${await r.text()}`);
 }

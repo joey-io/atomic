@@ -5,7 +5,7 @@
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
-![tests](https://img.shields.io/badge/tests-118%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-123%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Atomic is a dependency-free, single-file kernel for graph-relational data. Every record — a row of data, a type definition, a permission grant, a saved query, an audit-log entry, even a test — is one shape:
@@ -56,7 +56,7 @@ npm start
 ATOMIC_STORE=./data npm start
 
 # run the test suite, the self-tests, and the governance audit
-npm test         # 118 assertions over HTTP
+npm test         # 123 assertions over HTTP
 npm run check    # the kernel's own test atoms
 npm run audit    # structural invariants (exits non-zero on any finding)
 
@@ -64,7 +64,7 @@ npm run audit    # structural invariants (exits non-zero on any finding)
 npm run seed
 ```
 
-The admin identity is the token `atom://joey`. Authenticate with `Authorization: Bearer joey` for local exploration, or use the magic-link sign-in flow (below).
+**Authentication.** A token's public id is never a credential. Humans sign in by magic-link (`POST /auth { email }` → a link → a session cookie; in dev with no mailer configured, the link is returned in the response). Integrations present a token's **API secret** as `Authorization: Bearer <secret>` — minted and shown **once** when the token is created. The admin can also be given a fixed secret via the `ATOMIC_ADMIN_SECRET` env var (used by `npm run seed` and CI); otherwise the admin is magic-link only.
 
 ---
 
@@ -154,17 +154,18 @@ The surface is generated from the atoms. HTTP method maps to an operation, gated
 | `POST /tx` | transaction | a JSON array of ops, applied all-or-nothing |
 
 ```bash
+# $SECRET is a token's API secret (shown once at creation), or ATOMIC_ADMIN_SECRET.
 # create
-curl -X POST localhost:3040/contact -H 'authorization: Bearer joey' \
+curl -X POST localhost:3040/contact -H "authorization: Bearer $SECRET" \
   -H 'content-type: application/json' \
   -d '{"id":"c1","attr":{"name":"Jane Roe","email":"jane@northwind.com"}}'
 
 # read · list · filter · sort
-curl localhost:3040/c1 -H 'authorization: Bearer joey'
-curl 'localhost:3040/contact?email=jane@northwind.com&sort=-createdAt' -H 'authorization: Bearer joey'
+curl localhost:3040/c1 -H "authorization: Bearer $SECRET"
+curl 'localhost:3040/contact?email=jane@northwind.com&sort=-createdAt' -H "authorization: Bearer $SECRET"
 
 # update one field with optimistic concurrency
-curl -X PATCH localhost:3040/c1 -H 'authorization: Bearer joey' \
+curl -X PATCH localhost:3040/c1 -H "authorization: Bearer $SECRET" \
   -H 'content-type: application/json' -H 'if-match: 1' \
   -d '{"attr":{"name":"Jane R."}}'
 ```
@@ -172,7 +173,7 @@ curl -X PATCH localhost:3040/c1 -H 'authorization: Bearer joey' \
 ### Transactions
 
 ```bash
-curl -X POST localhost:3040/tx -H 'authorization: Bearer joey' \
+curl -X POST localhost:3040/tx -H "authorization: Bearer $SECRET" \
   -H 'content-type: application/json' -d '[
     {"op":"create","model":"contact","id":"c2","attr":{"name":"A"}},
     {"op":"update","id":"c1","ifMatch":2,"attr":{"name":"B"}},
@@ -189,7 +190,7 @@ Every model table and index result has an **export** (`?as=csv`) and a **templat
 
 ## Identity & access
 
-- **Tokens.** A `token` atom is an identity carrying `grants` (and/or `roles`). Authenticate with `Authorization: Bearer <token-id>`.
+- **Tokens.** A `token` atom is an identity carrying `grants` (and/or `roles`). A token's public **id is never a credential** (ids leak through `createdBy`, refs, and path reads). Each token instead holds a high-entropy **API secret**, stored only as a hash and surfaced once at creation; present it as `Authorization: Bearer <secret>`. A session id works as a bearer too (`Bearer sess-…`), identical to the cookie.
 - **Grants.** `{ path, mode }` where mode is `read` · `create` · `update` · `delete` · `write` (the mutation superset — does **not** imply read) · `all`. Paths are `model`, `model.field`, or wildcards (`*`, `**`).
 - **Roles.** A `role` atom bundles reusable grants; a token's effective grants are its own plus its roles'. A token can only wear a role within its own grants (attenuation).
 - **Tenancy is structural.** `lifecycle.parent` forms the tenant tree. You may write an atom only if you share its tenant ancestor (or you are a tenant-less root). Global atoms (`parent atom://0`) are world-readable and root-writable.
@@ -233,6 +234,7 @@ Read from the environment, with `./.env` as a fallback (gitignored).
 | `PORT` | HTTP port | `3040` |
 | `ATOMIC_STORE` | Directory for the durable SQLite store | unset → in-memory |
 | `ATOMIC_KEY` | Encryption key (64-hex or passphrase) for AES-256-GCM at rest | unset → plaintext |
+| `ATOMIC_ADMIN_SECRET` | A fixed API secret for the admin token (`Bearer <it>`), for CI / seeds | unset → admin is magic-link only |
 | `SENDGRID_API_KEY` | Sends magic-link sign-in email | unset → dev fallback (link surfaced locally) |
 | `ATOMIC_MAIL_FROM` | From-address for sign-in email | — |
 
@@ -243,7 +245,7 @@ Read from the environment, with `./.env` as a fallback (gitignored).
 | Command | What it does |
 |---------|--------------|
 | `npm start` | Run the kernel (`node atomic.mjs`). |
-| `npm test` | Full HTTP smoke test — 118 assertions, boots a temp instance, restarts to prove durability. |
+| `npm test` | Full HTTP smoke test — 123 assertions, boots a temp instance, restarts to prove durability. |
 | `npm run check` | Run the substrate's own `test` atoms (`node atomic.mjs --check`). |
 | `npm run audit` | Structural governance check (`node atomic.mjs --audit`); exits non-zero on any finding. |
 | `npm run seed` | Load four demo tenants over the API. |
@@ -254,7 +256,7 @@ Read from the environment, with `./.env` as a fallback (gitignored).
 
 Verification lives at two levels:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (118 assertions): validation, grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability across restart, and security regressions.
+- **`test.mjs`** — an independent, black-box HTTP suite (123 assertions): validation, grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability across restart, and security regressions.
 - **`--check`** — the substrate's own acceptance suite, **as data**: a `test` atom is `{ as, method, path, body, expect }`, run over the live surface as its `as` token, asserting status plus `condition` atoms against the response. Baked-in core self-tests run on any store; a tenant can add `test` atoms for its own models. `test.mjs`'s final assertion is that `--check` itself exits green.
 - **`--audit`** — a structural fsck: every atom resolves to a model, every reference resolves, every atom conforms to its schema, every grant/ledger entry/parent is well-formed.
 
@@ -276,7 +278,7 @@ package.json      scripts; no dependencies
 
 ## Status
 
-A runnable kernel, exercised by 118 test assertions and a structural audit. A reference instance runs under pm2 at `http://165.22.37.30:3040/`.
+A runnable kernel, exercised by 123 test assertions and a structural audit. Pre-launch and experimental.
 
 **Built:** atoms · models & validation · `embed://` reusable shapes · refs + inverse edges · paths · grants/roles · structural tenancy · transactions (`/tx`) · hooks · lazy expiration · lazy schema migration · CSV import/export · editable grid · tests-as-atoms (`--check`) · governance audit (`--audit`) · durable/encrypted SQLite · hardened HTTP surface.
 

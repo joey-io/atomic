@@ -6,15 +6,24 @@ import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 
 const PORT = 7790, STORE = '/tmp/atomic-test-store', base = `http://localhost:${PORT}`;
+const ADMIN = 'atk_test_admin_secret';                 // the kernel boots with ATOMIC_ADMIN_SECRET = this
+const SECRETS = { joey: ADMIN };                       // tokenId -> its clear API secret (the bearer credential)
 let pass = 0, fail = 0;
 const ok = (c, m) => { c ? pass++ : fail++; console.log(`${c ? ' ok ' : 'FAIL'}  ${m}`); };
+// a bearer is a token's API secret — never its public id (ids are not credentials).
 const J = (tok, method, p, body, headers = {}) => fetch(base + p, {
-  method, headers: { ...(tok ? { authorization: 'Bearer ' + tok } : {}), 'content-type': 'application/json', ...headers },
+  method, headers: { ...(tok && SECRETS[tok] ? { authorization: 'Bearer ' + SECRETS[tok] } : {}), 'content-type': 'application/json', ...headers },
   body: body ? JSON.stringify(body) : undefined,
 });
 const code = (tok, method, p, body, h) => J(tok, method, p, body, h).then((r) => r.status);
 const jsonOf = (tok, p) => J(tok, 'GET', p).then((r) => r.json());
-const start = () => spawn('node', ['atomic.mjs'], { env: { ...process.env, PORT, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '' }, stdio: 'ignore' });
+// create a token as admin and capture its one-time clear secret for later Bearer auth
+async function mkToken(body) {
+  const j = await (await J('joey', 'POST', '/token', body)).json();
+  if (j.id && j.secret) SECRETS[j.id] = j.secret;
+  return j;
+}
+const start = () => spawn('node', ['atomic.mjs'], { env: { ...process.env, PORT, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'ignore' });
 async function wait() { for (let i = 0; i < 50; i++) { try { await fetch(base + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); }
 
 rmSync(STORE, { recursive: true, force: true });
@@ -40,14 +49,14 @@ await J('joey', 'POST', '/model', { id: 'widget', manifest: 'Widget', hooks: { c
 await J('joey', 'POST', '/role', { id: 'role-reader', attr: { label: 'Reader', grants: [{ path: 'widget.*', mode: 'read' }] } });
 await J('joey', 'POST', '/tenant', { id: 't1', attr: { name: 'T1' } });
 await J('joey', 'POST', '/tenant', { id: 't2', attr: { name: 'T2' } });
-const mk = (id, t, grants) => J('joey', 'POST', '/token', { id, parent: 'atom://' + t, attr: { email: `${id}@x.com`, grants } });
+const mk = (id, t, grants) => mkToken({ id, parent: 'atom://' + t, attr: { email: `${id}@x.com`, grants } });
 await mk('tk-all', 't1', [{ path: '**', mode: 'all' }]);
 await mk('tk-read', 't1', [{ path: 'widget.*', mode: 'read' }]);
 await mk('tk-name', 't1', [{ path: 'widget.name', mode: 'write' }]); // write name only, no read
 await mk('tk-stamp', 't1', [{ path: 'widget.name', mode: 'write' }, { path: 'stamp', mode: 'read' }]);
 await mk('tk-link', 't1', [{ path: 'widget.name', mode: 'write' }, { path: 'link', mode: 'read' }]);
 await mk('tk2', 't2', [{ path: '**', mode: 'all' }]);
-await J('joey', 'POST', '/token', { id: 'tk-roled', parent: 'atom://t1', attr: { email: 'tk-roled@x.com', roles: ['atom://role-reader'] } });
+await mkToken({ id: 'tk-roled', parent: 'atom://t1', attr: { email: 'tk-roled@x.com', roles: ['atom://role-reader'] } });
 
 // --- validation --------------------------------------------------------------
 ok(await code('tk-all', 'POST', '/widget', { attr: {} }) === 400, 'required field enforced');
@@ -208,6 +217,15 @@ ok((await (await J('tk-nameonly', 'GET', '/w1.name')).json()) === 'Alpha', 'path
 ok(await code('tk-read', 'GET', '/joey.email') === 404, 'path read cannot leak another token’s field');
 ok(await code('tk-read', 'GET', '/joey.grants') === 404, 'path read cannot leak another token’s grants');
 
+// H3: a token's PUBLIC ID is not a credential — only its API secret (Bearer) or a
+// session is. The old `Bearer joey` = instant admin hole must be dead, and the
+// secret hash must never leave the kernel (not in the atom, not via a path).
+ok((await fetch(base + '/widget', { headers: { authorization: 'Bearer joey' } })).status === 401, 'Bearer <admin id> is not a credential — no impersonation by id');
+ok((await fetch(base + '/widget', { headers: { authorization: 'Bearer tk-all' } })).status === 401, 'Bearer <tenant token id> is rejected too');
+ok((await fetch(base + '/widget', { headers: { authorization: 'Bearer ' + SECRETS['tk-read'] } })).status === 200, 'Bearer <API secret> authenticates');
+ok((await jsonOf('joey', '/tk-all')).attr.secret === undefined, 'a token’s secret hash is never served (not even to admin)');
+ok(await code('joey', 'GET', '/tk-all.secret') === 404, 'a token’s secret is not reachable by path');
+
 // H2: roles are attenuated too — a token cannot wear a role that grants more than
 // the issuer holds (else "mint a ** role, then wear it" bypasses attenuation).
 await J('joey', 'POST', '/role', { id: 'role-admin', attr: { label: 'Admin', grants: [{ path: '**', mode: 'all' }] } });
@@ -309,7 +327,7 @@ ok((await jsonOf('joey', '/p-3')).attr.work.city === 'Metro', 'embed: reused sha
 const tmpl = await (await J('joey', 'GET', '/person2?as=template')).text();
 ok(tmpl.includes('home.line1') && tmpl.includes('work.city'), 'embed: CSV template flattens the shape into dotted columns');
 // a dotted CSV import rebuilds the nested objects
-const impRes = await fetch(base + '/person2', { method: 'POST', headers: { authorization: 'Bearer joey', 'content-type': 'text/csv' },
+const impRes = await fetch(base + '/person2', { method: 'POST', headers: { authorization: 'Bearer ' + ADMIN, 'content-type': 'text/csv' },
   body: 'id,manifest,name,home.line1,home.city,work.line1\np-5,,Dot,5 Pine,Town,7 Work\n' });
 ok(impRes.status === 200, 'embed: dotted CSV import accepted');
 const p5 = await jsonOf('joey', '/p-5');
@@ -352,7 +370,7 @@ await J('joey', 'POST', '/test', { id: 't-enum-400', attr: { label: 'bad enum is
 await J('joey', 'POST', '/test', { id: 't-read-403', attr: { label: 'read token cannot write', as: 'atom://tk-read', method: 'POST', path: '/widget', body: { attr: { name: 'z' } }, expect: { status: 403 } } });
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 const checkCode = await new Promise((res) => spawn('node', ['atomic.mjs', '--check'],
-  { env: { ...process.env, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '' }, stdio: 'inherit' }).on('exit', (c) => res(c)));
+  { env: { ...process.env, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'inherit' }).on('exit', (c) => res(c)));
 ok(checkCode === 0, 'kernel --check runs the substrate’s own test atoms green (core + seeded)');
 
 console.log(`\n${pass} passed, ${fail} failed`);

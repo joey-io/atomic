@@ -14,7 +14,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
+import { randomUUID, randomBytes, scryptSync, createCipheriv, createDecipheriv, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite'; // embedded SQLite — part of the Node runtime, not a dependency
 
 // load ./.env (KEY=VALUE lines) into process.env as a fallback — no dependency,
@@ -432,6 +432,7 @@ function readField(node, seg, actor) {
   if (Array.isArray(node)) return node.map((n) => readField(deref(n, actor), seg, actor));
   if (isAtomObj(node)) {
     if (node.attr && seg in node.attr) {
+      if (seg === 'secret') throw new Err(404, `no field .${seg} on ${node.id}`); // never traversable (see redact)
       // per-attribute read grant — the same redaction the whole-atom view applies,
       // so a path can't reach an attribute the actor couldn't see directly.
       if (actor && !canRead(actor, `${refId(node.model)}.${seg}`)) throw new Err(404, `no field .${seg} on ${node.id}`);
@@ -592,21 +593,40 @@ function parseCookies(req) {
   return out;
 }
 
-// The actor is resolved from a tracked session (cookie) or a bearer token.
-// An unauthenticated request resolves to atom://0 — the anonymous identity,
-// which can read the app descriptor but holds no data grants.
+const sha256 = (s) => createHash('sha256').update(String(s)).digest('hex');
+
+// Secret → token resolver, memoized on storeGen. A token's API secret is stored
+// only as a hash (attr.secret); the bearer presents the CLEAR secret, which we
+// hash and look up. Rebuilt lazily whenever the store changes.
+const _secretIdx = { gen: -1, map: new Map() };
+function tokenBySecret(clear) {
+  if (_secretIdx.gen !== storeGen) {
+    const map = new Map();
+    for (const t of store.query({ model: 'atom://token' }))
+      if (t.attr?.secret && t.lifecycle?.status !== 'retired') map.set(t.attr.secret, t.id);
+    _secretIdx.gen = storeGen; _secretIdx.map = map;
+  }
+  const id = _secretIdx.map.get(sha256(clear));
+  return id ? getAtom(id) : null;
+}
+
+// The actor is resolved from a tracked session (cookie or `Bearer sess-…`) or a
+// token's API secret (`Bearer <secret>`). A token's PUBLIC ID is never a credential
+// — ids leak through createdBy, refs, and path reads, so accepting one would let
+// anyone impersonate any token (e.g. the old `Bearer joey` = instant admin). An
+// unauthenticated request resolves to atom://0 — the anonymous identity.
 function actorFromReq(req, cookies) {
   const auth = req.headers['authorization'] || '';
-  const m = auth.match(/^Bearer\s+(.+)$/i);              // integrations present a token directly
-  // a bearer credential must resolve to a TOKEN atom — never any other atom kind,
-  // so e.g. `Bearer northwind` (a company id) can't be presented as an identity —
-  // and the token must still be live: retiring or expiring a token revokes it (the
-  // session path below already checks this; the Bearer path must too).
-  if (m && store.has(m[1])) {
-    const t = getAtom(m[1]);
-    if (t.model === 'atom://token' && t.lifecycle?.status !== 'retired' && !isExpired(t)) return t;
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  const bearer = m ? m[1] : null;
+  let sid = cookies['atomic_session'];                   // browsers carry a session the kernel tracks
+  if (bearer) {
+    if (bearer.startsWith('sess-')) sid = bearer;        // a session id, presented as a bearer (= the cookie)
+    else {                                               // otherwise it must be a token's API secret
+      const t = tokenBySecret(bearer);
+      if (t && t.lifecycle?.status !== 'retired' && !isExpired(t)) return t;
+    }
   }
-  const sid = cookies['atomic_session'];                 // browsers carry a session the kernel tracks
   if (sid && store.has(sid)) {
     const s = store.get(sid);
     if (s.model === 'atom://session' && s.lifecycle.status === 'active' &&
@@ -982,6 +1002,7 @@ function redact(actor, atom) {
   const modelId = refId(atom.model);
   const attr = {};
   for (const [k, v] of Object.entries(atom.attr || {})) {
+    if (k === 'secret') continue;                  // a token's API secret hash is never served, to anyone
     if (canRead(actor, `${modelId}.${k}`)) attr[k] = v;
   }
   return { ...atom, attr };
@@ -1096,7 +1117,16 @@ function create(modelId, body, actor) {
   };
   if (!writable(actor, atom))
     throw new Err(403, `cannot create ${modelId} (tenant scope or write rule)`);
+  // a token gets a high-entropy API secret on creation. We persist only its hash
+  // (attr.secret — never served), and surface the CLEAR value ONCE via a non-
+  // enumerable property, so it is neither stored nor readable again.
+  let mintedSecret = null;
+  if (modelId === 'token') {
+    mintedSecret = 'atk_' + randomBytes(32).toString('hex');
+    atom.attr.secret = sha256(mintedSecret);
+  }
   seed(atom);
+  if (mintedSecret) Object.defineProperty(atom, '_secret', { value: mintedSecret, enumerable: false });
   if (modelId === 'model') {
     buildInverse(); // a new model may declare inverse edges
     // creator-owns: defining a type mints full ownership of it for a tenant user,
@@ -1130,6 +1160,7 @@ function writeAtom(id, body, actor, ifMatch, mode) {
     throw new Err(409, `version conflict: have ${atom.lifecycle.version}, sent ${ifMatch}`);
   const before = { ...atom.attr };
   atom.attr = validate(modelId, mode === 'replace' ? (body.attr || {}) : { ...atom.attr, ...body.attr });
+  if (modelId === 'token' && before.secret) atom.attr.secret = before.secret; // secret is kernel-owned: immutable, never user-set
   attenuate(actor, modelId, atom.attr);
   if (!writable(actor, atom)) throw new Err(403, `cannot ${mode} ${modelId} (tenant scope or write rule)`);
   if (mode === 'update' && body.hooks) atom.lifecycle.hooks = body.hooks; // (re)register lifecycle hooks
@@ -1140,6 +1171,14 @@ function writeAtom(id, body, actor, ifMatch, mode) {
 }
 const update  = (id, body, actor, ifMatch) => writeAtom(id, body, actor, ifMatch, 'update');
 const replace = (id, body, actor, ifMatch) => writeAtom(id, body, actor, ifMatch, 'replace');
+
+// the create response for a token strips the stored secret HASH and surfaces the
+// CLEAR API secret exactly once (it is never recoverable again — store it now).
+function tokenCreateView(a) {
+  if (!a || a.model !== 'atom://token') return a;
+  const { secret, ...attr } = a.attr || {};
+  return { ...a, attr, ...(a._secret ? { secret: a._secret } : {}) };
+}
 
 // Hooks (the Logic primitive). A hook is an atom { run: <script>, grants: [...] }
 // registered in some atom's lifecycle.hooks (see runHooks). After a write, each
@@ -2118,7 +2157,7 @@ const server = http.createServer(async (req, res) => {
       if (Array.isArray(body)) return send(200, await bulkCreate(head, body, actor, atomic));
       const a = create(head, body, actor); await runHooks(a, 'create');
       if (a.model === 'atom://migration') await sweepModel(refId(a.attr.model)); // a new migration brings its model's atoms forward
-      return send(201, a);
+      return send(201, tokenCreateView(a)); // a token surfaces its clear API secret here, once
     }
     if (req.method === 'PUT') { const a = replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); if (a.model === 'atom://model') await sweepModel(a.id); return send(200, a); }
     if (req.method === 'PATCH') { const a = update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); if (a.model === 'atom://model') await sweepModel(a.id); return send(200, a); }
@@ -2382,7 +2421,7 @@ async function check() {
     const a = t.attr || {}, exp = a.expect || {};
     const asId = a.as ? (isRef(a.as) ? refId(a.as) : a.as) : null;
     const headers = {};
-    if (asId && asId !== '0') headers.authorization = 'Bearer ' + asId;   // atom://0 / absent → anonymous
+    if (asId && asId !== '0' && store.has(asId)) headers.authorization = 'Bearer ' + newSession(asId); // a session, not the public id
     if (a.body !== undefined) headers['content-type'] = 'application/json';
     let ok = true, why = '';
     try {
@@ -2415,6 +2454,18 @@ if (loadAll()) {                 // durable store on disk -> replay it
   await migrate();               // evolve an older store forward (idempotent): core atoms + schema migrations
 } else {
   bootstrap();                   // fresh -> seed (and persist, if ATOMIC_STORE is set)
+}
+
+// Optional: a clear admin API secret from the environment. When ATOMIC_ADMIN_SECRET
+// is set, the genesis admin token can be used non-interactively as `Bearer <secret>`
+// (for CI / seeds); unset, the admin authenticates only via the magic-link flow.
+// We store only the hash, like every other token.
+if (process.env.ATOMIC_ADMIN_SECRET) {
+  const joey = store.get('joey');
+  if (joey?.model === 'atom://token') {
+    const h = sha256(process.env.ATOMIC_ADMIN_SECRET);
+    if (joey.attr.secret !== h) { joey.attr.secret = h; persist(joey); }
+  }
 }
 
 if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens
