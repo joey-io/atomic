@@ -9,7 +9,7 @@ export default async function censusDistrict(atom, { patch, upsert, getAtom, ref
   // address.state is a ref to a state atom — resolve it to a two-letter abbr
   let abbr = '';
   if (a.state && a.state.startsWith && a.state.startsWith('atom://')) {
-    try { abbr = getAtom(refId(a.state)).attr.abbr || ''; } catch { /* unknown */ }
+    try { abbr = (await getAtom(refId(a.state))).attr.abbr || ''; } catch { /* unknown */ }
   } else if (typeof a.state === 'string') abbr = a.state;
 
   const u = new URL('https://geocoding.geo.census.gov/geocoder/geographies/address');
@@ -31,6 +31,6 @@ export default async function censusDistrict(atom, { patch, upsert, getAtom, ref
   const n = parseInt(num, 10);
   const padded = String(n).padStart(2, '0');
   const id = `cd-${abbr.toLowerCase()}-${padded}`;
-  const cd = upsert('census', id, { state: a.state, district: n, name: `${abbr}-${padded}` });
-  if (atom.attr.cd !== cd) patch({ cd });
+  const cd = await upsert('census', id, { state: a.state, district: n, name: `${abbr}-${padded}` });
+  if (atom.attr.cd !== cd) await patch({ cd });
 }
