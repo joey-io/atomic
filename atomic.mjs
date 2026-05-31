@@ -1697,6 +1697,24 @@ async function inboundRefs(targetId, targetModel) {
   return out;
 }
 
+// Phase 9 — the active legal hold (if any) covering this atom, by id / tenant / model scope.
+// Returns the hold atom, or null. Unconditional: not gated by mode, break-glass, or approval —
+// a hold's whole purpose is to override normal authority. (query scope is not yet evaluated.)
+async function heldBy(atom) {
+  if (!atom) return null;
+  const holds = (await store.query({ model: 'atom://legal-hold' }))
+    .filter((h) => h.lifecycle?.status !== 'retired' && (h.attr?.status || 'active') === 'active');
+  if (!holds.length) return null;
+  const tenant = await tenantOf(atom), modelId = refId(atom.model);
+  for (const h of holds) {
+    const t = isRef(h.attr.target) ? refId(h.attr.target) : h.attr.target;
+    const scope = h.attr.scope || 'atom';
+    if ((scope === 'atom' && t === atom.id) || (scope === 'tenant' && t === tenant) || (scope === 'model' && t === modelId))
+      return h;
+  }
+  return null;
+}
+
 // retire one atom, honoring every inbound edge's onDelete first — restrict refuses,
 // null clears the referring cell, cascade retires the referrer too — all inside one
 // transaction, so a base can never end up pointing at a ghost (and a half-applied
@@ -1704,6 +1722,9 @@ async function inboundRefs(targetId, targetModel) {
 async function retireWithRefs(atom, actor, seen) {
   if (seen.has(atom.id)) return atom;
   seen.add(atom.id);
+  // a legal hold blocks deletion of this atom (and so rolls back the whole cascade it sits in)
+  const held = await heldBy(atom);
+  if (held) throw new Err(423, `atom ${atom.id} is under an active legal hold (${held.id}) and cannot be deleted`);
   const model = refId(atom.model);
   for (const { src, field, mode } of await inboundRefs(atom.id, model)) {
     const srcModel = refId(src.model);
@@ -3045,6 +3066,16 @@ function coreAtoms() {
       expiresAt: { kind: 'datetime', required: true, filterable: true },
       grants: { kind: 'list', of: 'embed://grant' },
       status: { kind: 'enum', values: ['active', 'expired', 'revoked'], filterable: true } }),
+    // legal-hold — a retention override (Phase 9). An ACTIVE hold on an atom (by its id, its
+    // tenant, or its model) blocks retire/delete UNCONDITIONALLY — it trumps even break-glass
+    // and an approved change-request, because that is the point of a hold. Expiration still
+    // only HIDES atoms (lazy, non-destructive), so a held atom is never actually destroyed.
+    // A dangerous-write model: placing/releasing a hold is governance.
+    model('legal-hold', 'Legal Hold', {
+      target: { kind: 'text', required: true, filterable: true },
+      scope: { kind: 'enum', values: ['atom', 'tenant', 'model', 'query'] },
+      reason: { kind: 'text' }, status: { kind: 'enum', values: ['active', 'released'], filterable: true },
+      createdAt: { kind: 'datetime' }, releasedAt: { kind: 'datetime' } }),
     // export-job — evidence that a bulk export ran (Phase 1). Locked-mode --export-all
     // / --export-base write one of these BEFORE streaming a byte, so a shell operator's
     // dump is no longer silent. `sealed` records whether the bytes were AES-GCM sealed
@@ -3248,6 +3279,12 @@ async function audit() {
     const p = a.lifecycle?.parent;
     return isRef(p) && refId(p) !== a.id && !byId.has(refId(p));
   }).map((a) => `${a.id} → ${a.lifecycle.parent}`));
+
+  // Phase 9 — expired-but-held: atoms that expiration would hide from reads but a legal hold
+  // retains. Informational, NOT a finding — it is exactly the behavior a hold guarantees.
+  let expiredHeld = 0;
+  for (const a of atoms) if (a.lifecycle?.status !== 'retired' && await isExpired(a) && await heldBy(a)) expiredHeld++;
+  console.log(` ok   ${expiredHeld} expired-but-held atom${expiredHeld === 1 ? '' : 's'} (retained by a legal hold)`);
 
   console.log(`\naudit: ${atoms.length} atoms, ${findings.length} finding${findings.length === 1 ? '' : 's'}`);
   return findings.length ? 1 : 0;

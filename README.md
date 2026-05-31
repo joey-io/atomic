@@ -6,7 +6,7 @@
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0%20required-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
-![tests](https://img.shields.io/badge/tests-240%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-246%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Atomic is a single-file kernel for graph-relational data with no required dependencies (the
@@ -71,7 +71,7 @@ ATOMIC_DB=postgres://localhost/atomic npm start
 npm run seed
 
 # verify
-npm test         # 240 black-box HTTP assertions
+npm test         # 246 black-box HTTP assertions
 npm run check    # the kernel's own tests, which are themselves atoms
 npm run audit    # structural invariants (exits non-zero on any finding)
 ```
@@ -319,6 +319,10 @@ transaction.
   atom is expired when all of its policy's conditions hold; expired atoms are filtered out of
   reads but never mutated — editing one brings it back. The default policy is "not updated in
   three years."
+- **Legal hold.** A `legal-hold` atom `{ target, scope, reason, status }` (scope `atom` /
+  `tenant` / `model`) blocks retire/delete of the atoms it covers — **unconditionally**, even
+  under break-glass or an approved change-request. Expiration may hide a held atom, but a hold
+  guarantees it is never destroyed. (`--audit` reports the expired-but-held count.)
 - **Schema migration.** Each model carries a `version`, and each atom records the
   `modelVersion` it was written under. A `migration` atom is a one-way step (`rename` or
   `default` from a `spec`, or a vetted `custom` handler). Behind atoms are brought forward
@@ -405,7 +409,7 @@ Read from the environment, with `./.env` as a gitignored fallback.
 
 Verification lives at two levels, and the second is itself made of atoms:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (240 assertions) covering validation,
+- **`test.mjs`** — an independent, black-box HTTP suite (246 assertions) covering validation,
   grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability
   across restart, and security regressions.
 - **`--check`** — the substrate's own acceptance suite, *as data*: a `test` atom is
@@ -435,7 +439,7 @@ package.json scripts; no required dependencies
 
 ## Status
 
-Atomic is pre-launch and experimental. It runs, and it is exercised by 240 HTTP test
+Atomic is pre-launch and experimental. It runs, and it is exercised by 246 HTTP test
 assertions, a self-test suite, and a structural audit — but interfaces may still change.
 
 ---

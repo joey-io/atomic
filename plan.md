@@ -588,6 +588,25 @@ Break-glass is also the key that unlocks Phase 1's CLI bulk export and Phase 7's
 
 ## Phase 9 — Legal hold + retention hardening
 
+> **Status: implemented (2026-05-31).** A `legal-hold` model ships in `coreAtoms()` (a
+> dangerous-write model — placing/releasing a hold is governance). `heldBy(atom)` returns the
+> active hold covering an atom by `atom` / `tenant` / `model` scope; `retireWithRefs` checks it
+> at the top, so a held atom (or anything in a cascade that reaches one) throws **423** and
+> cannot be deleted. The check is **unconditional** — it runs even under break-glass and even
+> for an approved change-request's apply, because overriding normal authority is the whole
+> point of a hold. Expiration is untouched (still lazy + non-destructive — it only hides), so a
+> held atom is never actually destroyed. `--audit` gained an informational
+> **expired-but-held** count (not a finding — it's exactly what a hold guarantees). 6
+> assertions in `test.mjs` (atom + model scope block delete, unheld deletes, release re-enables
+> delete, and a hold trumps an active break-glass).
+>
+> **Scoped / deferred, stated plainly:** (1) **`query` scope is not yet evaluated** — atom,
+> tenant, and model holds work; a query-scope hold would need to run the saved query's match
+> per atom, which is deferred. (2) **No physical purge** is built (by design — the plan says get
+> soft-delete + hold right first). (3) Releasing a hold sets `status: released` via the normal
+> write path; the kernel does not auto-stamp `releasedAt` (the client supplies it). (4) Legal-
+> hold atoms are not yet tamper-chained (Phase 10).
+
 Expiration today is lazy and non-destructive — keep that. Add explicit holds.
 
 ```json
@@ -688,7 +707,7 @@ metadata first.
 7. ✅ Hook/migration allowlists (Phase 6).
 8. ✅ Change-request + approval, with the bootstrap path (Phase 7).
 9. ✅ Break-glass (Phase 8).
-10. Legal hold + retention hardening (Phase 9).
+10. ✅ Legal hold + retention hardening (Phase 9).
 11. Per-tenant hash-chained evidence with persisted head (Phase 10).
 12. Locked-mode `--audit` checks + locked-mode test suite (Phase 11).
 

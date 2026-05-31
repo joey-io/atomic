@@ -876,5 +876,42 @@ bsrv.kill(); await new Promise((r) => setTimeout(r, 200));
 rmSync(BGSTORE, { recursive: true, force: true });
 rmSync('/tmp/atomic-bg.ndjson', { force: true });
 
+// =============================================================================
+// Phase 9 — legal hold + retention hardening. An ACTIVE hold (by atom / tenant / model)
+// blocks retire/delete unconditionally — it trumps even break-glass. Mode-independent, so
+// the core is exercised in dev; one locked assertion proves a hold beats break-glass.
+// =============================================================================
+const LHPORT = 7796, LHSTORE = '/tmp/atomic-lh-store', lhbase = `http://localhost:${LHPORT}`;
+const LHSEC = { joey: ADMIN };
+const lhenv = (extra = {}) => ({ ...process.env, PORT: LHPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_STORE: LHSTORE, ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
+const startLH = (mode) => spawn('node', ['atomic.mjs'], { env: lhenv(mode === 'locked' ? { ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY } : {}), stdio: 'ignore' });
+const LHJ = (tok, method, p, body) => fetch(lhbase + p, { method, headers: { ...(LHSEC[tok] ? { authorization: 'Bearer ' + LHSEC[tok] } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const lhcode = (tok, method, p, body) => LHJ(tok, method, p, body).then((r) => r.status);
+const waitLH = async () => { for (let i = 0; i < 50; i++) { try { await fetch(lhbase + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+
+rmSync(LHSTORE, { recursive: true, force: true });
+let lhsrv = startLH('dev'); await waitLH();
+await LHJ('joey', 'POST', '/model', { id: 'record', attr: { label: 'Record', version: 1, fields: { name: { kind: 'text' } } } });
+for (const id of ['r1', 'r2', 'r3']) await LHJ('joey', 'POST', '/record', { id, attr: { name: id } });
+// an atom-scope hold on r1
+const hold = await (await LHJ('joey', 'POST', '/legal-hold', { attr: { target: 'atom://r1', scope: 'atom', reason: 'litigation', status: 'active' } })).json();
+ok(!!hold.id, 'hold: an atom-scope legal hold is placed');
+ok(await lhcode('joey', 'DELETE', '/r1') === 423, 'hold: a held atom cannot be deleted (423)');
+ok(await lhcode('joey', 'DELETE', '/r2') === 200, 'hold: an unheld atom deletes normally');
+// release the hold → r1 can be deleted
+await LHJ('joey', 'PATCH', '/' + hold.id, { attr: { status: 'released' } });
+ok(await lhcode('joey', 'DELETE', '/r1') === 200, 'hold: once released, the atom can be deleted');
+// a model-scope hold protects every atom of the model
+await LHJ('joey', 'POST', '/legal-hold', { attr: { target: 'atom://record', scope: 'model', reason: 'audit', status: 'active' } });
+ok(await lhcode('joey', 'DELETE', '/r3') === 423, 'hold: a model-scope hold blocks deletion of every atom of the model');
+lhsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+// reboot LOCKED — a legal hold trumps even an active break-glass
+lhsrv = startLH('locked'); await waitLH();
+await breakGlass((m, p, b) => LHJ('joey', m, p, b));
+ok(await lhcode('joey', 'DELETE', '/r3') === 423, 'hold: a legal hold trumps even an active break-glass');
+lhsrv.kill(); await new Promise((r) => setTimeout(r, 200));
+rmSync(LHSTORE, { recursive: true, force: true });
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
