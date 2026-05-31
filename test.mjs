@@ -382,6 +382,34 @@ ok(recP1.length === 10 && recP2.length === 10 && recP2[0].attr.n < recP1[recP1.l
 // a filter on an UNindexed field falls back to the scan — still correct
 ok((await jsonOf('tk-all', '/rec?note=r7')).length === 1, 'unindexed filter falls back to the scan (still correct)');
 
+// --- referential integrity: onDelete restrict / cascade / null ------------------
+// a parent type, and three child types whose ref to it carries each onDelete policy.
+await J('joey', 'POST', '/model', { id: 'par', attr: { label: 'Par', version: 1, fields: { name: { kind: 'text' } } } });
+await J('joey', 'POST', '/model', { id: 'chR', attr: { label: 'ChR', version: 1, fields: { par: { kind: 'ref', to: 'atom://par', inverse: 'rkids', onDelete: 'restrict' } } } });
+await J('joey', 'POST', '/model', { id: 'chC', attr: { label: 'ChC', version: 1, fields: { par: { kind: 'ref', to: 'atom://par', inverse: 'ckids', onDelete: 'cascade' } } } });
+await J('joey', 'POST', '/model', { id: 'chN', attr: { label: 'ChN', version: 1, fields: { par: { kind: 'ref', to: 'atom://par', inverse: 'nkids', onDelete: 'null' } } } });
+// restrict: a referenced atom cannot be deleted (and stays active)
+await J('joey', 'POST', '/par', { id: 'pr', attr: { name: 'restrict' } });
+await J('joey', 'POST', '/chR', { id: 'kr', attr: { par: 'atom://pr' } });
+ok(await code('joey', 'DELETE', '/pr') === 409, 'onDelete restrict: blocks deleting a referenced atom');
+ok((await jsonOf('joey', '/pr')).lifecycle.status === 'active', 'onDelete restrict: target stays active (no half-delete)');
+// cascade: deleting the parent retires its referrers too, atomically
+await J('joey', 'POST', '/par', { id: 'pc', attr: { name: 'cascade' } });
+await J('joey', 'POST', '/chC', { id: 'kc1', attr: { par: 'atom://pc' } });
+await J('joey', 'POST', '/chC', { id: 'kc2', attr: { par: 'atom://pc' } });
+ok(await code('joey', 'DELETE', '/pc') === 200, 'onDelete cascade: delete succeeds');
+ok((await jsonOf('joey', '/kc1')).lifecycle.status === 'retired' && (await jsonOf('joey', '/kc2')).lifecycle.status === 'retired', 'onDelete cascade: referrers retired with the target');
+// null: deleting the parent clears the referring cell but keeps the referrer
+await J('joey', 'POST', '/par', { id: 'pn', attr: { name: 'null' } });
+await J('joey', 'POST', '/chN', { id: 'kn', attr: { par: 'atom://pn' } });
+ok(await code('joey', 'DELETE', '/pn') === 200, 'onDelete null: delete succeeds');
+ok((await jsonOf('joey', '/kn')).attr.par === undefined, 'onDelete null: referring cell is cleared');
+ok((await jsonOf('joey', '/kn')).lifecycle.status === 'active', 'onDelete null: referrer kept (just unlinked)');
+// the default (no onDelete declared, e.g. widget.parentw) is restrict
+await J('tk-all', 'POST', '/widget', { id: 'wpar', attr: { name: 'WPar' } });
+await J('tk-all', 'POST', '/widget', { id: 'wkid', attr: { name: 'WKid', parentw: 'atom://wpar' } });
+ok(await code('tk-all', 'DELETE', '/wpar') === 409, 'onDelete defaults to restrict (a referenced atom cannot be deleted)');
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();

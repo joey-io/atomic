@@ -1298,16 +1298,63 @@ async function runHooks(atom, event) {
   }
 }
 
+// Referential integrity. The atoms that point AT `targetId` through a DECLARED
+// inverse edge (so the ledger's atom/actor refs — which declare no inverse — are
+// never treated as edges). Each ref field carries an `onDelete` policy. System view
+// (every shard): `restrict` must notice a cross-tenant referrer the deleter can't
+// itself touch. Returns { src, field, mode } per live referrer.
+function inboundRefs(targetId, targetModel) {
+  const out = [];
+  for (const inv of Object.values(invReg)) {
+    if (inv.targetModel !== targetModel) continue;
+    const def = getAtom(inv.sourceModel).attr.fields?.[inv.field] || {};
+    const mode = def.onDelete || 'restrict';                 // default: refuse to dangle
+    for (const a of store.query({ model: ref(inv.sourceModel) }))
+      if (a.lifecycle?.status !== 'retired' && a.attr?.[inv.field] === ref(targetId))
+        out.push({ src: a, field: inv.field, mode });
+  }
+  return out;
+}
+
+// retire one atom, honoring every inbound edge's onDelete first — restrict refuses,
+// null clears the referring cell, cascade retires the referrer too — all inside one
+// transaction, so a base can never end up pointing at a ghost (and a half-applied
+// cascade can't corrupt it). `seen` guards cycles in a cascade.
+function retireWithRefs(atom, actor, seen) {
+  if (seen.has(atom.id)) return atom;
+  seen.add(atom.id);
+  const model = refId(atom.model);
+  for (const { src, field, mode } of inboundRefs(atom.id, model)) {
+    const srcModel = refId(src.model);
+    if (mode === 'restrict')
+      throw new Err(409, `cannot delete ${atom.id}: ${src.id}.${field} still references it (onDelete: restrict)`);
+    if (mode === 'null') {
+      if (!writable(actor, src) || !allows(actor, `${srcModel}.${field}`, 'update'))
+        throw new Err(409, `cannot delete ${atom.id}: referrer ${src.id} is outside your write scope (onDelete: null)`);
+      const before = { ...src.attr };
+      const next = { ...src.attr }; delete next[field];
+      src.attr = validate(srcModel, next);                   // a required ref can't be nulled — validate rejects it
+      bump(src, actor.id);
+      logIt(src.id, 'update', actor.id, changeset(before, src.attr), actor._session);
+    } else if (mode === 'cascade') {
+      if (!writable(actor, src) || !canOp(actor, srcModel, 'delete'))
+        throw new Err(409, `cannot delete ${atom.id}: referrer ${src.id} is outside your delete scope (onDelete: cascade)`);
+      retireWithRefs(src, actor, seen);
+    }
+  }
+  atom.lifecycle.status = 'retired';
+  bump(atom, actor.id);
+  logIt(atom.id, 'delete', actor.id, [{ path: 'status', from: 'active', to: 'retired' }], actor._session);
+  return atom;
+}
+
 function retire(id, actor) {
   const atom = getAtom(id);
   if (!visible(actor, atom)) throw new Err(404, `no atom ${id}`);
   if (!canOp(actor, refId(atom.model), 'delete'))
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   if (!writable(actor, atom)) throw new Err(403, `cannot delete ${refId(atom.model)} (tenant scope or write rule)`);
-  atom.lifecycle.status = 'retired';
-  bump(atom, actor.id);
-  logIt(id, 'delete', actor.id, [{ path: 'status', from: 'active', to: 'retired' }], actor._session);
-  return atom;
+  return tx(() => retireWithRefs(atom, actor, new Set()));    // all-or-nothing across the cascade
 }
 
 // ---------------------------------------------------------------------------
