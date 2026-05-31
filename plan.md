@@ -1,425 +1,355 @@
 # Atomic Enterprise Readiness Plan
 
-> Goal: make Atomic safe enough for highly sensitive enterprise records without bloating it, without abandoning the single-kernel model, and without adding infrastructure-first complexity.
+> Goal: make Atomic safe enough to be the system of record for highly sensitive
+> enterprise data — without abandoning the single-kernel model, and without turning
+> Atomic into a pile of services.
 
-Atomic should stay what it is: one record shape, one kernel, generated API/UI, schema as atoms, permissions as atoms, tests as atoms, and zero required dependencies. The enterprise plan is not to turn Atomic into a pile of services. The plan is to harden the existing kernel with a stricter production mode, sensitive-field governance, immutable evidence, and operational safety rails.
+Atomic stays what it is: one record shape, one kernel, generated API/UI, schema as atoms,
+permissions as atoms, tests as atoms, zero required dependencies. The enterprise work is to
+**harden the existing kernel** with a stricter production mode, sensitive-field governance,
+tamper-evident records, and operational safety rails — all as atoms.
 
-This file compares the current project state to the minimum readiness plan and defines the work in order.
+This file states the threat model, ranks the work by leak-size-to-code, and fixes three
+things an earlier draft of this plan got wrong: it left the bulk-export path ungoverned,
+it specified an evidence hash chain that breaks under Postgres's advertised multi-writer
+mode, and it turned every sensitive read into an unbounded write. Those are corrected here.
+
+---
+
+## Honest framing
+
+This makes the kernel **stricter and larger**. It adds no services, no second app, no new
+stack — that discipline holds. But it adds ~8 native models, a runtime mode, a second write
+path (change requests), purpose context threaded through reads, per-tenant evidence chaining,
+and export gating. That is real branching threaded through the existing read/write/export/hook
+paths. The win is that it is all *coherent* growth — same atom shape, same store seam, same
+test philosophy — not that it is free. Plan for the kernel to grow meaningfully past its
+current ~2,900 lines.
 
 ---
 
 ## Current state
 
-Atomic already has the right substrate.
+Atomic already has the right substrate. It currently includes:
 
-It currently includes:
-
-- Single-file kernel in `atomic.mjs`.
-- Zero required dependencies.
-- Optional Postgres support through `pg` only when `ATOMIC_DB` is set.
-- In-memory, SQLite, and Postgres store drivers behind one store seam.
-- Tenant scoping through `lifecycle.parent`.
-- Token atoms with hashed API secrets shown once on creation.
-- Session atoms.
-- Grant and role atoms.
-- Per-field read/write checks.
-- Per-field redaction.
+- Single-file kernel in `atomic.mjs`, zero required dependencies.
+- In-memory, SQLite, and Postgres store drivers behind one store seam (`pg` optional, loaded
+  only when `ATOMIC_DB` is set).
+- Tenant scoping through `lifecycle.parent`; per-field read/write checks and redaction.
+- Token atoms with hashed API secrets shown once; session atoms; grant and role atoms.
 - Role attenuation so tokens/hooks cannot exceed the issuer's grants.
-- Generated HTTP API.
-- Generated HTML UI.
-- Inline editable grid with optimistic concurrency.
-- CSV import/export.
-- Transactions.
-- Referential integrity with `restrict`, `cascade`, and `null` behavior.
-- Hook atoms that run vetted scripts by safe basename.
-- Migration atoms.
-- Retention policies through policy/condition atoms.
-- Log atoms for changes.
+- Generated HTTP API + HTML UI; inline editable grid with optimistic concurrency.
+- CSV import/export; transactions; referential integrity (`restrict`/`cascade`/`null`).
+- Hook atoms running vetted scripts by safe basename; migration atoms; retention via
+  policy/condition atoms; `log` atoms for changes.
 - AES-256-GCM encryption at rest when `ATOMIC_KEY` is set.
-- Structural audit and self-test commands.
-- 148 black-box HTTP assertions.
+- Structural audit, atom self-tests, and 148 black-box HTTP assertions.
 
-This means Atomic is not missing a foundation. It is missing a locked enterprise posture.
+The gap is not architecture. The gap is governance posture — and a few concrete leaks below.
 
-The gap is not architecture. The gap is governance.
+---
+
+## Threat model (state it first, or you miss the leaks)
+
+We are defending sensitive records against:
+
+1. **Over-broad grants** — an admin or token with more reach than the task needs.
+2. **Malicious or compromised insider with an app identity** — a valid token used wrongly.
+3. **Malicious or compromised operator with shell/DB access** — the person who can run the
+   CLI or read the database directly.
+4. **Silent exfiltration** — data leaving through a path that produces no evidence (CSV, bulk
+   export, a hook).
+5. **Evidence tampering** — someone editing or deleting the record of what happened.
+
+We are **not** primarily defending against disk/backup theft — `ATOMIC_KEY` already covers
+that, and it does little against threats 1–3. Encryption is hygiene here, not the centerpiece.
+
+A control only counts if the answer to "who did this, when, and why" comes from **Atomic's own
+evidence**, not from Postgres or infrastructure logs.
+
+---
+
+## Readiness target
+
+Atomic is ready for sensitive enterprise use when it can answer, with kernel evidence:
+
+1. Who *can* see each sensitive field, and who *actually* viewed it, and why?
+2. Who changed the schema, grants, hooks, exports, or retention — and who approved it?
+3. Can a tenant admin accidentally expose restricted data?
+4. Can **any** export path — CSV *or* CLI bulk dump — leak restricted data silently?
+5. Can a hook or migration bypass normal permissions?
+6. Can logs or evidence be edited or deleted?
+7. Can retired, expired, or legally held records be mishandled?
+8. Can an operator with shell access exfiltrate everything without leaving a trace?
+
+Question 8 is the one the earlier draft missed. It drives the ordering below.
 
 ---
 
 ## Non-goals
 
-Do not solve enterprise readiness by adding bloat.
-
-Do not add:
-
-- A separate policy engine.
-- A separate workflow service.
-- A separate audit service.
-- GraphQL.
-- An ORM.
-- Kafka.
-- Microservices.
-- A generated-code layer.
-- A second admin application.
-- Required dependencies.
-
-The rule remains:
+Do not solve readiness by adding bloat. Do **not** add: a separate policy engine, a workflow
+service, an audit service, GraphQL, an ORM, Kafka, microservices, a generated-code layer, a
+second admin app, or any required dependency.
 
 > Governance is atoms too.
 
 ---
 
-## The readiness target
+## Out of scope (front it, don't pretend it's covered)
 
-Atomic is ready for sensitive enterprise use when it can answer these questions with kernel evidence:
+These are real enterprise requirements that this plan deliberately does **not** solve in the
+kernel. Name them so procurement and ops know where they live:
 
-1. Who can see each sensitive field?
-2. Who actually viewed each sensitive field?
-3. Why did they view it?
-4. Who changed the schema, grants, hooks, exports, or retention policy?
-5. Who approved that change?
-6. Can a tenant admin accidentally expose restricted data?
-7. Can a CSV export leak restricted data silently?
-8. Can a hook or migration bypass normal permissions?
-9. Can logs be edited or deleted?
-10. Can retired, expired, or legally held records be mishandled?
-
-The answer must come from Atomic itself, not only from Azure, Postgres, or infrastructure logs.
+- **SSO / MFA (SAML, OIDC).** Atomic authenticates by magic-link and bearer token. Federated
+  SSO and MFA are an enterprise procurement gate. The intended answer is an **auth proxy in
+  front** (the deployment terminates SSO and presents a kernel token), not OIDC inside the
+  kernel. If that answer is unacceptable to a buyer, it becomes a future phase — but it is not
+  in this plan.
+- **Key management & rotation.** `ATOMIC_KEY` is a single env var. KMS integration, key
+  rotation, and re-encryption are out of scope. **Note the live trade-off:** under a key,
+  indexed values are blind-hashed (equality only — no range or sort). So requiring `ATOMIC_KEY`
+  in locked mode silently removes range/sort on any encrypted indexed field. Classify with that
+  in mind.
+- **Network controls** — rate limiting, DoS, brute-force throttling on auth — belong at the
+  proxy/infra layer, not the kernel.
 
 ---
 
-## Phase 1 — Locked mode
-
-Add a runtime mode:
+## Phase 0 — `ATOMIC_MODE` and locked boot checks
 
 ```bash
-ATOMIC_MODE=dev|prod|locked
+ATOMIC_MODE=dev|prod|locked     # default: dev
 ```
-
-Default should be `dev` unless explicitly configured.
-
-### `dev`
-
-Friendly local behavior remains allowed:
-
-- In-memory store allowed.
-- Plaintext store allowed.
-- Magic-link fallback can return links in the response.
-- Open-login bases allowed.
-- Inline model/grant editing allowed if the actor has grants.
-- Wildcard grants allowed.
-- Hooks and migrations can run from safe basenames.
-
-### `prod`
-
-Production-safe default:
-
-- Durable store required: `ATOMIC_STORE` or `ATOMIC_DB`.
-- `ATOMIC_ADMIN_SECRET` or real mail delivery required.
-- No dev magic-link response fallback.
-- No in-memory store.
-- Security headers and strict CSP remain mandatory.
-- Logs remain append-only through API behavior.
-
-### `locked`
-
-Sensitive enterprise mode:
-
-- Durable store required.
-- `ATOMIC_KEY` required.
-- No open-login tokens.
-- No public one-click base sharing for full tenant access.
-- No direct edits to dangerous governance atoms except through approved change requests.
-- No wildcard `**` grants except root break-glass.
-- No hooks unless the hook script is explicitly allowlisted.
-- No custom migrations unless explicitly allowlisted.
-- No sensitive CSV export without explicit export grant and audit event.
-- No sensitive read without purpose.
-
-Implementation should be tiny:
 
 ```js
-const MODE = process.env.ATOMIC_MODE || 'dev';
+const MODE   = process.env.ATOMIC_MODE || 'dev';
 const LOCKED = MODE === 'locked';
-const PROD = MODE === 'prod' || LOCKED;
+const PROD   = MODE === 'prod' || LOCKED;
 ```
 
-Then put guardrails in the existing write/read/export/hook paths rather than adding new paths.
+- **`dev`** — friendly local behavior: in-memory and plaintext stores allowed, magic-link
+  returned in the response, open-login bases, wildcard grants, hooks/migrations from safe
+  basenames.
+- **`prod`** — durable store required (`ATOMIC_STORE` or `ATOMIC_DB`); `ATOMIC_ADMIN_SECRET`
+  or real mail required; no dev magic-link fallback; no in-memory store; strict CSP/security
+  headers mandatory.
+- **`locked`** — everything in `prod`, plus: `ATOMIC_KEY` required; no open-login tokens; no
+  public one-click full-tenant base sharing; no direct edits to dangerous governance atoms
+  except through approved change requests; no wildcard `**` grant except active root
+  break-glass; hooks and custom migrations must be allowlisted; **no bulk or CSV export of
+  restricted data without an explicit export grant and an evidence record**; no restricted
+  read without purpose.
+
+Put guardrails in the **existing** read/write/export/hook paths. Add no new routes.
 
 ---
 
-## Phase 2 — Field classification
+## Phase 1 — Close the bulk-export hole + dangerous-write guard
 
-Extend model fields with sensitivity metadata.
+> Highest leak, smallest code. This lands first.
 
-Example:
+**The hole.** `--export-all` and `--export-base` read straight from the store and dump every
+atom verbatim — no actor, no grants, no redaction, no purpose, no evidence (`atomic.mjs`
+≈2861–2882). If `ATOMIC_KEY` is set, the kernel works in plaintext above the store seam, so the
+dump is **decrypted**. An operator with shell access exfiltrates every field of every tenant in
+one command, leaving no trace. Any CSV gating (Phase 6) is moot while this stands open.
+
+Locked-mode rules for the CLI bulk paths:
+
+- `--export-all` / `--export-base` require an **active root break-glass** (Phase 9) or a signed
+  maintenance window — they are not routine commands.
+- Each run emits an `export-job` evidence atom (operator identity, scope, atom count, purpose,
+  reason) **before** the first byte streams.
+- Default to **sealed** output: bodies stay AES-GCM-sealed and round-trip only under the same
+  key. A plaintext bulk export requires break-glass and emits a distinct, louder evidence event.
+- `--import-all` re-validates every atom against its model, **refuses** to import `log` /
+  `sensitive-read` / other evidence atoms with foreign hashes, and re-chains evidence on import
+  (Phase 11). Verbatim import that preserves `createdBy`/`lifecycle` is a forgery vector and is
+  disabled in locked mode outside an import-specific break-glass.
+
+**Dangerous-write guard.** In locked mode, direct writes (`POST`/`PATCH`/`PUT`/`DELETE`) to the
+dangerous models below are rejected with a pointer to the change-request flow (Phase 8). The
+*guard* ships now; the *workflow* comes later — deny first, build the maker-checker path after.
+
+```text
+model  grant  role  token  hook  migration  policy  condition
+retention-policy  legal-hold  purpose  export-job  break-glass
+```
+
+---
+
+## Phase 2 — Field sensitivity + redaction
+
+Sensitivity lives on the model field definition. No separate classification engine.
 
 ```json
 {
   "fields": {
-    "name": { "kind": "text", "sensitivity": "internal" },
+    "name":  { "kind": "text",  "sensitivity": "internal" },
     "email": { "kind": "email", "sensitivity": "confidential" },
-    "governmentIdLast4": { "kind": "text", "sensitivity": "restricted", "encrypted": true, "index": "blind" },
-    "eligibilityStatus": { "kind": "enum", "values": ["eligible", "ineligible", "unknown"], "sensitivity": "restricted" }
+    "governmentIdLast4": { "kind": "text", "sensitivity": "restricted",
+                           "encrypted": true, "index": "blind" },
+    "eligibilityStatus": { "kind": "enum", "values": ["eligible","ineligible","unknown"],
+                           "sensitivity": "restricted" }
   }
 }
 ```
 
-Supported sensitivity levels:
+Levels: `public` · `internal` · `confidential` · `restricted`. Missing → `internal`.
 
-```text
-public
-internal
-confidential
-restricted
-```
-
-Minimal behavior:
-
-- Missing sensitivity defaults to `internal`.
-- `restricted` fields require explicit field grant.
-- `restricted` fields require purpose-bound access in locked mode.
-- `restricted` fields are excluded from CSV export unless export is explicitly granted.
-- `restricted` fields always produce read audit events when revealed.
-- `restricted` fields are redacted in HTML tables by default unless the actor has reveal permission.
-
-Do not create a separate classification engine. Sensitivity belongs on model field definitions.
+- `restricted` fields require an explicit field grant (never satisfied by a wildcard in locked
+  mode).
+- `restricted` fields are redacted in HTML tables and JSON by default unless the actor holds
+  reveal permission.
+- `restricted` fields are excluded from every export path unless export is explicitly granted
+  (Phase 6).
+- Revealing a `restricted` field produces read evidence (Phase 5).
 
 ---
 
 ## Phase 3 — Purpose-bound sensitive reads
 
-Add a native `purpose` atom.
-
-Example:
+Add a native `purpose` atom; extend grants with an optional `purpose`.
 
 ```json
-{
-  "id": "purpose-eligibility-admin",
-  "model": "atom://purpose",
-  "manifest": "Eligibility administration",
-  "attr": {
-    "label": "Eligibility administration",
-    "description": "Used for eligibility, compliance, or authorized administrative review."
-  }
-}
+{ "id": "purpose-eligibility-admin", "model": "atom://purpose",
+  "attr": { "label": "Eligibility administration",
+            "description": "Eligibility, compliance, or authorized administrative review." } }
 ```
-
-Extend grants with optional purpose:
 
 ```json
-{
-  "path": "person.governmentIdLast4",
-  "mode": "read",
-  "purpose": "atom://purpose-eligibility-admin"
-}
+{ "path": "person.governmentIdLast4", "mode": "read",
+  "purpose": "atom://purpose-eligibility-admin" }
 ```
 
-In locked mode:
+**Enforcement is grant-match; the reason string is evidence only.** In locked mode, revealing a
+restricted field requires (a) a matching read grant and (b) a request purpose that matches a
+purpose the grant authorizes. The free-text `reason` is **self-asserted** — it is recorded as
+evidence, never trusted for access. Do not confuse the two.
 
-- Reading a restricted field requires a matching read grant.
-- The request must carry purpose.
-- Purpose may be supplied by header or query param.
-
-Recommended minimal surface:
+Request surface (normalized into request context):
 
 ```http
 X-Atomic-Purpose: purpose-eligibility-admin
-X-Atomic-Reason: eligibility review
+X-Atomic-Reason:  eligibility review
 ```
 
-or:
-
-```http
-GET /person-123?purpose=purpose-eligibility-admin&reason=eligibility-review
-```
-
-The kernel should normalize this into request context.
-
-Every revealed restricted field logs a `sensitive-read` atom.
+or `GET /person-123?purpose=purpose-eligibility-admin&reason=eligibility-review`.
 
 ---
 
-## Phase 4 — Sensitive read evidence
+## Phase 4 — Sensitive-read evidence (bounded — reads must not become unbounded writes)
 
-Current log atoms record writes. Add read evidence only for restricted fields.
-
-Do not log every read of every field. That would bloat the system.
-
-Add a `sensitive-read` model:
+Add a `sensitive-read` model. Record read evidence **only when a restricted field is actually
+revealed**, and bound the cost so the read path stays fast.
 
 ```json
-{
-  "id": "sensitive-read",
-  "model": "atom://model",
-  "manifest": "Sensitive read evidence",
-  "attr": {
-    "label": "Sensitive Read",
-    "version": 1,
+{ "id": "sensitive-read", "model": "atom://model",
+  "attr": { "label": "Sensitive Read", "version": 1,
     "fields": {
-      "atom": { "kind": "text", "required": true, "filterable": true },
-      "model": { "kind": "text", "required": true, "filterable": true },
-      "field": { "kind": "text", "required": true, "filterable": true },
-      "actor": { "kind": "ref", "to": "atom://token", "required": true },
+      "actor":   { "kind": "ref", "to": "atom://token",  "required": true },
       "session": { "kind": "ref", "to": "atom://session" },
       "purpose": { "kind": "ref", "to": "atom://purpose", "required": true },
-      "reason": { "kind": "text" },
-      "at": { "kind": "datetime", "required": true, "filterable": true, "sortable": true }
-    }
-  }
-}
+      "reason":  { "kind": "text" },
+      "model":   { "kind": "text", "required": true, "filterable": true },
+      "fields":  { "kind": "list", "of": "atom://_string" },
+      "atoms":   { "kind": "list", "of": "atom://_string" },
+      "query":   { "kind": "ref", "to": "atom://query" },
+      "count":   { "kind": "integer" },
+      "at":      { "kind": "datetime", "required": true, "filterable": true, "sortable": true } } } }
 ```
 
-Implementation rule:
+**Granularity — one evidence atom per request, never per field per row:**
 
-- Redaction remains the default.
-- When projection reveals a restricted field, append a `sensitive-read` atom.
-- Do this in the projection/redaction path, not in every route.
+- A single-atom read (`GET /<id>`) that reveals restricted fields → **one** `sensitive-read`
+  recording that atom id and the revealed field names.
+- A list/query read → **one** `sensitive-read` recording the model/query, the revealed field
+  names, the matched atom ids (a list — one write, not N) and a count. "Who saw this person's
+  SSN" is then answerable by querying evidence on `atoms` contains `person-123`.
 
-This makes the audit question answerable:
+This caps a sensitive request at a single evidence write and preserves the millisecond filtered
+read for non-sensitive data — a read that reveals nothing restricted writes nothing.
 
-> Who viewed this record's restricted data, when, and why?
+**Fail mode (state it):**
+
+- **Locked mode → fail-closed.** Write the evidence atom after projection but before flushing
+  the restricted fields. If the evidence write fails, return `503` and do **not** send the
+  restricted fields. Revealing data we cannot record violates the entire point.
+- **`prod` mode → best-effort.** Evidence may be written async; a failure logs but does not
+  block the response.
+
+Append evidence in the **projection/redaction path**, not in every route.
 
 ---
 
-## Phase 5 — Hash-chained evidence
+## Phase 5 — Export control (CSV *and* the CLI paths from Phase 1)
 
-Current log atoms are ordinary atoms. They record changes, but they should become tamper-evident.
-
-Add hash chaining to evidence records:
+Add an `export` grant mode and a model-level export posture.
 
 ```json
-{
-  "prev": "sha256...",
-  "hash": "sha256(prev + canonical_event)"
-}
+{ "path": "person.email", "mode": "export", "purpose": "atom://purpose-eligibility-admin" }
 ```
 
-Apply to:
+```json
+{ "exports": "disabled" | "grant" | "approval" }     // default in locked mode: "grant"
+```
 
-- `log`
-- `sensitive-read`
-- `export-job`
-- `change-request`
-- `approval`
-- `break-glass`
-
-Minimal implementation:
-
-- Add a global `evidenceSeq` or continue using `logSeq` style sequencing.
-- Keep `lastEvidenceHash` in memory and reconstruct on boot by sorted evidence order.
-- Each evidence atom stores `prev` and `hash`.
-- `--audit` verifies the chain.
-
-No dependency is needed. Use existing `node:crypto` hashing.
+- `read` does **not** imply `export`; `write` does not imply `export`; `all` implies export
+  only outside locked mode.
+- In locked mode, any export (HTTP CSV *or* CLI bulk from Phase 1) touching confidential or
+  restricted fields requires an explicit `export` grant and emits an `export-job` atom
+  recording actor, model/query, fields, filters, count, purpose, reason, timestamp.
+- `exports: "approval"` routes the export through a change request (Phase 8) before it runs.
 
 ---
 
-## Phase 6 — Change requests for dangerous atoms
+## Phase 6 — Hook and migration allowlists
 
-In locked mode, dangerous atoms cannot be directly edited even by normal admins.
+Hook/migration `run` is already locked to safe basenames. In locked mode, add an explicit
+allowlist:
 
-Dangerous models:
-
-```text
-model
-grant
-role
-token
-hook
-migration
-policy
-condition
-retention-policy
-legal-hold
-purpose
-export-job
-break-glass
+```bash
+ATOMIC_HOOKS=census-district,normalize-email
+ATOMIC_MIGRATIONS=person-v2-normalize
 ```
 
-Add:
+- Locked + hook not allowlisted → skip and emit evidence.
+- Locked + custom migration not allowlisted → **fail closed**.
+- Hook and migration atoms are dangerous atoms (require a change request to add/modify).
+- Hook patch/upsert continues to run under the hook's own grants.
 
-```text
-change-request
-approval
-```
+---
 
-A `change-request` contains:
+## Phase 7 — Change requests + approval (the maker-checker workflow)
+
+The Phase 1 guard already blocks direct edits to dangerous atoms. This phase adds the path to
+make those edits safely.
 
 ```json
-{
-  "target": "atom://person",
-  "op": "update",
-  "before": { },
-  "after": { },
-  "diff": [ ],
-  "status": "draft|submitted|approved|rejected|applied",
-  "reason": "..."
-}
+{ "model": "atom://change-request",
+  "attr": { "target": "atom://person", "op": "update",
+            "before": {}, "after": {}, "diff": [],
+            "status": "draft|submitted|approved|rejected|applied", "reason": "..." } }
 ```
-
-An `approval` contains:
 
 ```json
-{
-  "change": "atom://cr-123",
-  "approver": "atom://tok-security-admin",
-  "decision": "approved|rejected",
-  "reason": "...",
-  "at": "..."
-}
+{ "model": "atom://approval",
+  "attr": { "change": "atom://cr-123", "approver": "atom://tok-security-admin",
+            "decision": "approved|rejected", "reason": "...", "at": "..." } }
 ```
 
-Rules:
-
-- Maker cannot approve their own change.
-- Change request must show a diff.
-- Applying the change runs through the normal existing write path.
-- Applied change produces log/evidence.
+- **Maker cannot approve their own change.**
+- A change request must show a diff.
+- Applying a change runs through the **normal existing write path** (so it re-validates, checks
+  grants, and produces a `log` + evidence).
 - Rejected changes are retained.
 
-This keeps schema/governance changes inside Atomic without adding a workflow service.
-
----
-
-## Phase 7 — Export control
-
-CSV is a major leakage path.
-
-Current state has model/query CSV export. Keep it, but gate it in locked mode.
-
-Add `export` mode to grants:
-
-```json
-{
-  "path": "person.email",
-  "mode": "export",
-  "purpose": "atom://purpose-eligibility-admin"
-}
-```
-
-Behavior:
-
-- `read` does not imply `export`.
-- `write` does not imply `export`.
-- `all` implies export only outside locked mode.
-- In locked mode, export requires explicit `export` grant.
-- Any export containing confidential/restricted fields creates an `export-job` atom.
-- Export-job records actor, model/query, fields, filters, count, purpose, reason, and timestamp.
-- Restricted exports can require change-request approval later, but start with explicit grant + audit.
-
-Add model-level option:
-
-```json
-{
-  "exports": "disabled|grant|approval"
-}
-```
-
-Default in locked mode:
-
-```text
-grant
-```
+**Bootstrap (the paradox the earlier draft left open):** if editing grants needs an approved
+change request, and approval needs an approver with the right grant, the first approver must be
+establishable **out of band** — an env-configured root identity (`ATOMIC_ADMIN_SECRET`) that can
+seed the first approver and is itself only usable via break-glass evidence in locked mode. Name
+this explicitly so locked mode is recoverable, not bricked.
 
 ---
 
@@ -427,208 +357,176 @@ grant
 
 Wildcard root access is sometimes necessary, but it must be noisy and temporary.
 
-Add `break-glass` atom:
-
 ```json
-{
-  "actor": "atom://tok-admin",
-  "reason": "incident response",
-  "expiresAt": "2026-06-01T00:00:00Z",
-  "grants": [
-    { "path": "**", "mode": "all" }
-  ],
-  "status": "active|expired|revoked"
-}
+{ "model": "atom://break-glass",
+  "attr": { "actor": "atom://tok-admin", "reason": "incident response",
+            "expiresAt": "2026-06-01T00:00:00Z",
+            "grants": [ { "path": "**", "mode": "all" } ],
+            "status": "active|expired|revoked" } }
 ```
 
-Locked-mode rules:
+- In locked mode, `**` grants are rejected unless tied to an **active** break-glass.
+- Break-glass requires a reason and an expiration; activation emits evidence.
+- Every sensitive read under break-glass logs a `sensitive-read` with the break-glass reason.
+- Expired break-glass stops working automatically.
+- Implementation: reuse the existing grant system — expand an actor's effective grants only
+  while an active, unexpired break-glass atom exists for them. No parallel permission path.
 
-- `**` grants are rejected unless associated with active break-glass.
-- Break-glass requires reason and expiration.
-- Break-glass activation creates evidence.
-- Every sensitive read under break-glass is logged as sensitive-read with reason.
-- Expired break-glass grants stop working automatically.
-
-Implementation should reuse the existing grant system by expanding effective grants only when an active break-glass atom exists for the actor.
+Break-glass is also the key that unlocks Phase 1's CLI bulk export and Phase 7's bootstrap.
 
 ---
 
-## Phase 9 — Legal hold and retention hardening
+## Phase 9 — Legal hold + retention hardening
 
-Current expiration is lazy and non-destructive. That is good.
-
-Add explicit legal hold behavior.
-
-Models:
-
-```text
-legal-hold
-retention-policy
-```
-
-A `legal-hold` atom:
+Expiration today is lazy and non-destructive — keep that. Add explicit holds.
 
 ```json
-{
-  "target": "atom://person-123",
-  "scope": "atom|tenant|model|query",
-  "reason": "hold",
-  "status": "active|released",
-  "createdAt": "...",
-  "releasedAt": null
-}
+{ "model": "atom://legal-hold",
+  "attr": { "target": "atom://person-123", "scope": "atom|tenant|model|query",
+            "reason": "hold", "status": "active|released",
+            "createdAt": "...", "releasedAt": null } }
 ```
 
-Rules:
-
-- Retire/delete is blocked for held atoms.
-- Purge/export/delete operations must check active holds.
-- Expiration can hide held atoms from normal reads, but cannot destroy them.
+- Retire/delete is blocked for held atoms; purge/export/delete must check active holds.
+- Expiration may hide a held atom from normal reads but can never destroy it.
 - `--audit` reports expired-but-held counts.
-
-Do not implement physical purging first. Keep soft-delete and legal hold correct before adding hard deletion.
+- Do **not** build physical purging first. Get soft-delete + hold correct before hard deletion.
 
 ---
 
-## Phase 10 — Hook and migration allowlists
+## Phase 10 — Tamper-evident evidence (multi-writer correct)
 
-Current hook and custom migration execution already restricts `run` to safe basenames. In locked mode, add an explicit allowlist.
+> This is the phase the earlier draft got wrong. An in-memory `lastEvidenceHash` rebuilt on
+> boot only works for a single-node, single writer. Atomic's Postgres driver is sold as MVCC
+> "many writers," and more than one `atomic` process already runs under pm2. A global in-memory
+> chain head forks the moment two writers append concurrently, and `--audit` fails.
 
-Environment:
+Make evidence (`log`, `sensitive-read`, `export-job`, `change-request`, `approval`,
+`break-glass`) tamper-evident with **per-tenant hash chains and a persisted head**:
 
-```bash
-ATOMIC_HOOKS=census-district,normalize-email
-ATOMIC_MIGRATIONS=person-v2-normalize
+```json
+{ "prev": "sha256…", "hash": "sha256(prev + canonical_event)", "seq": 42 }
 ```
 
-Rules:
+- One chain **per tenant** (per shard), so cross-tenant writes stay concurrent — the chain
+  serializes only within a tenant, not globally.
+- The chain head is a **persisted** value (a head row / head atom per tenant), never only
+  in memory.
+- Appending an evidence atom happens **inside one store transaction** that serializes per
+  tenant: take a per-tenant lock (`pg_advisory_xact_lock(hashtext(tenant))` on Postgres; the
+  single writer satisfies it trivially on SQLite), read the head, compute
+  `hash(prev + canonical_event)`, write the evidence atom with `{prev, hash, seq}`, advance the
+  head, commit. No torn chains, no cross-process races.
+- `--audit` re-walks each tenant's chain in `seq` order and recomputes every hash; a break is a
+  finding.
+- Uses only `node:crypto`. No dependency.
 
-- If locked and hook run is not allowlisted, skip and log evidence.
-- If locked and custom migration run is not allowlisted, fail closed.
-- Hook/migration atoms are dangerous atoms and require change request.
-- Hook patch/upsert continues to run under hook grants.
-
-This keeps the dynamic script feature but makes it production-governed.
+Accept the cost honestly: evidence writes within a tenant serialize. For the sensitive-read and
+governance volumes this targets, that is fine; if a tenant ever needs higher evidence
+throughput, shard the chain below the tenant — but do not pretend the chain is free.
 
 ---
 
-## Phase 11 — Locked-mode self-tests
+## Phase 11 — Locked-mode audit + self-tests
 
-The existing test structure is one of Atomic's best features. Add locked-mode tests before declaring readiness.
-
-Required tests:
+The atom-as-test structure is one of Atomic's best features. Add locked-mode coverage to both
+the black-box HTTP suite and the atom self-tests before declaring readiness:
 
 1. In-memory store rejected in locked mode.
 2. Missing `ATOMIC_KEY` rejected in locked mode.
 3. Open-login token rejected in locked mode.
-4. Direct model edit rejected in locked mode.
-5. Direct grant edit rejected in locked mode.
-6. Wildcard `**` grant rejected without break-glass.
-7. Restricted field hidden without explicit grant.
-8. Restricted field hidden without purpose.
-9. Restricted field visible with grant + purpose.
-10. Sensitive read creates `sensitive-read` evidence.
-11. CSV export rejected without export grant.
-12. CSV export with restricted field creates `export-job` evidence.
-13. Maker cannot approve own change request.
-14. Approved change request applies through normal write path.
-15. Legal hold blocks retire/delete.
-16. Hook not in allowlist does not run in locked mode.
-17. Custom migration not in allowlist fails closed in locked mode.
-18. Evidence hash chain verifies in `--audit`.
-19. Log/evidence atoms cannot be edited through normal APIs.
-20. Break-glass requires reason and expiration.
+4. Direct edit of each dangerous model rejected in locked mode.
+5. Wildcard `**` grant rejected without active break-glass.
+6. Restricted field hidden without explicit grant; hidden without purpose; visible with both.
+7. Sensitive read creates exactly **one** `sensitive-read` for a list of N rows (not N).
+8. Sensitive read fails **closed** when evidence cannot be written (locked mode).
+9. HTTP CSV export rejected without export grant; export with restricted field creates an
+   `export-job`.
+10. **`--export-all` refused without break-glass; emits `export-job`; default output is sealed.**
+11. **`--import-all` rejects foreign-hash evidence atoms and re-chains.**
+12. Maker cannot approve own change request; approved change applies via the normal write path.
+13. Legal hold blocks retire/delete.
+14. Hook not in allowlist does not run; custom migration not in allowlist fails closed.
+15. **Evidence hash chain verifies in `--audit` after concurrent writes from two processes.**
+16. Log/evidence atoms cannot be edited or deleted through normal APIs.
+17. Break-glass requires reason + expiration; expired break-glass stops working.
 
-Add these to both the black-box HTTP suite and the atom self-test suite where possible.
+Items 7, 8, 10, 11, and 15 are the regression tests for the three problems this plan fixes.
 
 ---
 
 ## Minimal new atom types
 
-Add only these native models:
-
 ```text
-purpose
-sensitive-read
-change-request
-approval
-legal-hold
-retention-policy
-export-job
-break-glass
+purpose  sensitive-read  change-request  approval
+legal-hold  retention-policy  export-job  break-glass
 ```
 
-Possibly add `classification` only if sensitivity needs reusable descriptions. Prefer field-level metadata first.
+Add `classification` only if sensitivity needs reusable descriptions — prefer field-level
+metadata first.
 
 ---
 
-## Implementation order
+## Implementation order (ranked by leak-size-to-code)
 
-Build in this order:
+1. `ATOMIC_MODE` + locked boot checks (Phase 0).
+2. **Close the bulk-export hole + dangerous-write guard (Phase 1)** — biggest leak, least code.
+3. Field `sensitivity` + restricted redaction (Phase 2).
+4. Purpose parsing + purpose-bound restricted reads (Phase 3).
+5. Bounded `sensitive-read` evidence with fail-closed semantics (Phase 4).
+6. Explicit `export` grant mode + CSV/CLI export audit (Phase 5).
+7. Hook/migration allowlists (Phase 6).
+8. Change-request + approval, with the bootstrap path (Phase 7).
+9. Break-glass (Phase 8).
+10. Legal hold + retention hardening (Phase 9).
+11. Per-tenant hash-chained evidence with persisted head (Phase 10).
+12. Locked-mode `--audit` checks + locked-mode test suite (Phase 11).
 
-1. `ATOMIC_MODE` and locked-mode boot checks.
-2. Dangerous-model write guard.
-3. Field `sensitivity` metadata and restricted redaction behavior.
-4. Purpose parsing from request headers/query.
-5. Purpose-bound restricted reads.
-6. `sensitive-read` evidence atoms.
-7. Explicit `export` grant mode and CSV export audit.
-8. Hook/migration allowlists.
-9. Change-request and approval atoms.
-10. Break-glass atoms.
-11. Legal hold checks.
-12. Evidence hash chain.
-13. Locked-mode `--audit` checks.
-14. Locked-mode test suite.
-
-This order gives value quickly and avoids rewriting the kernel.
+Steps 1–2 deliver the most safety per line and stop the silent-exfil path immediately.
 
 ---
 
 ## Readiness definition
 
-Atomic can be considered minimally ready for sensitive enterprise pilot use when all of this is true:
+Atomic is minimally ready for a sensitive enterprise pilot when all of this is true:
 
-- `ATOMIC_MODE=locked` exists.
-- Locked mode refuses unsafe boot configurations.
-- Restricted fields exist and redact by default.
-- Restricted reads require purpose.
-- Restricted reads produce evidence.
-- CSV export is separately permissioned.
-- Dangerous atoms require approved change requests.
+- `ATOMIC_MODE=locked` exists and refuses unsafe boot configurations.
+- **No export path — CSV or CLI bulk — leaks restricted data without an explicit grant and an
+  `export-job` evidence record.**
+- Restricted fields redact by default; restricted reads require purpose and produce bounded,
+  fail-closed evidence.
+- Dangerous atoms require approved change requests, and locked mode is recoverable (bootstrap
+  path defined).
 - Hooks and custom migrations are allowlisted.
 - Legal holds block deletion.
 - Break-glass is temporary, reasoned, and logged.
-- Evidence chain verifies in `npm run audit`.
+- **The per-tenant evidence chain verifies in `npm run audit` after concurrent multi-writer
+  appends.**
 - Locked-mode tests pass.
 
-Until then, Atomic should not be the direct system of record for high-sensitivity enterprise records. It can safely continue as the kernel prototype, control-plane model, admin UI generator, and testbed for the eventual governed system.
+Until then, Atomic should not be the direct system of record for high-sensitivity data. It can
+safely continue as the kernel prototype, control-plane model, admin-UI generator, and testbed.
 
 ---
 
 ## Design mantra
 
-Keep the system small by making the kernel stricter, not larger.
+Keep the system coherent by making the kernel **stricter**, accepting that it also grows
+**larger** — never by adding more stack.
 
 ```text
-same atom shape
-same HTTP surface
-same generated UI
-same store seam
-same permission system
-same test philosophy
+same atom shape · same HTTP surface · same generated UI
+same store seam · same permission system · same test philosophy
 
 + locked mode
++ every export path governed (CSV and CLI bulk)
 + field sensitivity
 + purpose-bound access
-+ sensitive-read evidence
-+ explicit export grants
-+ approved governance changes
-+ legal hold
-+ break-glass
-+ evidence hash chain
++ bounded, fail-closed sensitive-read evidence
++ approved governance changes (recoverable bootstrap)
++ legal hold · break-glass
++ per-tenant, multi-writer-correct evidence chain
 ```
 
-Atomic does not need more stack.
-
-Atomic needs fewer escape hatches.
+Atomic does not need more stack. Atomic needs fewer escape hatches — and the biggest escape
+hatch was the one nobody was watching: bulk export.
