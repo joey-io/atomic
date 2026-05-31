@@ -4,14 +4,15 @@
 > audit log, even the UI. Each is an **atom**, and one kernel governs them all.
 
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
-![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+![dependencies](https://img.shields.io/badge/dependencies-0%20required-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
 ![tests](https://img.shields.io/badge/tests-148%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Atomic is a single-file, dependency-free kernel for graph-relational data. Every record it
-holds — a row of data, a type definition, a permission grant, a saved query, an audit-log
-entry, even a test — is the same shape:
+Atomic is a single-file kernel for graph-relational data with no required dependencies (the
+optional Postgres driver pulls in `pg`). Every record it holds — a row of data, a type
+definition, a permission grant, a saved query, an audit-log entry, even a test — is the same
+shape:
 
 ```json
 { "id": "...", "model": "atom://...", "manifest": "...", "attr": { }, "lifecycle": { } }
