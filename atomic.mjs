@@ -662,7 +662,10 @@ async function actorFromReq(req, cookies) {
     if (bearer.startsWith('sess-')) sid = bearer;        // a session id, presented as a bearer (= the cookie)
     else {                                               // otherwise it must be a token's API secret
       const t = await tokenBySecret(bearer);
-      if (t && t.lifecycle?.status !== 'retired' && !await isExpired(t)) return t;
+      if (t && t.lifecycle?.status !== 'retired' && !await isExpired(t))
+        // the literal ATOMIC_ADMIN_SECRET is the out-of-band root: only it may activate
+        // break-glass (Phase 8). A session or any other token secret cannot — _admin marks it.
+        return (process.env.ATOMIC_ADMIN_SECRET && bearer === process.env.ATOMIC_ADMIN_SECRET) ? { ...t, _admin: true } : t;
     }
   }
   if (sid && await store.has(sid)) {
@@ -704,10 +707,32 @@ const grantsOf = async (actor) => {
     const role = await store.get(isRef(r) ? refId(r) : r);
     roleGrants.push(...(role?.attr?.grants || []));
   }
-  const val = [...(actor.attr?.grants || []), ...roleGrants];
+  let val = [...(actor.attr?.grants || []), ...roleGrants];
+  // Phase 8 — in locked mode a full-wildcard `**` grant is INERT unless restored by an
+  // active break-glass for this actor (computed once per request → actor._breakGlass). With
+  // break-glass: its grants expand the actor's effective set (restoring `**`). Without:
+  // every `**` is dropped, so even a superuser can do nothing until they break the glass.
+  if (LOCKED) {
+    if (actor._breakGlass) val = [...val, ...(actor._breakGlass.attr?.grants || [])];
+    else val = val.filter((g) => g.path !== '**');
+  }
   _grants.set(actor, { gen: storeGen, val });
   return val;
 };
+
+// the active, unexpired, un-revoked break-glass for this actor (or null). Break-glass atoms
+// are rare, so a full scan is cheap; expiry is checked against the wall clock each call, so
+// a break-glass stops working the instant it lapses — no cache to go stale (Phase 8).
+async function activeBreakGlass(actor) {
+  if (!actor || actor.id === '0') return null;
+  for (const a of await store.query({ model: 'atom://break-glass' })) {
+    if (a.lifecycle?.status === 'retired' || a.attr?.status !== 'active') continue;
+    if (refId(a.attr.actor || '') !== actor.id) continue;
+    if (a.attr.expiresAt && a.attr.expiresAt <= now()) continue;   // ISO strings sort chronologically
+    return a;
+  }
+  return null;
+}
 
 // segment-wise match with * (one segment) and ** (any number)
 function grantMatch(gpath, target) {
@@ -773,6 +798,11 @@ async function canReveal(actor, modelId, field, def) {
   if (!LOCKED) return true;                                 // sensitivity is inert outside locked
   if (def === undefined) def = (await getCached(modelId))?.attr?.fields?.[field];
   if (sensOf(def) !== 'restricted') return true;
+  // Phase 8 — an active break-glass that covers this field with a read grant reveals it,
+  // no exact grant or purpose required: the break-glass IS the authorization, and its reason
+  // is what the sensitive-read evidence records (see writeSensitiveRead).
+  if (actor?._breakGlass && (actor._breakGlass.attr?.grants || []).some((g) => permits(g.mode, 'read') && grantMatch(g.path, target)))
+    return true;
   // locked + restricted (Phase 2): only EXACT field-path read grants reveal — never a wildcard.
   const exact = (await grantsOf(actor)).filter((g) => g.path === target && permits(g.mode, 'read'));
   if (!exact.length) return false;
@@ -1354,7 +1384,8 @@ async function writeSensitiveRead(actor, modelId, e) {
     manifest: `read ${[...e.fields].join(', ')} on ${modelId} (${atoms.length})`,
     attr: {
       actor: ref(actor.id), ...(actor._session ? { session: ref(actor._session) } : {}),
-      purpose: ref(actor._purpose), ...(actor._reason ? { reason: actor._reason } : {}),
+      ...(actor._purpose ? { purpose: ref(actor._purpose) } : {}),   // absent under break-glass (Phase 8)
+      ...(actor._breakGlass ? { reason: `break-glass: ${actor._breakGlass.attr.reason}` } : (actor._reason ? { reason: actor._reason } : {})),
       model: modelId, fields: [...e.fields], atoms, count: atoms.length, at: now(),
     },
     lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(),
@@ -1445,13 +1476,15 @@ const EVIDENCE_MODELS = new Set([
 // the single chokepoint, called at the head of create/writeAtom/retire — the only
 // actor-driven write entries. Kernel-internal writes (seed/persist/bump/logIt/hooks)
 // do not pass through here, so genesis, the ledger, and hook patches are unaffected.
-function guardDangerous(modelRef, op) {
-  if (LOCKED && DANGEROUS_MODELS.has(modelRef))
+function guardDangerous(modelRef, op, actor) {
+  // an active break-glass is the emergency override (Phase 8): it lets the holder edit
+  // governance atoms directly, the way an approved change-request (viaApproval) does.
+  if (LOCKED && DANGEROUS_MODELS.has(modelRef) && !actor?._breakGlass)
     throw new Err(403, `locked mode: cannot ${op} ${modelRef} directly — governance atoms change only through an approved change request (POST /change-request) or active break-glass`);
 }
 
 async function create(modelId, body, actor, viaApproval = false) {
-  if (!viaApproval) guardDangerous(ref(modelId), 'create');   // an approved change-request is the sanctioned bypass (Phase 7)
+  if (!viaApproval) guardDangerous(ref(modelId), 'create', actor);   // bypass: approved change-request (Phase 7) or active break-glass (Phase 8)
   const modelAtom = await getAtom(modelId);
   const fields = Object.keys(body.attr || {});
   // a baseline create grant on the model is required even for an all-default/empty
@@ -1551,7 +1584,7 @@ async function create(modelId, body, actor, viaApproval = false) {
 async function writeAtom(id, body, actor, ifMatch, mode, viaApproval = false) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
-  if (!viaApproval) guardDangerous(atom.model, mode);   // an approved change-request is the sanctioned bypass (Phase 7)
+  if (!viaApproval) guardDangerous(atom.model, mode, actor);   // bypass: approved change-request (Phase 7) or active break-glass (Phase 8)
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
   for (const f of fields) if (!await allows(actor, `${modelId}.${f}`, 'update'))
@@ -1699,7 +1732,7 @@ async function retireWithRefs(atom, actor, seen) {
 async function retire(id, actor, viaApproval = false) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
-  if (!viaApproval) guardDangerous(atom.model, 'delete');   // an approved change-request is the sanctioned bypass (Phase 7)
+  if (!viaApproval) guardDangerous(atom.model, 'delete', actor);   // bypass: approved change-request (Phase 7) or active break-glass (Phase 8)
   if (!await canOp(actor, refId(atom.model), 'delete'))
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   if (!await writable(actor, atom)) throw new Err(403, `cannot delete ${refId(atom.model)} (tenant scope or write rule)`);
@@ -1777,6 +1810,30 @@ async function submitApproval(body, actor) {
     await persist(change);
     return approval;
   });
+}
+
+// Phase 8 — activate a break-glass. ONLY the out-of-band root (the literal ATOMIC_ADMIN_SECRET,
+// → actor._admin) may do this, so it bypasses the grant system and the dangerous-write guard
+// (which is the whole point: it's how a locked, `**`-suppressed admin recovers access). A
+// reason and a FUTURE expiry are mandatory; the atom itself is the activation evidence.
+async function activateBreakGlass(body, actor) {
+  if (!actor?._admin) throw new Err(403, 'break-glass can be activated only with the admin secret (Authorization: Bearer <ATOMIC_ADMIN_SECRET>)');
+  const attr = body.attr || {};
+  if (!attr.reason) throw new Err(400, 'break-glass requires a reason');
+  if (!attr.expiresAt || isNaN(Date.parse(attr.expiresAt))) throw new Err(400, 'break-glass requires an expiresAt (ISO datetime)');
+  if (attr.expiresAt <= now()) throw new Err(400, 'break-glass expiresAt must be in the future');
+  const id = `bg-${randomUUID().slice(0, 8)}`;
+  const bg = {
+    id, model: 'atom://break-glass', manifest: `break-glass for ${actor.id}: ${attr.reason}`,
+    attr: { actor: ref(actor.id), reason: String(attr.reason), expiresAt: attr.expiresAt,
+      grants: Array.isArray(attr.grants) && attr.grants.length ? attr.grants : [{ path: '**', mode: 'all' }],
+      status: 'active' },
+    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(),
+      createdBy: ref(actor.id), parent: ref('0'), expiration: 'atom://policy-never' },
+  };
+  await seed(bg);
+  await logIt(id, 'break-glass', actor.id, [{ path: 'status', from: null, to: 'active' }], actor._session); // noisy by design
+  return bg;
 }
 
 // Provision a base: one tenant + one open-login token scoped to it, in a single
@@ -2744,11 +2801,18 @@ const server = http.createServer(async (req, res) => {
     // locked mode this is inert metadata, but threading it is cheap and uniform.
     const _purpose = (req.headers['x-atomic-purpose'] || url.searchParams.get('purpose') || '').trim();
     const _reason  = (req.headers['x-atomic-reason']  || url.searchParams.get('reason')  || '').trim();
-    if (_purpose || _reason) {
+    // Always work on a per-request COPY of a resolved actor (Phase 8): grantsOf must be
+    // recomputed per request so a break-glass's wall-clock expiry is honored — caching the
+    // effective grants across requests on a shared token object would keep an expired
+    // break-glass "active". The copy also carries _purpose/_reason and _breakGlass safely.
+    if (actor.id !== '0') {
       const pid = isRef(_purpose) ? refId(_purpose) : _purpose;
       let _purposeOk = false;
       if (pid) { const p = await store.get(pid); _purposeOk = !!p && p.model === 'atom://purpose' && p.lifecycle?.status !== 'retired'; }
       actor = { ...actor, ...(pid ? { _purpose: pid, _purposeOk } : {}), ...(_reason ? { _reason } : {}) };
+      // resolve this actor's active break-glass once (locked only) — the flag the grant
+      // suppression, the guard bypass, and restricted-reveal all read.
+      if (LOCKED) actor._breakGlass = await activeBreakGlass(actor);
     }
     // Phase 4 — flush restricted-reveal evidence, THEN send. In locked mode a failed
     // evidence write throws 503 here (caught below) and the projected body is never sent
@@ -2799,6 +2863,10 @@ const server = http.createServer(async (req, res) => {
     // POST so the before/diff capture and the approver≠maker + apply logic run.
     if (req.method === 'POST' && path === 'change-request') return send(201, await submitChange(await readBody(req), actor));
     if (req.method === 'POST' && path === 'approval') return send(201, await submitApproval(await readBody(req), actor));
+    // Phase 8 — break the glass: the admin-secret root grants itself temporary, reasoned,
+    // expiring `**`. Special-cased (not generic create) because it bypasses the grant system
+    // and the dangerous-write guard by design — it's how a `**`-suppressed admin recovers.
+    if (req.method === 'POST' && path === 'break-glass') return send(201, await activateBreakGlass(await readBody(req), actor));
 
     // an atom id may itself contain dots (query ids like 'atom.byDate'); a whole-
     // path match on a real atom wins over dot-path traversal of atom://atom.
@@ -2966,6 +3034,17 @@ function coreAtoms() {
       approver: { kind: 'ref', to: 'atom://token' },
       decision: { kind: 'enum', values: ['approved', 'rejected'], required: true },
       reason: { kind: 'text' }, at: { kind: 'datetime' } }),
+    // break-glass — the emergency override (Phase 8). In locked mode a `**` grant is inert
+    // unless an ACTIVE, unexpired break-glass for the actor restores it; while active it also
+    // lets the holder edit governance atoms directly and reveal restricted fields (recording
+    // the break-glass reason). Activated ONLY with the admin secret (POST /break-glass), with
+    // a mandatory reason + future expiry. An evidence + dangerous-write model.
+    model('break-glass', 'Break Glass', {
+      actor: { kind: 'ref', to: 'atom://token', required: true },
+      reason: { kind: 'text', required: true },
+      expiresAt: { kind: 'datetime', required: true, filterable: true },
+      grants: { kind: 'list', of: 'embed://grant' },
+      status: { kind: 'enum', values: ['active', 'expired', 'revoked'], filterable: true } }),
     // export-job — evidence that a bulk export ran (Phase 1). Locked-mode --export-all
     // / --export-base write one of these BEFORE streaming a byte, so a shell operator's
     // dump is no longer silent. `sealed` records whether the bytes were AES-GCM sealed
@@ -3159,7 +3238,7 @@ async function audit() {
   // every ledger entry is well-formed: a known op, with a subject + actor.
   // (Global contiguity is NOT an invariant — tenants are independent shards a
   //  node may carry or drop, which legitimately gaps the global log counter.)
-  const OPS = new Set(['genesis', 'create', 'merge', 'update', 'replace', 'delete', 'hook', 'migrate', 'hook-skipped']);
+  const OPS = new Set(['genesis', 'create', 'merge', 'update', 'replace', 'delete', 'hook', 'migrate', 'hook-skipped', 'break-glass']);
   report('every ledger entry is well-formed', atoms.filter((a) => a.model === 'atom://log')
     .filter((a) => !OPS.has(a.attr?.op) || !isRef(a.attr?.atom) || !isRef(a.attr?.actor))
     .map((a) => `${a.id}: op=${a.attr?.op}`));

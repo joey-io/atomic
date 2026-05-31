@@ -534,6 +534,37 @@ this explicitly so locked mode is recoverable, not bricked.
 
 ## Phase 8 — Break-glass access
 
+> **Status: implemented (2026-05-31).** A `break-glass` model ships in `coreAtoms()` (evidence
+> + dangerous-write). `grantsOf` now, in locked mode, **drops every `**` grant** unless the
+> actor has an active break-glass — whose grants then expand the effective set, restoring `**`.
+> `activeBreakGlass(actor)` is resolved once per request (→ `actor._breakGlass`) against the
+> wall clock, and the handler now always works on a **per-request copy** of the actor so a
+> break-glass's expiry is honored immediately (no cross-request grant cache to go stale). While
+> active, a break-glass also **bypasses `guardDangerous`** (direct governance edits, like an
+> approved change-request) and **reveals restricted fields** with no exact grant or purpose —
+> recording the **break-glass reason** in the `sensitive-read` evidence. Activation is
+> `POST /break-glass`, allowed **only** to the literal `ATOMIC_ADMIN_SECRET` bearer (→
+> `actor._admin`, set in `actorFromReq`), and requires a reason + a future `expiresAt`; the
+> atom itself + a `break-glass` ledger op are the activation evidence. 11 assertions in
+> `test.mjs` (expired grants nothing, non-`**` wildcards unaffected, admin-only activation,
+> reason/future-expiry required, active restores `**` + reveals + bypasses the guard + records
+> the reason).
+>
+> **This is the phase that re-armed the earlier ones:** the Phase 0–7 locked tests relied on
+> `joey`'s `**` working in locked mode (break-glass didn't exist yet); they now break the glass
+> (admin secret) to do their admin setup, and the "even `**` can't reveal" assertions became
+> "`**` is suppressed; under break-glass it reveals (Phase 8)".
+>
+> **Scoped / deferred, stated plainly:** (1) only the literal `**` path is suppressed — a bare
+> `*` (single-segment) superuser is not, since the plan names `**`. (2) Break-glass is
+> admin-secret-only; delegating activation to a security-admin role is a future nicety. (3) The
+> **CLI plaintext bulk export gated on break-glass** (Phase 1's deferred louder export) is NOT
+> built — the CLI has no request actor to carry `_breakGlass`; the sealed export remains the
+> locked default. (4) `status: expired` is not lazily written back — expiry is computed from
+> `expiresAt` on read (an `expired`/`revoked` status is honored if set, but the kernel doesn't
+> sweep `active`→`expired`). (5) Break-glass atoms themselves are not yet tamper-chained (Phase
+> 10).
+
 Wildcard root access is sometimes necessary, but it must be noisy and temporary.
 
 ```json
@@ -656,7 +687,7 @@ metadata first.
 6. ✅ Explicit `export` grant mode + CSV/CLI export audit (Phase 5).
 7. ✅ Hook/migration allowlists (Phase 6).
 8. ✅ Change-request + approval, with the bootstrap path (Phase 7).
-9. Break-glass (Phase 8).
+9. ✅ Break-glass (Phase 8).
 10. Legal hold + retention hardening (Phase 9).
 11. Per-tenant hash-chained evidence with persisted head (Phase 10).
 12. Locked-mode `--audit` checks + locked-mode test suite (Phase 11).

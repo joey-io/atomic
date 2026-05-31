@@ -6,7 +6,7 @@
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0%20required-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
-![tests](https://img.shields.io/badge/tests-226%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-240%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Atomic is a single-file kernel for graph-relational data with no required dependencies (the
@@ -71,7 +71,7 @@ ATOMIC_DB=postgres://localhost/atomic npm start
 npm run seed
 
 # verify
-npm test         # 226 black-box HTTP assertions
+npm test         # 240 black-box HTTP assertions
 npm run check    # the kernel's own tests, which are themselves atoms
 npm run audit    # structural invariants (exits non-zero on any finding)
 ```
@@ -297,6 +297,11 @@ transaction.
   a confidential/restricted field leaves in a CSV only under an explicit `export`-mode grant
   (never `read`/`write`/`all`), the model's `exports` posture (`disabled` · `grant` ·
   `approval`) is enforced, and a sensitive export records an `export-job` evidence atom.
+- **Governed change + break-glass.** In `locked` mode governance atoms (models, tokens, hooks,
+  …) can't be edited directly — only through a `change-request` an approval applies (maker ≠
+  approver) — and a `**` grant is inert unless an **active break-glass** restores it.
+  Break-glass is admin-secret-only, reasoned, and expiring: while active it grants full access
+  and records every sensitive read with its reason.
 - **One-click bases.** `POST /base { name }` (or `node atomic.mjs --new-base "<name>"`)
   provisions a tenant and an open-login token in one transaction and returns a **share URL** —
   open it and you are one-clicked into that base as a full, tenant-confined session.
@@ -400,7 +405,7 @@ Read from the environment, with `./.env` as a gitignored fallback.
 
 Verification lives at two levels, and the second is itself made of atoms:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (226 assertions) covering validation,
+- **`test.mjs`** — an independent, black-box HTTP suite (240 assertions) covering validation,
   grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability
   across restart, and security regressions.
 - **`--check`** — the substrate's own acceptance suite, *as data*: a `test` atom is
@@ -430,7 +435,7 @@ package.json scripts; no required dependencies
 
 ## Status
 
-Atomic is pre-launch and experimental. It runs, and it is exercised by 226 HTTP test
+Atomic is pre-launch and experimental. It runs, and it is exercised by 240 HTTP test
 assertions, a self-test suite, and a structural audit — but interfaces may still change.
 
 ---

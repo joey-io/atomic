@@ -479,6 +479,10 @@ ok(checkCode === 0, 'kernel --check runs the substrate’s own test atoms green 
 // =============================================================================
 const LPORT = 7791, LSTORE = '/tmp/atomic-locked-store', lbase = `http://localhost:${LPORT}`;
 const LKEY = 'ab'.repeat(32);                                  // 64-hex AES-256 key
+const FUTURE = '2099-12-31T00:00:00.000Z';                     // a far-future break-glass expiry (Phase 8)
+// activate a break-glass for joey (the admin secret is the only key) — Phase 8 suppresses a
+// `**` grant in locked mode, so the earlier locked blocks break the glass to do admin work.
+const breakGlass = (jfetch, expiresAt = FUTURE) => jfetch('POST', '/break-glass', { attr: { actor: 'atom://joey', reason: 'test admin access', expiresAt, grants: [{ path: '**', mode: 'all' }] } });
 const lenv = (extra = {}) => ({ ...process.env, PORT: LPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ...extra });
 const locked = (extra = {}) => lenv({ ATOMIC_STORE: LSTORE, ATOMIC_KEY: LKEY, ATOMIC_MODE: 'locked', ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
 // run a one-shot CLI/boot and resolve { code, out } when it exits. A process that
@@ -515,9 +519,11 @@ ok(await lcode('POST', '/hook', { id: 'h-x', attr: { run: 'x' } }) === 403, 'loc
 ok(await lcode('POST', '/condition', { id: 'c-x', attr: { field: 'a', op: 'eq', value: 1 } }) === 403, 'locked: guard blocks POST /condition');
 ok(await lcode('PATCH', '/policy-default', { attr: { label: 'tampered' } }) === 403, 'locked: guard blocks PATCH of a governance atom');
 ok(await lcode('DELETE', '/policy-default') === 403, 'locked: guard blocks DELETE of a governance atom');
-// the guard is selective — ordinary data writes still work
-ok(await lcode('POST', '/config', { id: 'cfg1', attr: { key: 'k', value: 1 } }) === 201, 'locked: a non-governance create still succeeds (guard is selective)');
-ok(await lcode('PATCH', '/cfg1', { attr: { key: 'k', value: 2 } }) === 200, 'locked: PATCH of a non-governance atom still succeeds');
+// Phase 8 — joey's `**` is suppressed in locked mode; the admin secret breaks the glass to act.
+ok((await breakGlass(LJ)).status === 201, 'locked: the admin secret can activate a break-glass');
+// under break-glass the admin can write again (ordinary + governance alike)
+ok(await lcode('POST', '/config', { id: 'cfg1', attr: { key: 'k', value: 1 } }) === 201, 'locked: under break-glass a create succeeds');
+ok(await lcode('PATCH', '/cfg1', { attr: { key: 'k', value: 2 } }) === 200, 'locked: under break-glass a PATCH succeeds');
 
 // --- Phase 1b: the bulk-export hole is closed (sealed bytes + an evidence record) ---
 lsrv.kill(); await new Promise((r) => setTimeout(r, 300));
@@ -589,7 +595,11 @@ ssrv = startMode('locked'); await waitS();
 ok((await (await fetch(sbase + '/')).json()).id === '0', 'sensitivity (locked): the dev-built store reboots in locked mode');
 const wildView = await sjson('p-wild', '/p-1');
 ok(wildView.attr.name === 'Ada' && wildView.attr.ssn === undefined, 'locked: a wildcard read sees name but NOT the restricted ssn');
-ok((await sjson('joey', '/p-1')).attr.ssn === undefined, 'locked: even a ** superuser does not reveal a restricted field');
+// Phase 8 — joey's `**` is now suppressed in locked mode: a superuser can't even read,
+// then breaks the glass (admin secret only) to do the setup + reads the later phases need.
+ok(await scode('joey', 'GET', '/p-1') === 404, 'locked: a ** superuser is SUPPRESSED until break-glass (Phase 8)');
+ok((await breakGlass((m, p, b) => SJ('joey', m, p, b))).status === 201, 'locked: the admin secret activates a break-glass');
+ok((await sjson('joey', '/p-1')).attr.ssn === '111-22-3333', 'locked: ** under an active break-glass reveals the restricted field (Phase 8)');
 ok(await scode('p-wild', 'GET', '/p-1.ssn') === 404, 'locked: dotted read of a restricted field is 404 for a wildcard actor');
 const list = await sjson('p-wild', '/person');
 ok(Array.isArray(list) && list[0] && list[0].attr.ssn === undefined, 'locked: list view redacts the restricted field for a wildcard actor');
@@ -615,7 +625,7 @@ ok(await ssnVia('p-reveal', 'purpose-audit', 'compliance') === '111-22-3333', 'p
 // the query-param form works the same as the header
 ok((await (await SJ('p-reveal', 'GET', '/p-1?purpose=purpose-eligibility')).json()).attr.ssn === '111-22-3333', 'purpose: ?purpose= query form reveals just like the header');
 // even with a valid purpose, a ** superuser still has no EXACT grant → still redacted
-ok(await ssnVia('joey', 'purpose-eligibility') === undefined, 'purpose: a ** superuser with a valid purpose still cannot reveal (no exact grant)');
+ok(await ssnVia('p-wild', 'purpose-eligibility') === undefined, 'purpose: a wildcard grant + a valid purpose still cannot reveal (an exact grant is required)');
 // dotted traversal honours the same purpose gate
 ok((await sPurp('p-reveal', '/p-1.ssn')).status === 404, 'purpose: dotted read of a restricted field is 404 without a purpose');
 ok((await sPurp('p-reveal', '/p-1.ssn', 'purpose-eligibility')).status === 200, 'purpose: dotted read of a restricted field works with a valid purpose');
@@ -740,6 +750,7 @@ await new Promise((res) => spawn('node', ['atomic.mjs', '--import-all', '/tmp/at
 
 // reboot LOCKED with NO allowlists → hook skips (+ evidence), custom migration fails closed
 hsrv = startH({ ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY }); await waitH();
+await breakGlass((m, p, b) => HJ('joey', m, p, b));    // Phase 8 — the admin breaks the glass to write widget6 atoms (persists across the reboot below)
 await HJ('joey', 'POST', '/widget6', { id: 'wd2', attr: { name: 'Delta' } });
 ok((await hjson('joey', '/wd2')).attr.stamp === undefined, 'hooks (locked, no allowlist): the hook is SKIPPED — no stamp written');
 const skiplog = await hjson('joey', '/log.byAtom?atom=atom://wd2');
@@ -810,6 +821,60 @@ ok((await cjson('approver', '/' + cr2.id)).attr.status === 'rejected', 'cr: a re
 ok((await cjson('approver', '/target')).attr.email === 'approved@x.com', 'cr: a rejected change does not touch the target');
 csrv.kill(); await new Promise((r) => setTimeout(r, 200));
 rmSync(CSTORE, { recursive: true, force: true });
+
+// =============================================================================
+// Phase 8 — break-glass. In locked mode a `**` grant is INERT unless an active, unexpired
+// break-glass (admin-secret only) restores it; while active it bypasses the dangerous-write
+// guard and reveals restricted fields (recording the break-glass reason). An EXPIRED
+// break-glass is injected first to prove it grants nothing.
+// =============================================================================
+const BPORT = 7795, BGSTORE = '/tmp/atomic-bg-store', bbase = `http://localhost:${BPORT}`;
+const BSEC = { joey: ADMIN };
+const benv = (extra = {}) => ({ ...process.env, PORT: BPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_STORE: BGSTORE, ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
+const startB = (extra = {}) => spawn('node', ['atomic.mjs'], { env: benv(extra), stdio: 'ignore' });
+const BJ = (tok, method, p, body) => fetch(bbase + p, { method, headers: { ...(BSEC[tok] ? { authorization: 'Bearer ' + BSEC[tok] } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const bcode = (tok, method, p, body) => BJ(tok, method, p, body).then((r) => r.status);
+const bjson = (tok, p) => BJ(tok, 'GET', p).then((r) => r.json());
+const waitB = async () => { for (let i = 0; i < 50; i++) { try { await fetch(bbase + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+const mkTokB = async (body) => { const j = await (await BJ('joey', 'POST', '/token', body)).json(); if (j.id && j.secret) BSEC[j.id] = j.secret; return j; };
+
+rmSync(BGSTORE, { recursive: true, force: true });
+let bsrv = startB(); await waitB();
+await BJ('joey', 'POST', '/model', { id: 'vip', attr: { label: 'VIP', version: 1, fields: { name: { kind: 'text' }, ssn: { kind: 'text', sensitivity: 'restricted' } } } });
+await mkTokB({ id: 'worker', attr: { email: 'wk@x.com', grants: [{ path: 'vip.*', mode: 'read' }] } });
+await BJ('joey', 'POST', '/vip', { id: 'v1', attr: { name: 'Iris', ssn: '777-88-9999' } });
+bsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+// inject an EXPIRED break-glass for joey (status active, but expiresAt in the past)
+const bglc = `"lifecycle":{"status":"active","version":1,"modelVersion":1,"createdAt":"2020-01-01T00:00:00.000Z","createdBy":"atom://0","parent":"atom://0","expiration":"atom://policy-never"}`;
+writeFileSync('/tmp/atomic-bg.ndjson', `{"id":"bg-old","model":"atom://break-glass","manifest":"old","attr":{"actor":"atom://joey","reason":"old incident","expiresAt":"2020-01-01T00:00:00.000Z","grants":[{"path":"**","mode":"all"}],"status":"active"},${bglc}}\n`);
+await new Promise((res) => spawn('node', ['atomic.mjs', '--import-all', '/tmp/atomic-bg.ndjson'], { env: benv(), stdio: 'ignore' }).on('exit', res));
+
+bsrv = startB({ ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY }); await waitB();
+// an EXPIRED break-glass grants nothing: joey's `**` stays suppressed
+ok(await bcode('joey', 'GET', '/v1') === 404, 'bg: an expired break-glass does not restore ** — the superuser stays suppressed');
+// a non-`**` wildcard grant is NOT suppressed — worker reads vip but still can't reveal the restricted ssn
+const wv = await bjson('worker', '/v1');
+ok(wv.attr.name === 'Iris' && wv.attr.ssn === undefined, 'bg: a non-** wildcard grant still works in locked mode (and cannot reveal restricted)');
+// only the admin secret may activate break-glass; a normal token cannot
+ok(await bcode('worker', 'POST', '/break-glass', { attr: { reason: 'x', expiresAt: FUTURE } }) === 403, 'bg: a non-admin token cannot activate break-glass');
+// a reason and a FUTURE expiry are mandatory
+ok(await bcode('joey', 'POST', '/break-glass', { attr: { expiresAt: FUTURE } }) === 400, 'bg: activation requires a reason');
+ok(await bcode('joey', 'POST', '/break-glass', { attr: { reason: 'incident' } }) === 400, 'bg: activation requires an expiresAt');
+ok(await bcode('joey', 'POST', '/break-glass', { attr: { reason: 'incident', expiresAt: '2020-01-01T00:00:00.000Z' } }) === 400, 'bg: activation refuses a past expiry');
+// the admin activates a valid break-glass → ** is restored
+ok((await BJ('joey', 'POST', '/break-glass', { attr: { reason: 'prod incident 42', expiresAt: FUTURE } })).status === 201, 'bg: the admin secret activates a valid break-glass');
+ok(await bcode('joey', 'GET', '/v1') === 200, 'bg: an active break-glass restores ** (the superuser can read again)');
+// under break-glass ** reveals restricted fields (no exact grant or purpose needed)
+ok((await bjson('joey', '/v1')).attr.ssn === '777-88-9999', 'bg: ** under an active break-glass reveals a restricted field');
+// the reveal is recorded with the break-glass reason
+const bgReads = await bjson('joey', '/sensitive-read');
+ok(Array.isArray(bgReads) && bgReads.some((a) => String(a.attr.reason || '').startsWith('break-glass:')), 'bg: a sensitive read under break-glass records the break-glass reason');
+// break-glass bypasses the dangerous-write guard — joey can mint a token directly
+ok(await bcode('joey', 'POST', '/token', { id: 'bg-tok', attr: { email: 'bt@x.com' } }) === 201, 'bg: an active break-glass bypasses the dangerous-write guard');
+bsrv.kill(); await new Promise((r) => setTimeout(r, 200));
+rmSync(BGSTORE, { recursive: true, force: true });
+rmSync('/tmp/atomic-bg.ndjson', { force: true });
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
