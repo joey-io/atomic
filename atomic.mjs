@@ -765,6 +765,7 @@ function parseLine(line) {
 // write-back used by in-place mutators (bump/migrate) and is just store.set.
 function memStore() {                                   // in-memory (no ATOMIC_STORE): the default
   const m = new Map();
+  let snapshot = null;            // deep pre-transaction copy; non-null only inside a tx
   return {
     get: (id) => m.get(id), set: (id, a) => m.set(id, a), has: (id) => m.has(id),
     delete: (id) => m.delete(id), values: () => [...m.values()], get size() { return m.size; },
@@ -778,6 +779,14 @@ function memStore() {                                   // in-memory (no ATOMIC_
       }
       return out;
     },
+    // Transactions. This driver hands out live atom references that the kernel
+    // mutates in place (bump), so a shallow copy would alias those mutations —
+    // begin() takes a deep snapshot and rollback() restores it wholesale. That is
+    // O(store) per transaction, but this is the in-RAM default; the durable path
+    // below uses SQLite's native BEGIN/COMMIT, which is O(changes).
+    begin()    { snapshot = new Map(); for (const [k, v] of m) snapshot.set(k, structuredClone(v)); },
+    commit()   { snapshot = null; },
+    rollback() { if (snapshot) { m.clear(); for (const [k, v] of snapshot) m.set(k, v); snapshot = null; } },
     close() {},
   };
 }
@@ -823,11 +832,47 @@ function sqliteStore() {
       const sql = 'SELECT body FROM atom' + (where.length ? ' WHERE ' + where.join(' AND ') : '');
       return prep(sql).all(...params).map((r) => parseLine(r.body));
     },
+    // Transactions: SQLite's own, on the single writer connection. Reads inside the
+    // transaction (same connection) see its uncommitted writes, so a batch's ops
+    // observe each other; ROLLBACK reverts every change as one unit. Durable on
+    // COMMIT (WAL + synchronous=NORMAL fsyncs at the checkpoint).
+    begin()      { db.exec('BEGIN'); },
+    commit()     { db.exec('COMMIT'); },
+    rollback()   { db.exec('ROLLBACK'); },
     close()      { db.close(); },
   };
 }
 store = ROOT ? sqliteStore() : memStore();
 function persist(atom) { store.set(atom.id, atom); storeGen++; } // durable write-back; bumps the read-memo gen
+
+// --- Transactions. A batch of mutations that commits all-or-nothing. The store
+// driver supplies begin/commit/rollback (SQLite's native transaction; a deep
+// snapshot for the in-RAM driver). tx(fn) runs fn inside one transaction: on any
+// throw the whole batch rolls back and storeGen is bumped so every gen-keyed read
+// memo rebuilds against the reverted state. Nested tx() calls join the enclosing
+// one, so a mutator that is itself transactional (e.g. a cascading delete) composes
+// without opening a second transaction. fn is synchronous — the kernel's mutators
+// (create/update/retire) are; their async tails (hooks, migration sweeps) run after
+// commit, because a hook's external side-effect cannot be rolled back.
+let _txDepth = 0;
+function tx(fn) {
+  if (_txDepth > 0) return fn();                 // already inside a transaction — join it
+  _txDepth++;
+  try {
+    store.begin();
+    try {
+      const result = fn();
+      store.commit();
+      return result;
+    } catch (e) {
+      store.rollback();
+      storeGen++;                                // reverted state invalidates the read memos
+      throw e;
+    }
+  } finally {
+    _txDepth--;
+  }
+}
 
 // One-time migration: fold any legacy per-tenant NDJSON shards (the previous
 // on-disk format) into atoms.db, last-write-wins by id, then set them aside as
@@ -1448,13 +1493,63 @@ function csvToBodies(modelId, text) {
   }
   return bodies;
 }
-async function bulkCreate(modelId, bodies, actor) {
+async function bulkCreate(modelId, bodies, actor, atomic = false) {
+  // atomic import (?atomic=1): the whole import is one transaction — a single bad
+  // row rolls every row back and surfaces the error, rather than a partial load.
+  if (atomic) {
+    const made = tx(() => bodies.map((b) => create(modelId, b, actor)));
+    for (const a of made) await runHooks(a, 'create');   // hooks fire post-commit
+    return { imported: made.length, failed: [] };
+  }
+  // default: per-row best-effort — each row that validates is kept, each that
+  // fails is reported, and the response is a summary (Import is still POST-many).
   const out = { imported: 0, failed: [] };
   for (let i = 0; i < bodies.length; i++) {
     try { const a = create(modelId, bodies[i], actor); await runHooks(a, 'create'); out.imported++; }
     catch (e) { out.failed.push({ row: i, id: bodies[i]?.id || null, error: e.message }); }
   }
   return out;
+}
+
+// ---- /tx: an all-or-nothing batch of writes. The body is a JSON array of ops,
+// each mirroring a REST verb and dispatched through the same mutator REST uses, so
+// grants, attenuation, rules, tenant scope, dedup, and optimistic concurrency all
+// apply unchanged. The batch runs inside one transaction (tx): any op throwing
+// rolls the whole batch back. Lifecycle hooks and migration sweeps run only after
+// the batch commits — a hook may call an external service, which cannot be undone.
+const bareId = (v) => (isRef(v) ? refId(v) : String(v));
+function applyOp(op, actor, i) {
+  if (!op || typeof op !== 'object' || Array.isArray(op)) throw new Err(400, `op ${i}: must be an object`);
+  const { op: verb, ifMatch, ...body } = op;       // body = the create/update payload (attr, manifest, id, parent, hooks…)
+  switch (verb) {
+    case 'create':
+      if (!op.model) throw new Err(400, `op ${i}: create needs a model`);
+      return { atom: create(bareId(op.model), body, actor), event: 'create' };
+    case 'update':
+      if (!op.id) throw new Err(400, `op ${i}: update needs an id`);
+      return { atom: update(bareId(op.id), body, actor, ifMatch), event: 'update' };
+    case 'replace':
+      if (!op.id) throw new Err(400, `op ${i}: replace needs an id`);
+      return { atom: replace(bareId(op.id), body, actor, ifMatch), event: 'update' };
+    case 'delete':
+      if (!op.id) throw new Err(400, `op ${i}: delete needs an id`);
+      return { atom: retire(bareId(op.id), actor), event: 'delete' };
+    default:
+      throw new Err(400, `op ${i}: unknown op "${verb}" — use create | update | replace | delete`);
+  }
+}
+async function txBatch(ops, actor) {
+  if (!Array.isArray(ops)) throw new Err(400, '/tx expects a JSON array of operations');
+  if (!ops.length) return { ok: true, results: [] };
+  const effects = [];
+  tx(() => { for (let i = 0; i < ops.length; i++) effects.push(applyOp(ops[i], actor, i)); });
+  // committed — now fire the same post-write tails the REST verbs run, in order.
+  for (const { atom, event } of effects) {
+    await runHooks(atom, event);
+    if (event !== 'delete' && atom.model === 'atom://model') await sweepModel(atom.id);
+    if (event === 'create' && atom.model === 'atom://migration') await sweepModel(refId(atom.attr.model));
+  }
+  return { ok: true, results: effects.map((e) => e.atom) };
 }
 
 function renderTable(modelId, atoms, actor) {
@@ -1817,6 +1912,12 @@ const server = http.createServer(async (req, res) => {
       return send(401, { error: 'authenticate: POST /auth { email } or Authorization: Bearer <token>' });
     }
 
+    // --- /tx: all-or-nothing batch of writes (see txBatch). Body is a JSON array
+    // of ops, each mirroring a REST verb:
+    //   {op:'create', model, attr, …} · {op:'update'|'replace', id, attr, ifMatch} · {op:'delete', id}
+    // A single failure rolls the whole batch back; the response is {ok, results}.
+    if (req.method === 'POST' && path === 'tx') return send(200, await txBatch(await readBody(req), actor));
+
     // an atom id may itself contain dots (index ids like 'atom.byDate'); a whole-
     // path match on a real atom wins over dot-path traversal of atom://atom.
     if (req.method === 'GET' && path && store.has(path) && getAtom(path).model === 'atom://index') {
@@ -1878,12 +1979,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST') {
       // IMPORT (bulk create) — POST a CSV body, or a JSON array, to a model. Each
       // row/element runs through create() under the caller's own grants and rules.
+      const atomic = url.searchParams.get('atomic') === '1';   // ?atomic=1 → all-or-nothing import
       if ((req.headers['content-type'] || '').includes('csv')) {
         const text = await readRaw(req);  // capped — a CSV import can't exhaust memory either
-        return send(200, await bulkCreate(head, csvToBodies(head, text), actor));
+        return send(200, await bulkCreate(head, csvToBodies(head, text), actor, atomic));
       }
       const body = await readBody(req);
-      if (Array.isArray(body)) return send(200, await bulkCreate(head, body, actor));
+      if (Array.isArray(body)) return send(200, await bulkCreate(head, body, actor, atomic));
       const a = create(head, body, actor); await runHooks(a, 'create');
       if (a.model === 'atom://migration') await sweepModel(refId(a.attr.model)); // a new migration brings its model's atoms forward
       return send(201, a);

@@ -245,10 +245,53 @@ ok((await J('joey', 'GET', '/loopy', null, { accept: 'text/html' })).status === 
 // L2: an id with HTML/URL metacharacters is rejected.
 ok(await code('joey', 'POST', '/widget', { id: '<script>', attr: { name: 'x' } }) === 400, 'unsafe id rejected');
 
+// --- transactions: /tx all-or-nothing ---------------------------------------
+// happy path: a batch of two creates commits together
+ok(await code('tk-all', 'POST', '/tx', [
+  { op: 'create', model: 'widget', id: 'tx-a', attr: { name: 'TxA' } },
+  { op: 'create', model: 'widget', id: 'tx-b', attr: { name: 'TxB' } },
+]) === 200, '/tx batch of creates returns 200');
+ok(await code('tk-all', 'GET', '/tx-a') === 200 && await code('tk-all', 'GET', '/tx-b') === 200, '/tx committed every op');
+// failure path: a later op is invalid (bad enum) — the whole batch rolls back
+ok(await code('tk-all', 'POST', '/tx', [
+  { op: 'create', model: 'widget', id: 'tx-c', attr: { name: 'TxC' } },
+  { op: 'create', model: 'widget', id: 'tx-d', attr: { name: 'TxD', kind: 'nope' } },
+]) === 400, '/tx with one bad op fails the batch');
+ok(await code('tk-all', 'GET', '/tx-c') === 404, '/tx rolled back an earlier op when a later op failed');
+// and the rolled-back id is free again — nothing was half-committed (atom or ledger)
+ok(await code('tk-all', 'POST', '/tx', [{ op: 'create', model: 'widget', id: 'tx-c', attr: { name: 'TxC' } }]) === 200, '/tx rolled-back id is reusable (no half-create)');
+// optimistic concurrency inside a batch: a stale ifMatch rolls back its sibling too
+const txv = (await jsonOf('tk-all', '/tx-a')).lifecycle.version;
+ok(await code('tk-all', 'POST', '/tx', [
+  { op: 'update', id: 'tx-b', attr: { name: 'TxB2' } },
+  { op: 'update', id: 'tx-a', ifMatch: txv + 99, attr: { name: 'TxA2' } },
+]) === 409, '/tx surfaces a version conflict as 409');
+ok((await jsonOf('tk-all', '/tx-b')).attr.name === 'TxB', '/tx rolled back the sibling update on conflict');
+// a delete is a batch op like any other
+ok(await code('tk-all', 'POST', '/tx', [{ op: 'delete', id: 'tx-b' }]) === 200, '/tx delete retires the atom');
+ok((await jsonOf('tk-all', '/tx-b')).lifecycle.status === 'retired', '/tx delete committed (atom retired, hidden from lists)');
+ok(!(await jsonOf('tk-all', '/widget')).find((a) => a.id === 'tx-b'), '/tx-retired atom is gone from the list');
+// grants still apply per op: tk-read may not write, so the batch is refused whole
+ok(await code('tk-read', 'POST', '/tx', [{ op: 'create', model: 'widget', id: 'tx-x', attr: { name: 'No' } }]) === 403, '/tx enforces grants per op');
+ok(await code('tk-all', 'GET', '/tx-x') === 404, '/tx applied nothing when an op was unauthorized');
+
+// --- atomic import (?atomic=1) ------------------------------------------------
+ok(await code('tk-all', 'POST', '/widget?atomic=1', [
+  { id: 'tx-e', attr: { name: 'TxE' } },
+  { attr: { name: 'TxF', size: 999 } },          // size > max → invalid
+]) === 400, 'atomic import fails the whole import on a bad row');
+ok(await code('tk-all', 'GET', '/tx-e') === 404, 'atomic import rolled back the good row');
+const best = await (await J('tk-all', 'POST', '/widget', [
+  { id: 'tx-g', attr: { name: 'TxG' } },
+  { attr: { name: 'TxH', size: 999 } },
+])).json();
+ok(best.imported === 1 && best.failed.length === 1, 'default import stays per-row best-effort');
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();
 ok((await jsonOf('joey', '/w1')).attr.name === 'Alpha', 'atom persists across restart');
+ok((await jsonOf('tk-all', '/tx-a')).attr.name === 'TxA', '/tx commit is durable across restart (real SQLite COMMIT)');
 ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook-written field persists');
 // the migrated shape is durable — the rewrite was persisted, not recomputed each read
 g = await jsonOf('joey', '/g1');
