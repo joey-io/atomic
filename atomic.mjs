@@ -1047,7 +1047,7 @@ function migrateNdjson() {
       if (line.trim()) { const a = parseLine(line); store.set(a.id, a); n++; }
     fs.renameSync(f, f + '.migrated');
   }
-  if (n) console.log(`migrated ${n} NDJSON log lines into atoms.db`);
+  if (n) console.error(`migrated ${n} NDJSON log lines into atoms.db`);
 }
 // Durable data present? (SQLite: rows in atoms.db, after folding any legacy NDJSON.)
 function loadAll() {
@@ -1355,6 +1355,23 @@ function retire(id, actor) {
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   if (!writable(actor, atom)) throw new Err(403, `cannot delete ${refId(atom.model)} (tenant scope or write rule)`);
   return tx(() => retireWithRefs(atom, actor, new Set()));    // all-or-nothing across the cascade
+}
+
+// Provision a base: one tenant + one open-login token scoped to it, in a single
+// transaction — the "one base = one tenant, one URL" bow on top of the parts that
+// already exist (structural tenancy + open-login). The token's id is the SHARE
+// credential: its /auth/open URL one-clicks anyone into the base as a full session
+// confined to that tenant. (That's the INTENDED public mechanism for open-login —
+// distinct from the old bearer-id hole, which is why bearers are per-token secrets.)
+function provisionBase(name, actor) {
+  if (tenantOf(actor) !== null) throw new Err(403, 'only a superuser may provision a base');
+  const slug = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'base';
+  return tx(() => {
+    let tid; do { tid = `${slug}-${randomUUID().slice(0, 6)}`; } while (store.has(tid));
+    const tenant = create('tenant', { id: tid, attr: { name: String(name || 'New Base') } }, actor);
+    const token = create('token', { parent: ref(tenant.id), attr: { login: 'open', grants: [{ path: '**', mode: 'all' }] } }, actor);
+    return { tenant, token };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2272,6 +2289,14 @@ const server = http.createServer(async (req, res) => {
     // A single failure rolls the whole batch back; the response is {ok, results}.
     if (req.method === 'POST' && path === 'tx') return send(200, await txBatch(await readBody(req), actor));
 
+    // --- /base: provision a new base (superuser only) — one tenant + one open-login
+    // token scoped to it. Returns the tenant, the token, and a one-click share URL.
+    if (req.method === 'POST' && path === 'base') {
+      const { name } = await readBody(req);
+      const { tenant, token } = provisionBase(name, actor);
+      return send(201, { tenant: ref(tenant.id), token: ref(token.id), url: `${origin}/auth/open?token=${token.id}` });
+    }
+
     // an atom id may itself contain dots (index ids like 'atom.byDate'); a whole-
     // path match on a real atom wins over dot-path traversal of atom://atom.
     if (req.method === 'GET' && path && store.has(path) && getAtom(path).model === 'atom://index') {
@@ -2508,7 +2533,7 @@ async function migrate() {
   // schema evolution: bring every atom of a migrated model up to the current
   // version — the "background job, run to completion on boot" (README).
   const sgBefore = storeGen; await sweepAll(); const migrated = storeGen > sgBefore;
-  if (added || refreshed || n || migrated) console.log(`migrate: +${added} core atoms, refreshed ${refreshed} core models, backfilled expiration on ${n}, applied schema migrations`);
+  if (added || refreshed || n || migrated) console.error(`migrate: +${added} core atoms, refreshed ${refreshed} core models, backfilled expiration on ${n}, applied schema migrations`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2660,11 +2685,38 @@ if (store.indexCount && store.size > 0 && store.indexCount() === 0) {
   store.begin?.();
   try { for (const a of store.values()) store.setIndex(a.id, shardOf(a), a.model, indexRows(a)); store.commit?.(); }
   catch (e) { store.rollback?.(); throw e; }
-  console.log(`indexed ${store.size} atoms into the secondary index`);
+  console.error(`indexed ${store.size} atoms into the secondary index`);
 }
 
 if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens
 if (process.argv.includes('--check')) process.exit(await check()); // self-tests (the test atoms), then stop
+
+// `node atomic.mjs --new-base "<name>"` — provision a base from the command line and
+// print its one-click share URL. Persists if ATOMIC_STORE is set, then stops.
+const _nb = process.argv.indexOf('--new-base');
+if (_nb !== -1) {
+  const name = process.argv[_nb + 1] || 'New Base';
+  const { tenant, token } = provisionBase(name, getAtom('joey'));
+  const origin = process.env.ATOMIC_ORIGIN || `http://localhost:${process.env.PORT || 3040}`;
+  console.log(`base "${name}" provisioned`);
+  console.log(`  tenant:    atom://${tenant.id}`);
+  console.log(`  share URL: ${origin}/auth/open?token=${token.id}`);
+  process.exit(0);
+}
+// `node atomic.mjs --export-base <tenant> > base.ndjson` — a portable base is one
+// file: the tenant atom plus every atom in its shard, one JSON object per line.
+const _eb = process.argv.indexOf('--export-base');
+if (_eb !== -1) {
+  const t = process.argv[_eb + 1];
+  if (!t || !store.has(t)) { console.error(`usage: --export-base <tenant-id>  (no atom "${t}")`); process.exit(2); }
+  let n = 0; const seen = new Set();
+  for (const a of [store.get(t), ...store.query({ shards: [t] })]) {
+    if (!a || seen.has(a.id)) continue; seen.add(a.id);
+    process.stdout.write(JSON.stringify(a) + '\n'); n++;
+  }
+  console.error(`exported ${n} atoms of base ${t}`);
+  process.exit(0);
+}
 
 const PORT = process.env.PORT || 3040; // matches the seeds' default base and the documented live port
 server.listen(PORT, () => {

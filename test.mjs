@@ -410,6 +410,31 @@ await J('tk-all', 'POST', '/widget', { id: 'wpar', attr: { name: 'WPar' } });
 await J('tk-all', 'POST', '/widget', { id: 'wkid', attr: { name: 'WKid', parentw: 'atom://wpar' } });
 ok(await code('tk-all', 'DELETE', '/wpar') === 409, 'onDelete defaults to restrict (a referenced atom cannot be deleted)');
 
+// --- one-click base provisioning (#6) -------------------------------------------
+// POST /base spins up a tenant + an open-login token and returns a share URL.
+const prov = await (await J('joey', 'POST', '/base', { name: 'Acme Inc' })).json();
+ok(prov.url && prov.url.includes('/auth/open?token='), 'base: provisioning returns a one-click share URL');
+ok(prov.tenant && prov.token, 'base: a tenant + an open-login token are created');
+// the share URL one-clicks into the base as a scoped session
+const baseTok = prov.token.replace('atom://', '');
+const baseOpen = await fetch(base + '/auth/open?token=' + baseTok, { redirect: 'manual' });
+const baseCookie = (baseOpen.headers.get('set-cookie') || '').split(';')[0];
+ok(baseCookie.startsWith('atomic_session='), 'base: the share URL issues a base session');
+// inside the base the session can read+write, fully self-service within its own tenant
+ok((await fetch(base + '/model', { headers: { cookie: baseCookie } })).status === 200, 'base: the shared session can read the base');
+ok((await fetch(base + '/config', { method: 'POST', headers: { cookie: baseCookie, 'content-type': 'application/json' }, body: JSON.stringify({ id: 'base-cfg', attr: { key: 'hello', value: 1 } }) })).status === 201, 'base: the shared session can create within the base (full self-service)');
+// only a superuser may provision a base — a tenant user cannot create siblings
+ok(await code('tk-all', 'POST', '/base', { name: 'Nope' }) === 403, 'base: only a superuser may provision a base');
+// the CLI provisions a base too (one command to spin up), printing the share URL
+rmSync('/tmp/atomic-cli-base', { recursive: true, force: true });
+const cliOut = await new Promise((res) => {
+  let o = ''; const p = spawn('node', ['atomic.mjs', '--new-base', 'CLI Base'],
+    { env: { ...process.env, ATOMIC_STORE: '/tmp/atomic-cli-base', SENDGRID_API_KEY: '', ATOMIC_ORIGIN: 'http://example.test' } });
+  p.stdout.on('data', (d) => { o += d; }); p.on('exit', () => res(o));
+});
+ok(cliOut.includes('http://example.test/auth/open?token='), 'base: --new-base CLI prints a share URL');
+rmSync('/tmp/atomic-cli-base', { recursive: true, force: true });
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();

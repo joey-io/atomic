@@ -5,7 +5,7 @@
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
-![tests](https://img.shields.io/badge/tests-141%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-148%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Atomic is a dependency-free, single-file kernel for graph-relational data. Every record — a row of data, a type definition, a permission grant, a saved query, an audit-log entry, even a test — is one shape:
@@ -36,6 +36,7 @@ The whole kernel is `atomic.mjs` (~2,400 lines, no dependencies). Persistence is
 - **Index-backed reads.** Declare a field `filterable`/`sortable` and the kernel maintains a generic secondary index over it (plus built-in `createdAt`/`updatedAt`); filtering, range, sort, and pagination are then pushed entirely into SQL — a read never materializes the model's full set, so a filtered/sorted page over a 100M-row model stays milliseconds, scoped per tenant. (Above the store port: the index holds opaque `(model, field, value, id)` rows; the store never learns the schema. Under `ATOMIC_KEY`, values are blind-hashed — equality only, no range/sort.)
 - **Transactions.** `POST /tx` applies a batch of writes all-or-nothing; any failure rolls the whole batch back.
 - **Referential integrity.** A `ref` field carries an `onDelete` policy — `restrict` (the default: refuse to delete a still-referenced atom), `cascade` (delete the referrers too), or `null` (clear the referring cells). Enforced at delete time, inside the transaction, so a base can never end up pointing at a ghost — and a half-applied cascade can't corrupt it. (Honored on declared `inverse` edges, so the append-only ledger's own refs aren't treated as edges.)
+- **One-click bases.** `POST /base { name }` (or `node atomic.mjs --new-base "<name>"`) provisions a tenant + an open-login token in one transaction and returns a **share URL** — open it and you're one-clicked into that base as a full, tenant-confined session. A base is also one file: `node atomic.mjs --export-base <tenant> > base.ndjson`.
 - **Hooks.** Capability atoms that run a vetted server script on create/update/delete under their *own* grants.
 - **Lazy lifecycle.** Non-destructive expiration (retention policies) and forward-only schema migration, both applied on read.
 - **CSV import/export**, generated from the model, with an optional atomic (transactional) import.
@@ -58,7 +59,7 @@ npm start
 ATOMIC_STORE=./data npm start
 
 # run the test suite, the self-tests, and the governance audit
-npm test         # 141 assertions over HTTP
+npm test         # 148 assertions over HTTP
 npm run check    # the kernel's own test atoms
 npm run audit    # structural invariants (exits non-zero on any finding)
 
@@ -154,6 +155,7 @@ The surface is generated from the atoms. HTTP method maps to an operation, gated
 | `PUT /<id>` | replace | replace `attr` wholesale |
 | `DELETE /<id>` | retire | soft-delete (sets `status: retired`) |
 | `POST /tx` | transaction | a JSON array of ops, applied all-or-nothing |
+| `POST /base` | provision | superuser-only; `{ name }` → a new tenant + open-login token + share URL |
 
 ```bash
 # $SECRET is a token's API secret (shown once at creation), or ATOMIC_ADMIN_SECRET.
@@ -247,9 +249,11 @@ Read from the environment, with `./.env` as a fallback (gitignored).
 | Command | What it does |
 |---------|--------------|
 | `npm start` | Run the kernel (`node atomic.mjs`). |
-| `npm test` | Full HTTP smoke test — 141 assertions, boots a temp instance, restarts to prove durability. |
+| `npm test` | Full HTTP smoke test — 148 assertions, boots a temp instance, restarts to prove durability. |
 | `npm run check` | Run the substrate's own `test` atoms (`node atomic.mjs --check`). |
 | `npm run audit` | Structural governance check (`node atomic.mjs --audit`); exits non-zero on any finding. |
+| `node atomic.mjs --new-base "<name>"` | Provision a base from the CLI and print its share URL (`ATOMIC_ORIGIN` sets the host). |
+| `node atomic.mjs --export-base <tenant>` | Dump a base (tenant + its shard) as NDJSON on stdout — a base is one file. |
 | `npm run seed` | Load four demo tenants over the API. |
 
 ---
@@ -258,7 +262,7 @@ Read from the environment, with `./.env` as a fallback (gitignored).
 
 Verification lives at two levels:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (141 assertions): validation, grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability across restart, and security regressions.
+- **`test.mjs`** — an independent, black-box HTTP suite (148 assertions): validation, grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability across restart, and security regressions.
 - **`--check`** — the substrate's own acceptance suite, **as data**: a `test` atom is `{ as, method, path, body, expect }`, run over the live surface as its `as` token, asserting status plus `condition` atoms against the response. Baked-in core self-tests run on any store; a tenant can add `test` atoms for its own models. `test.mjs`'s final assertion is that `--check` itself exits green.
 - **`--audit`** — a structural fsck: every atom resolves to a model, every reference resolves, every atom conforms to its schema, every grant/ledger entry/parent is well-formed.
 
@@ -280,13 +284,9 @@ package.json      scripts; no dependencies
 
 ## Status
 
-A runnable kernel, exercised by 141 test assertions and a structural audit. Pre-launch and experimental.
+A runnable kernel, exercised by 148 test assertions and a structural audit. Pre-launch and experimental.
 
-**Built:** atoms · models & validation · `embed://` reusable shapes · refs + inverse edges · paths · grants/roles · structural tenancy · transactions (`/tx`) · **referential integrity (`onDelete`)** · hooks · lazy expiration · lazy schema migration · CSV import/export · editable grid · secondary `attr`-field index · tests-as-atoms (`--check`) · governance audit (`--audit`) · durable/encrypted SQLite · hardened HTTP surface.
-
-**Not yet built:**
-
-- **One-click tenant packaging.** The parts exist (structural tenancy, open-login tokens, file-driven seeds); a "one base = one tenant, one URL" wrapper does not.
+**Built:** atoms · models & validation · `embed://` reusable shapes · refs + inverse edges · paths · grants/roles · structural tenancy · transactions (`/tx`) · referential integrity (`onDelete`) · hooks · lazy expiration · lazy schema migration · CSV import/export · editable grid · secondary `attr`-field index · **one-click base provisioning** · tests-as-atoms (`--check`) · governance audit (`--audit`) · durable/encrypted SQLite · hardened HTTP surface.
 
 ---
 
