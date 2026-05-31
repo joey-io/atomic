@@ -13,5 +13,9 @@
   "engines": {
     "node": ">=22.5"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "comment": "Zero required dependencies. `pg` is OPTIONAL — loaded (dynamic import) only when ATOMIC_DB is set to use the Postgres driver; the in-memory and SQLite (node:sqlite) paths need nothing.",
+  "optionalDependencies": {
+    "pg": "^8.21.0"
+  }
 }

@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID, randomBytes, scryptSync, createCipheriv, createDecipheriv, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite'; // embedded SQLite — part of the Node runtime, not a dependency
+import { AsyncLocalStorage } from 'node:async_hooks'; // scopes a transaction's connection (Postgres driver)
 
 // load ./.env (KEY=VALUE lines) into process.env as a fallback — no dependency,
 // explicit env still wins. This is where ATOMIC_STORE / SENDGRID_API_KEY live.
@@ -841,6 +842,7 @@ async function getStore(actor) {
 // file); unset ATOMIC_STORE keeps the kernel purely in-memory (the default).
 // ---------------------------------------------------------------------------
 const ROOT = process.env.ATOMIC_STORE || null;
+const ATOMIC_DB = process.env.ATOMIC_DB || null; // a postgres:// URL → the Postgres driver
 const shardOf = async (atom) => await tenantOf(atom) || '_global';
 
 // Encryption at rest (opt-in). Set ATOMIC_KEY to a 64-char hex key or any
@@ -879,7 +881,6 @@ function parseLine(line) {
 // write-back used by in-place mutators (bump/migrate) and is just store.set.
 function memStore() {                                   // in-memory (no ATOMIC_STORE): the default
   const m = new Map();
-  let snapshot = null;            // deep pre-transaction copy; non-null only inside a tx
   // Every method is async — it resolves immediately over the in-RAM Map, but the
   // interface is the contract: the kernel awaits the store everywhere, so a later
   // phase can drop in an async Postgres driver without touching the kernel.
@@ -896,14 +897,15 @@ function memStore() {                                   // in-memory (no ATOMIC_
       }
       return out;
     },
-    // Transactions. This driver hands out live atom references that the kernel
-    // mutates in place (bump), so a shallow copy would alias those mutations —
-    // begin() takes a deep snapshot and rollback() restores it wholesale. That is
-    // O(store) per transaction, but this is the in-RAM default; the durable path
-    // below uses SQLite's native BEGIN/COMMIT, which is O(changes).
-    async begin()    { snapshot = new Map(); for (const [k, v] of m) snapshot.set(k, structuredClone(v)); },
-    async commit()   { snapshot = null; },
-    async rollback() { if (snapshot) { m.clear(); for (const [k, v] of snapshot) m.set(k, v); snapshot = null; } },
+    // Transactions. This driver hands out live atom references the kernel mutates in
+    // place (bump), so a shallow copy would alias those mutations — transact() takes a
+    // deep snapshot up front and restores it on failure. O(store) per tx, but this is
+    // the in-RAM dev default; the durable drivers below use the engine's own BEGIN/COMMIT.
+    async transact(fn) {
+      const snap = new Map(); for (const [k, v] of m) snap.set(k, structuredClone(v));
+      try { return await fn(); }
+      catch (e) { m.clear(); for (const [k, v] of snap) m.set(k, v); throw e; }
+    },
     async close() {},
   };
 }
@@ -991,17 +993,88 @@ function sqliteStore() {
       const sql = 'SELECT body FROM atom' + (where.length ? ' WHERE ' + where.join(' AND ') : '');
       return prep(sql).all(...params).map((r) => parseLine(r.body));
     },
-    // Transactions: SQLite's own, on the single writer connection. Reads inside the
-    // transaction (same connection) see its uncommitted writes, so a batch's ops
-    // observe each other; ROLLBACK reverts every change as one unit. Durable on
-    // COMMIT (WAL + synchronous=NORMAL fsyncs at the checkpoint).
-    async begin()      { db.exec('BEGIN'); },
-    async commit()     { db.exec('COMMIT'); },
-    async rollback()   { db.exec('ROLLBACK'); },
+    // Transactions: SQLite's own, on the single writer connection. ROLLBACK reverts
+    // every change as one unit; durable on COMMIT (WAL + synchronous=NORMAL fsyncs at
+    // the checkpoint). (node:sqlite is synchronous, so a tx does not truly overlap I/O.)
+    async transact(fn) {
+      db.exec('BEGIN');
+      try { const r = await fn(); db.exec('COMMIT'); return r; }
+      catch (e) { db.exec('ROLLBACK'); throw e; }
+    },
     async close()      { db.close(); },
   };
 }
-store = ROOT ? sqliteStore() : memStore();
+
+// Postgres (ATOMIC_DB set): the scale-out durable store. Same shape as the SQLite
+// driver — atom(id, shard, model, body) + a generic idx — but with real concurrency
+// (MVCC, many writers), connection pooling, and managed backups/replication/HA. The
+// body is TEXT, so ATOMIC_KEY sealing works unchanged; the idx `value` is JSONB, which
+// orders numbers numerically and strings lexically within a field — exactly like
+// SQLite's no-affinity column — so equality, range, and sort stay index-backed.
+// A transaction pins one pooled connection and routes its OWN operations to it via
+// AsyncLocalStorage: a concurrent request that interleaves while the tx awaits sees an
+// empty ALS, uses the pool (MVCC-isolated), and can never land on the tx's connection.
+async function pgStore() {
+  const { Pool } = (await import('pg')).default;
+  const pool = new Pool({ connectionString: ATOMIC_DB, max: 12 });
+  const als = new AsyncLocalStorage();
+  const q = (sql, params) => (als.getStore() || pool).query(sql, params);
+  await q('CREATE TABLE IF NOT EXISTS atom (id text PRIMARY KEY, shard text NOT NULL, model text NOT NULL, body text NOT NULL)');
+  await q('CREATE INDEX IF NOT EXISTS atom_by_shard ON atom(shard)');
+  await q('CREATE INDEX IF NOT EXISTS atom_by_model ON atom(model)');
+  await q('CREATE TABLE IF NOT EXISTS idx (shard text, model text, field text, value jsonb, id text)');
+  await q('CREATE INDEX IF NOT EXISTS idx_lookup ON idx(model, field, value, shard, id)');
+  await q('CREATE INDEX IF NOT EXISTS idx_by_id ON idx(id)');
+  return {
+    async get(id)    { const r = await q('SELECT body FROM atom WHERE id = $1', [id]); return r.rows[0] ? parseLine(r.rows[0].body) : undefined; },
+    async has(id)    { const r = await q('SELECT 1 FROM atom WHERE id = $1', [id]); return r.rowCount > 0; },
+    async set(id, a) { await q('INSERT INTO atom(id, shard, model, body) VALUES($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET shard = EXCLUDED.shard, model = EXCLUDED.model, body = EXCLUDED.body', [id, await shardOf(a), a.model, serializeLine(a)]); },
+    async delete(id) { await q('DELETE FROM atom WHERE id = $1', [id]); await q('DELETE FROM idx WHERE id = $1', [id]); },
+    async values()   { const r = await q('SELECT body FROM atom'); return r.rows.map((x) => parseLine(x.body)); },
+    async count()    { const r = await q('SELECT count(*)::int AS c FROM atom'); return r.rows[0].c; },
+    async setIndex(id, shard, model, rows) {
+      await q('DELETE FROM idx WHERE id = $1', [id]);
+      for (const r of rows) await q('INSERT INTO idx(shard, model, field, value, id) VALUES($1, $2, $3, $4::jsonb, $5)', [shard, model, r.field, JSON.stringify(r.value), id]);
+    },
+    async indexCount() { const r = await q('SELECT count(*)::int AS c FROM idx'); return r.rows[0].c; },
+    async page({ shards, model, anchorField, anchorDesc, filters, cursor, limit }) {
+      const p = []; const ph = (v) => { p.push(v); return '$' + p.length; };
+      const w = [`x.model = ${ph(model)}`, `x.field = ${ph(anchorField)}`];
+      if (shards) w.push(`x.shard = ANY(${ph(shards)})`);
+      for (const f of filters) {
+        const sub = [`model = ${ph(model)}`, `field = ${ph(f.field)}`];
+        if (shards) sub.push(`shard = ANY(${ph(shards)})`);
+        if (f.op === '=' && Array.isArray(f.val)) sub.push(`value IN (${f.val.map((v) => ph(JSON.stringify(v)) + '::jsonb').join(', ')})`);
+        else sub.push(`value ${f.op} ${ph(JSON.stringify(f.val))}::jsonb`);
+        w.push(`x.id IN (SELECT id FROM idx WHERE ${sub.join(' AND ')})`);
+      }
+      if (cursor != null) w.push(`x.value ${anchorDesc ? '<' : '>'} ${ph(JSON.stringify(cursor))}::jsonb`);
+      const dir = anchorDesc ? 'DESC' : 'ASC';
+      const r = await q(`SELECT a.body AS body, x.value AS av FROM idx x JOIN atom a ON a.id = x.id WHERE ${w.join(' AND ')} ORDER BY x.value ${dir}, x.id ${dir} LIMIT ${ph(limit)}`, p);
+      return r.rows.map((row) => ({ body: parseLine(row.body), cursor: row.av }));
+    },
+    async query({ shards = null, model = null } = {}) {
+      const p = []; const ph = (v) => { p.push(v); return '$' + p.length; };
+      const w = [];
+      if (shards) w.push(`shard = ANY(${ph(shards)})`);
+      if (model)  w.push(`model = ${ph(model)}`);
+      const r = await q('SELECT body FROM atom' + (w.length ? ' WHERE ' + w.join(' AND ') : ''), p);
+      return r.rows.map((x) => parseLine(x.body));
+    },
+    async transact(fn) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const r = await als.run(client, fn);             // tx ops route to this client; others use the pool
+        await client.query('COMMIT');
+        return r;
+      } catch (e) { try { await client.query('ROLLBACK'); } catch { /* connection already gone */ } throw e; }
+      finally { client.release(); }
+    },
+    async close() { await pool.end(); },
+  };
+}
+store = ATOMIC_DB ? await pgStore() : ROOT ? sqliteStore() : memStore();
 // secondary-index projection for one atom: built-in createdAt/updatedAt plus every
 // attr field the model declares `filterable`/`sortable`. Scalars only; a retired
 // atom projects nothing (so it leaves the index). Under ATOMIC_KEY a value is stored
@@ -1024,33 +1097,30 @@ async function indexRows(atom) {
 // durable write-back; also refreshes the atom's secondary-index rows. Bumps the gen.
 async function persist(atom) { await store.set(atom.id, atom); if (store.setIndex) await store.setIndex(atom.id, await shardOf(atom), atom.model, await indexRows(atom)); storeGen++; }
 
-// --- Transactions. A batch of mutations that commits all-or-nothing. The store
-// driver supplies begin/commit/rollback (SQLite's native transaction; a deep
-// snapshot for the in-RAM driver). tx(fn) runs fn inside one transaction: on any
-// throw the whole batch rolls back and storeGen is bumped so every gen-keyed read
-// memo rebuilds against the reverted state. Nested tx() calls join the enclosing
-// one, so a mutator that is itself transactional (e.g. a cascading delete) composes
-// without opening a second transaction. fn is synchronous — the kernel's mutators
-// (create/update/retire) are; their async tails (hooks, migration sweeps) run after
-// commit, because a hook's external side-effect cannot be rolled back.
+// --- Transactions. A batch of mutations that commits all-or-nothing. Each store
+// driver implements transact(fn): runs fn inside one transaction (SQLite/Postgres
+// BEGIN..COMMIT; a deep snapshot for the in-RAM driver), rolling back on any throw.
+// On rollback storeGen is bumped so every gen-keyed read memo rebuilds against the
+// reverted state. Nested tx() calls join the enclosing one (a cascading delete
+// composes without opening a second transaction). Top-level transactions are
+// serialized by an async lock so _txDepth and the gen counter stay coherent across
+// the event loop; the Postgres driver additionally routes each tx's own reads/writes
+// to its pinned connection (AsyncLocalStorage), so a concurrent request that
+// interleaves while a tx awaits is isolated on a separate pooled connection.
 let _txDepth = 0;
+let _txLock = Promise.resolve();
 async function tx(fn) {
   if (_txDepth > 0) return fn();                 // already inside a transaction — join it
+  const prev = _txLock; let release;             // serialize top-level transactions
+  _txLock = new Promise((r) => { release = r; });
+  await prev;
   _txDepth++;
   try {
-    await store.begin();
-    try {
-      const result = await fn();
-      await store.commit();
-      return result;
-    } catch (e) {
-      await store.rollback();
-      storeGen++;                                // reverted state invalidates the read memos
-      throw e;
-    }
-  } finally {
-    _txDepth--;
-  }
+    return await store.transact(async () => {
+      try { return await fn(); }
+      catch (e) { storeGen++; throw e; }         // reverted state invalidates the read memos
+    });
+  } finally { _txDepth--; release(); }
 }
 
 // One-time migration: fold any legacy per-tenant NDJSON shards (the previous
@@ -2747,9 +2817,9 @@ if (process.env.ATOMIC_ADMIN_SECRET) {
 // bootstrap already indexed as it seeded, so this is a one-time upgrade step). If
 // the index is empty but atoms exist, project every atom once, in one transaction.
 if (store.indexCount && await store.count() > 0 && await store.indexCount() === 0) {
-  await store.begin?.();
-  try { for (const a of await store.values()) await store.setIndex(a.id, await shardOf(a), a.model, await indexRows(a)); await store.commit?.(); }
-  catch (e) { await store.rollback?.(); throw e; }
+  await store.transact(async () => {
+    for (const a of await store.values()) await store.setIndex(a.id, await shardOf(a), a.model, await indexRows(a));
+  });
   console.error(`indexed ${await store.count()} atoms into the secondary index`);
 }
 
@@ -2780,6 +2850,33 @@ if (_eb !== -1) {
     process.stdout.write(JSON.stringify(a) + '\n'); n++;
   }
   console.error(`exported ${n} atoms of base ${t}`);
+  process.exit(0);
+}
+// `--export-all > all.ndjson` then `ATOMIC_DB=… --import-all all.ndjson` migrates a
+// whole store between drivers (e.g. SQLite → Postgres). Export dumps every atom;
+// import writes each verbatim (preserving id + lifecycle) and rebuilds the index, in
+// one transaction. Idempotent: re-importing overwrites by id.
+if (process.argv.includes('--export-all')) {
+  let n = 0;
+  for (const a of await store.values()) { process.stdout.write(JSON.stringify(a) + '\n'); n++; }
+  console.error(`exported ${n} atoms`);
+  process.exit(0);
+}
+const _ia = process.argv.indexOf('--import-all');
+if (_ia !== -1) {
+  const file = process.argv[_ia + 1];
+  if (!file || !fs.existsSync(file)) { console.error(`usage: --import-all <file.ndjson>  (no file "${file}")`); process.exit(2); }
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  let n = 0;
+  await store.transact(async () => {
+    for (const line of lines) {
+      const a = parseLine(line);
+      await store.set(a.id, a);
+      if (store.setIndex) await store.setIndex(a.id, await shardOf(a), a.model, await indexRows(a));
+      n++;
+    }
+  });
+  console.error(`imported ${n} atoms into ${ATOMIC_DB ? 'postgres' : ROOT ? 'sqlite' : 'memory'}`);
   process.exit(0);
 }
 

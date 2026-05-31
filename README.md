@@ -16,7 +16,7 @@ Atomic is a dependency-free, single-file kernel for graph-relational data. Every
 
 One kernel validates, stores, queries, permissions, and renders all of them. There is no separate ORM, API layer, query builder, or UI framework, and no generated code to keep in sync. The HTTP API and the web UI are both generated from the same atoms.
 
-The whole kernel is `atomic.mjs` (~2,400 lines, no dependencies). Persistence is embedded SQLite via Node's built-in `node:sqlite` — still a single file, still no `node_modules`.
+The whole kernel is `atomic.mjs` (~2,800 lines, zero required dependencies). Persistence is embedded SQLite via Node's built-in `node:sqlite` — a single file, no `node_modules` — or, for scale-out, Postgres (the one optional dependency, loaded only when `ATOMIC_DB` is set).
 
 ---
 
@@ -222,10 +222,11 @@ Browsing any atom with `Accept: text/html` renders a generated interface from th
 ## Persistence
 
 - **In-memory** by default (nothing persists).
-- **Durable** when `ATOMIC_STORE=<dir>` is set: state lives in `<dir>/atoms.db` (WAL-mode SQLite, one `atom` table indexed on `shard` and `model`). State is authoritative in the table — there is no boot-time log replay, and reads are scoped to a tenant + type in SQL, so a read never materializes another tenant's atoms.
-- **Encrypted at rest** when `ATOMIC_KEY` is set (64-hex or a passphrase stretched with scrypt): each atom's `body` is sealed with AES-256-GCM (confidential and tamper-evident); the structural columns `id`/`shard`/`model` stay plaintext for routing and indexing.
+- **Durable (SQLite)** when `ATOMIC_STORE=<dir>` is set: state lives in `<dir>/atoms.db` (WAL-mode SQLite via Node's built-in `node:sqlite`, one `atom` table indexed on `shard` and `model`, plus the secondary `idx`). State is authoritative in the table — no boot-time replay — and reads are scoped to a tenant + type in SQL, so a read never materializes another tenant's atoms. Single-node, single-writer.
+- **Postgres (scale-out)** when `ATOMIC_DB=<postgres-url>` is set: the same two tables (`atom`, `idx`) on Postgres — MVCC concurrency (many writers), connection pooling, and managed backups/replication/HA. The `idx.value` is `jsonb` (numbers order numerically, strings lexically — equality, range, and sort stay index-backed, exactly as on SQLite). Transactions pin a pooled connection and route their own operations to it via `AsyncLocalStorage`, so a concurrent request can never land on a transaction's connection. The whole kernel is async behind the store port, so this is a driver swap — **zero user-facing or model changes**. (Requires the optional `pg` dependency, loaded only when `ATOMIC_DB` is set; the SQLite/in-memory paths stay dependency-free.) Migrate between drivers with `--export-all` / `--import-all`.
+- **Encrypted at rest** when `ATOMIC_KEY` is set (64-hex or a passphrase stretched with scrypt): each atom's `body` is sealed with AES-256-GCM (confidential and tamper-evident); the structural columns `id`/`shard`/`model` stay plaintext for routing and indexing. Under a key, indexed `value`s are blind-hashed — equality only, no range/sort.
 
-SQLite is the storage port, not the model — no SQL, ORM, or query builder reaches the user-facing surface.
+The store (SQLite or Postgres) is the storage *port*, not the model — no SQL, ORM, or query builder reaches the user-facing surface; swapping the driver swaps the substrate and nothing else moves.
 
 ---
 
@@ -237,6 +238,7 @@ Read from the environment, with `./.env` as a fallback (gitignored).
 |----------|---------|---------|
 | `PORT` | HTTP port | `3040` |
 | `ATOMIC_STORE` | Directory for the durable SQLite store | unset → in-memory |
+| `ATOMIC_DB` | Postgres connection URL → the scale-out Postgres driver (needs optional `pg`) | unset → SQLite/in-memory |
 | `ATOMIC_KEY` | Encryption key (64-hex or passphrase) for AES-256-GCM at rest | unset → plaintext |
 | `ATOMIC_ADMIN_SECRET` | A fixed API secret for the admin token (`Bearer <it>`), for CI / seeds | unset → admin is magic-link only |
 | `SENDGRID_API_KEY` | Sends magic-link sign-in email | unset → dev fallback (link surfaced locally) |

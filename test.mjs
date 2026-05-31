@@ -23,7 +23,11 @@ async function mkToken(body) {
   if (j.id && j.secret) SECRETS[j.id] = j.secret;
   return j;
 }
-const start = () => spawn('node', ['atomic.mjs'], { env: { ...process.env, PORT, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'ignore' });
+// ATOMIC_TEST_DB (a postgres:// URL) runs the WHOLE suite against the Postgres
+// driver; otherwise SQLite at STORE. The pg tables are truncated once before the run
+// (externally), never on the mid-suite restart, so the durability check is real.
+const storeEnv = process.env.ATOMIC_TEST_DB ? { ATOMIC_DB: process.env.ATOMIC_TEST_DB } : { ATOMIC_STORE: STORE };
+const start = () => spawn('node', ['atomic.mjs'], { env: { ...process.env, PORT, ...storeEnv, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'ignore' });
 async function wait() { for (let i = 0; i < 50; i++) { try { await fetch(base + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); }
 
 rmSync(STORE, { recursive: true, force: true });
@@ -457,7 +461,7 @@ await J('joey', 'POST', '/test', { id: 't-enum-400', attr: { label: 'bad enum is
 await J('joey', 'POST', '/test', { id: 't-read-403', attr: { label: 'read token cannot write', as: 'atom://tk-read', method: 'POST', path: '/widget', body: { attr: { name: 'z' } }, expect: { status: 403 } } });
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 const checkCode = await new Promise((res) => spawn('node', ['atomic.mjs', '--check'],
-  { env: { ...process.env, ATOMIC_STORE: STORE, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'inherit' }).on('exit', (c) => res(c)));
+  { env: { ...process.env, ...storeEnv, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'inherit' }).on('exit', (c) => res(c)));
 ok(checkCode === 0, 'kernel --check runs the substrate’s own test atoms green (core + seeded)');
 
 console.log(`\n${pass} passed, ${fail} failed`);
