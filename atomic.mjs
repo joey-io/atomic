@@ -461,9 +461,13 @@ async function readField(node, seg, actor) {
   if (isAtomObj(node)) {
     if (node.attr && seg in node.attr) {
       if (seg === 'secret') throw new Err(404, `no field .${seg} on ${node.id}`); // never traversable (see redact)
-      // per-attribute read grant — the same redaction the whole-atom view applies,
-      // so a path can't reach an attribute the actor couldn't see directly.
-      if (actor && !await canRead(actor, `${refId(node.model)}.${seg}`)) throw new Err(404, `no field .${seg} on ${node.id}`);
+      // per-attribute reveal gate — the same redaction the whole-atom view applies,
+      // so a dotted path can't reach a field (or a restricted field) the actor could
+      // not see directly. Restricted + wildcard-only in locked mode → 404, like redact.
+      if (actor && !await canReveal(actor, refId(node.model), seg)) throw new Err(404, `no field .${seg} on ${node.id}`);
+      // Phase 4 — a dotted read that discloses a restricted field is evidence too.
+      if (actor && sensOf((await getCached(refId(node.model)))?.attr?.fields?.[seg]) === 'restricted')
+        noteReveal(actor, refId(node.model), node.id, [seg]);
       return node.attr[seg];
     }
     if (node.lifecycle && typeof node.lifecycle === 'object' && seg in node.lifecycle)
@@ -521,6 +525,12 @@ async function validate(modelId, attr) {
     checkKind(key, def, val);
     out[key] = val;
   }
+  // Phase 2 — a model's field defs may carry a `sensitivity`; reject an unknown level
+  // so a typo can't silently downgrade a `restricted` field to the `internal` default.
+  if (modelId === 'model')
+    for (const [fname, fdef] of Object.entries(out.fields || {}))
+      if (fdef && fdef.sensitivity !== undefined && !SENS.includes(fdef.sensitivity))
+        throw new Err(400, `field "${fname}": sensitivity must be one of ${SENS.join(', ')}`);
   return out;
 }
 
@@ -740,6 +750,99 @@ const canRead = async (actor, target) => allows(actor, target, 'read');
 const readableAtom = async (actor, a) =>
   a.lifecycle?.status !== 'retired' && await canOp(actor, refId(a.model), 'read') && await ruleOk(actor, a, 'read');
 
+// Phase 2 — field sensitivity. Levels, least→most sensitive; an unknown/missing level
+// is `internal`. Only `restricted` changes behavior here: in locked mode a restricted
+// field is revealed ONLY by an EXACT field-path read grant — a wildcard (`*` / `**`,
+// including a superuser's `**`) does not reveal it, so it redacts out of every read,
+// list, query, traversal, and CSV by default (all of which funnel through redact() and
+// readField()). Outside locked mode sensitivity is metadata only and ordinary read
+// applies, so dev/prod disclosure is unchanged. (`confidential` gates export in Phase 5;
+// reveal under an active break-glass `**` arrives with Phase 8.)
+const SENS = ['public', 'internal', 'confidential', 'restricted'];
+const sensOf = (def) => (SENS.includes(def?.sensitivity) ? def.sensitivity : 'internal');
+// Phase 3 — a grant's optional `purpose` binds it to one or more purpose atoms. A grant
+// with no `purpose` authorizes ANY valid purpose (the request must still declare one); a
+// grant that names purposes authorizes only those. Stored as `atom://purpose-x` (or a list
+// of them); normalized to bare ids here. Returns null for "unconstrained" (no purpose key).
+const grantPurposes = (g) =>
+  g.purpose === undefined || g.purpose === null ? null
+  : (Array.isArray(g.purpose) ? g.purpose : [g.purpose]).map((p) => (isRef(p) ? refId(p) : p));
+async function canReveal(actor, modelId, field, def) {
+  const target = `${modelId}.${field}`;
+  if (!await canRead(actor, target)) return false;          // ordinary per-field read gate first
+  if (!LOCKED) return true;                                 // sensitivity is inert outside locked
+  if (def === undefined) def = (await getCached(modelId))?.attr?.fields?.[field];
+  if (sensOf(def) !== 'restricted') return true;
+  // locked + restricted (Phase 2): only EXACT field-path read grants reveal — never a wildcard.
+  const exact = (await grantsOf(actor)).filter((g) => g.path === target && permits(g.mode, 'read'));
+  if (!exact.length) return false;
+  // Phase 3: the request must ALSO carry a valid purpose — a real, active purpose atom,
+  // resolved once per request in the handler (→ actor._purposeOk) — that at least one of
+  // those exact grants authorizes. Enforcement is grant-match; the free-text reason is
+  // evidence only and is never consulted here. No purpose, or an unknown one → no reveal.
+  if (!actor?._purpose || !actor._purposeOk) return false;
+  return exact.some((g) => { const ps = grantPurposes(g); return ps === null || ps.includes(actor._purpose); });
+}
+
+// Phase 4 — accumulate which restricted fields a request actually revealed, grouped by
+// model, on the request-scoped actor copy. flushEvidence (in the projection→send seam)
+// turns each model's accumulation into ONE sensitive-read atom. Locked-mode only: a
+// restricted reveal in locked always carries a purpose, so `actor` is the per-request
+// COPY and this never mutates a shared/cached token atom. dev/prod record nothing here.
+function noteReveal(actor, modelId, atomId, fields) {
+  if (!LOCKED || !actor) return;
+  if (!actor._reveals) actor._reveals = new Map();   // modelId -> { fields:Set, atoms:Set }
+  let e = actor._reveals.get(modelId);
+  if (!e) { e = { fields: new Set(), atoms: new Set() }; actor._reveals.set(modelId, e); }
+  for (const f of fields) e.fields.add(f);
+  if (atomId) e.atoms.add(atomId);
+}
+
+// Phase 5 — export control. Reading a field and EXPORTING it are different rights: a CSV
+// export of a confidential/restricted field is a bulk-egress event the read gate doesn't
+// cover. In locked mode such a field leaves in a CSV ONLY under an explicit `export` grant
+// on its exact path (never `read`, `write`, or even `all` — those don't imply export in
+// locked). public/internal fields export freely; outside locked the gate is inert. An
+// export grant may bind a purpose, matched like a reveal grant.
+async function canExport(actor, modelId, field, def) {
+  if (!LOCKED) return true;
+  const level = sensOf(def);
+  if (level !== 'confidential' && level !== 'restricted') return true;   // only sensitive fields gated
+  const target = `${modelId}.${field}`;
+  return (await grantsOf(actor)).some((g) => g.path === target && g.mode === 'export'
+    && (() => { const ps = grantPurposes(g); return ps === null || (actor?._purposeOk && ps.includes(actor._purpose)); })());
+}
+
+// Strip from a to-be-exported atom set every confidential/restricted field the actor lacks
+// an export grant for (an empty CSV cell, never a leak), enforce the model's export posture,
+// and stash one export-job descriptor on the actor for flushEvidence to record. Single-model
+// exports enforce posture up front; a cross-model (atom://atom) export gates per field by
+// each atom's own model but cannot honor a single posture — a documented narrowing.
+async function gateExport(actor, modelId, atoms, scope, filters) {
+  if (!LOCKED) return atoms;
+  if (modelId && modelId !== 'atom') {
+    const posture = (await getCached(modelId))?.attr?.exports || 'grant';     // locked default: grant
+    if (posture === 'disabled') throw new Err(403, `locked mode: exports are disabled for ${modelId}`);
+    if (posture === 'approval') throw new Err(403, `locked mode: exporting ${modelId} needs an approved change request (Phase 8) — not yet available`);
+  }
+  const exported = new Set();                                                  // sensitive fields actually exported
+  const models = new Set();
+  const out = [];
+  for (const a of atoms) {
+    const m = modelId && modelId !== 'atom' ? modelId : refId(a.model);
+    const fields = (await getCached(m))?.attr?.fields || {};
+    let attr = a.attr, copied = false;
+    for (const [f, def] of Object.entries(fields)) {
+      if (!['confidential', 'restricted'].includes(sensOf(def)) || !a.attr || !(f in a.attr)) continue;
+      if (await canExport(actor, m, f, def)) { exported.add(f); models.add(m); }
+      else { if (!copied) { attr = { ...a.attr }; copied = true; } delete attr[f]; }
+    }
+    out.push(copied ? { ...a, attr } : a);
+  }
+  if (exported.size) actor._exportJob = { scope, model: [...models].join(','), fields: [...exported], filters, count: out.length };
+  return out;
+}
+
 // Attenuation: a token (or hook) may only be issued with grants that are a subset
 // of the issuer's own — it can never grant more than it holds. This covers BOTH
 // inline `grants` AND `roles`: a role confers its grants on every token that wears
@@ -876,6 +979,50 @@ const KEY = process.env.ATOMIC_KEY
       ? Buffer.from(process.env.ATOMIC_KEY, 'hex')
       : scryptSync(process.env.ATOMIC_KEY, 'atomic-shard-v1', 32))
   : null;
+
+// Phase 0 — runtime mode. `dev` (default) keeps friendly local behavior; `prod`
+// and `locked` are the production postures. The constants are read once here and
+// threaded into the guards below (the export gate, the dangerous-write guard, the
+// magic-link fallback). dev is the default precisely so an unset ATOMIC_MODE — the
+// live deployment today — behaves exactly as it always has.
+const MODE   = (process.env.ATOMIC_MODE || 'dev').toLowerCase();
+const LOCKED = MODE === 'locked';
+const PROD   = MODE === 'prod' || LOCKED;
+
+// Phase 6 — hook/migration allowlists. `run` is already constrained to a safe basename
+// in scripts/; in LOCKED mode it must ALSO be named here, or the kernel refuses to execute
+// it. Empty/unset → nothing allowlisted → every hook skips and every custom migration fails
+// closed (the secure default: code runs only if an operator explicitly named it). Inert
+// outside locked mode. Parsed once: comma-separated bare basenames.
+const allowList = (v) => new Set((v || '').split(',').map((s) => s.trim()).filter(Boolean));
+const HOOK_ALLOW = allowList(process.env.ATOMIC_HOOKS);
+const MIGRATION_ALLOW = allowList(process.env.ATOMIC_MIGRATIONS);
+
+// Locked boot checks. prod/locked refuse an unsafe boot configuration BEFORE the
+// server ever listens — fail closed, loudly, with the exact env var to set. dev
+// runs none of these. This is the only place the process exits on config; every
+// other guard is a per-request 403 (see guardDangerous) or a per-command refusal
+// (see the bulk-export gate). Run it as soon as the config it inspects is known.
+function assertBootMode() {
+  if (!['dev', 'prod', 'locked'].includes(MODE)) {
+    console.error(`fatal: ATOMIC_MODE="${MODE}" is not one of dev | prod | locked`);
+    process.exit(1);
+  }
+  const fail = (m) => { console.error(`fatal: ATOMIC_MODE=${MODE} — ${m}`); process.exit(1); };
+  if (PROD) {
+    // no in-memory store: production data must be durable (SQLite or Postgres).
+    if (!ROOT && !ATOMIC_DB) fail('a durable store is required — set ATOMIC_STORE (SQLite) or ATOMIC_DB (Postgres)');
+    // a real authentication path must exist — the admin secret or a configured mailer.
+    // Without either, prod would have no way to sign in but the dev magic-link leak.
+    if (!process.env.ATOMIC_ADMIN_SECRET && !SENDGRID) fail('set ATOMIC_ADMIN_SECRET or configure mail (SENDGRID_API_KEY) — no dev magic-link fallback in prod');
+  }
+  if (LOCKED) {
+    // encryption at rest is mandatory in locked mode: a sealed bulk export (below)
+    // and the at-rest guarantee both depend on a key being present.
+    if (!KEY) fail('encryption at rest is required — set ATOMIC_KEY');
+  }
+}
+assertBootMode();
 function serializeLine(atom) {
   if (!KEY) return JSON.stringify(atom);
   const iv = randomBytes(12);
@@ -1166,11 +1313,14 @@ async function loadAll() {
 async function redact(actor, atom) {
   if (atom.id === '0') return atom; // the public root atom — the address everyone sees
   const modelId = refId(atom.model);
+  const fields = (await getCached(modelId))?.attr?.fields || {};  // field defs carry sensitivity
   const attr = {};
+  const revealed = [];                             // restricted fields actually disclosed (Phase 4 evidence)
   for (const [k, v] of Object.entries(atom.attr || {})) {
     if (k === 'secret') continue;                  // a token's API secret hash is never served, to anyone
-    if (await canRead(actor, `${modelId}.${k}`)) attr[k] = v;
+    if (await canReveal(actor, modelId, k, fields[k])) { attr[k] = v; if (sensOf(fields[k]) === 'restricted') revealed.push(k); }
   }
+  if (revealed.length) noteReveal(actor, modelId, atom.id, revealed);
   return { ...atom, attr };
 }
 
@@ -1188,6 +1338,57 @@ async function logIt(atomId, op, actorId, changes, sessionId) {
     lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(),
       createdBy: ref(actorId), parent: ref(subj ? (await tenantOf(subj) || '0') : '0') },
   });
+}
+
+// Phase 4 — turn a request's accumulated restricted-field reveals into evidence: ONE
+// sensitive-read atom per model touched, recording the revealed fields, the matched atom
+// ids, and a count. Written by the kernel (via seed, bypassing the dangerous-write guard,
+// like logIt) into the data's tenant shard. Called in the projection→send seam AFTER the
+// body is projected but BEFORE it is flushed to the socket. Locked mode is fail-closed: a
+// failed evidence write throws 503 and the projected (restricted) body is never sent —
+// recording is the price of disclosure. Idempotent: clears the accumulator after a flush.
+async function writeSensitiveRead(actor, modelId, e) {
+  const atoms = [...e.atoms];
+  await seed({
+    id: `sread-${randomUUID()}`, model: 'atom://sensitive-read',
+    manifest: `read ${[...e.fields].join(', ')} on ${modelId} (${atoms.length})`,
+    attr: {
+      actor: ref(actor.id), ...(actor._session ? { session: ref(actor._session) } : {}),
+      purpose: ref(actor._purpose), ...(actor._reason ? { reason: actor._reason } : {}),
+      model: modelId, fields: [...e.fields], atoms, count: atoms.length, at: now(),
+    },
+    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(),
+      createdBy: ref(actor.id), parent: ref(await tenantOf(actor) || '0'), expiration: 'atom://policy-never' },
+  });
+}
+// Phase 5 — evidence that an HTTP CSV export carried confidential/restricted fields. One
+// per export request, written before the CSV bytes are flushed (same fail-closed seam as
+// sensitive-read). `sealed:false` — unlike the CLI bulk dump, this is a deliberate,
+// grant-authorized plaintext export to the client.
+async function writeExportJob(actor, j) {
+  await seed({
+    id: `export-${randomUUID().slice(0, 12)}`, model: 'atom://export-job',
+    manifest: `export ${j.fields.join(', ')} on ${j.model} (${j.count})`,
+    attr: {
+      actor: ref(actor.id), scope: j.scope, model: j.model, fields: j.fields,
+      ...(j.filters ? { filters: j.filters } : {}), count: j.count, sealed: false,
+      ...(actor._purpose ? { purpose: actor._purpose } : {}), ...(actor._reason ? { reason: actor._reason } : {}),
+      at: now(),
+    },
+    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(),
+      createdBy: ref(actor.id), parent: ref(await tenantOf(actor) || '0'), expiration: 'atom://policy-never' },
+  });
+}
+async function flushEvidence(actor) {
+  const reveals = actor?._reveals, exportJob = actor?._exportJob;
+  if ((!reveals || reveals.size === 0) && !exportJob) return;
+  actor._reveals = null; actor._exportJob = null;   // idempotent — a request's evidence flushes once
+  try {
+    if (reveals) for (const [modelId, e] of reveals) await writeSensitiveRead(actor, modelId, e);
+    if (exportJob) await writeExportJob(actor, exportJob);
+  } catch {
+    throw new Err(503, 'export/read evidence could not be recorded — disclosure withheld');
+  }
 }
 
 function changeset(before, after) {
@@ -1220,7 +1421,37 @@ async function resolveExpiration(body, actor, fallback) {
   return body.expiration;
 }
 
+// Phase 1 — the governance atoms whose contents define who-can-do-what and what is
+// retained. In locked mode these change only through an approved change request
+// (Phase 7) or active break-glass (Phase 8) — never a direct POST/PATCH/PUT/DELETE
+// (REST or /tx). The guard ships now; deny first, build the maker-checker path after.
+// `grant` is omitted because it is embedded inside token/role (which ARE guarded), not
+// a top-level model you can address. change-request/approval are deliberately NOT here
+// — locked mode must be able to FILE the changes that edit everything else. The
+// not-yet-built models (purpose, break-glass, …) are listed so guarding them needs no
+// later edit; guarding a model with no instances is a harmless no-op.
+const DANGEROUS_MODELS = new Set([
+  'atom://model', 'atom://token', 'atom://role', 'atom://hook', 'atom://migration',
+  'atom://policy', 'atom://condition', 'atom://retention-policy', 'atom://legal-hold',
+  'atom://purpose', 'atom://export-job', 'atom://break-glass',
+]);
+// Evidence atoms — append-only by construction (the kernel writes them via seed/logIt,
+// never the write surface). Importing one verbatim would forge history, so locked-mode
+// --import-all refuses them outright until Phase 11 adds safe re-chaining.
+const EVIDENCE_MODELS = new Set([
+  'atom://log', 'atom://sensitive-read', 'atom://export-job',
+  'atom://change-request', 'atom://approval', 'atom://break-glass',
+]);
+// the single chokepoint, called at the head of create/writeAtom/retire — the only
+// actor-driven write entries. Kernel-internal writes (seed/persist/bump/logIt/hooks)
+// do not pass through here, so genesis, the ledger, and hook patches are unaffected.
+function guardDangerous(modelRef, op) {
+  if (LOCKED && DANGEROUS_MODELS.has(modelRef))
+    throw new Err(403, `locked mode: cannot ${op} ${modelRef} directly — governance atoms change only through an approved change request (POST /change-request) or active break-glass`);
+}
+
 async function create(modelId, body, actor) {
+  guardDangerous(ref(modelId), 'create');
   const modelAtom = await getAtom(modelId);
   const fields = Object.keys(body.attr || {});
   // a baseline create grant on the model is required even for an all-default/empty
@@ -1320,6 +1551,7 @@ async function create(modelId, body, actor) {
 async function writeAtom(id, body, actor, ifMatch, mode) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
+  guardDangerous(atom.model, mode);
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
   for (const f of fields) if (!await allows(actor, `${modelId}.${f}`, 'update'))
@@ -1396,6 +1628,13 @@ async function runHooks(atom, event) {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(String(h.attr.run || ''))) { // never import a path-traversing run
       console.error(`hook ${h.id}: unsafe run "${h.attr.run}" — skipped`); continue;
     }
+    // Phase 6 — in locked mode a hook runs only if its `run` is in ATOMIC_HOOKS. Not
+    // allowlisted → SKIP (don't import or execute) and record evidence on the target atom,
+    // so a silently-disabled automation leaves a trace. dev/prod run hooks as before.
+    if (LOCKED && !HOOK_ALLOW.has(h.attr.run)) {
+      await logIt(atom.id, 'hook-skipped', '0', [{ path: 'hook', from: h.id, to: `${h.attr.run} not in ATOMIC_HOOKS` }]);
+      continue;
+    }
     try {
       const mod = await import(new URL(`./scripts/${h.attr.run}.mjs`, import.meta.url));
       await mod.default(atom, {
@@ -1460,6 +1699,7 @@ async function retireWithRefs(atom, actor, seen) {
 async function retire(id, actor) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
+  guardDangerous(atom.model, 'delete');
   if (!await canOp(actor, refId(atom.model), 'delete'))
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   if (!await writable(actor, atom)) throw new Err(403, `cannot delete ${refId(atom.model)} (tenant scope or write rule)`);
@@ -1501,6 +1741,10 @@ function parseQuery(search) {
     if (k === 'as')     { as = v; continue; }
     if (k === 'limit')  { limit = Number(v) || null; continue; }
     if (k === 'cursor') { cursor = v; continue; }
+    // purpose/reason are request context (Phase 3), normalized onto the actor — never
+    // row filters. Without this a `?purpose=` on a list/CSV would filter to rows whose
+    // attr.purpose matched (i.e. none), silently emptying the result.
+    if (k === 'purpose' || k === 'reason') continue;
     filters.push({ field: k, op, val: v });
   }
   return { filters, sort, as, limit, cursor };
@@ -1599,6 +1843,12 @@ async function applyMigration(attr, mig) {
   } else if (op === 'custom') {
     const run = String(mig.attr.run || '');
     if (!/^[a-z0-9][a-z0-9-]*$/.test(run)) { console.error(`migration ${mig.id}: unsafe run "${run}" — skipped`); return out; }
+    // Phase 6 — in locked mode a custom migration runs only if its `run` is in
+    // ATOMIC_MIGRATIONS. Not allowlisted → FAIL CLOSED: throw rather than silently skipping,
+    // so an atom never reads back through an unvetted transform (the read fails until an
+    // operator allowlists it). dev/prod run custom migrations as before.
+    if (LOCKED && !MIGRATION_ALLOW.has(run))
+      throw new Err(403, `locked mode: custom migration "${run}" (${mig.id}) is not in ATOMIC_MIGRATIONS`);
     try {
       const mod = await import(new URL(`./scripts/${run}.mjs`, import.meta.url));
       const next = await mod.default(out, { migration: mig, getAtom, refId, ref });
@@ -1641,7 +1891,11 @@ async function bringForward(atom) {
 // sweep every atom of one model forward (a model write or new migration triggers this)
 async function sweepModel(modelId) {
   if (!(await migrationsByModel()).get(modelId)?.length) return;
-  for (const a of await store.query({ model: ref(modelId) })) await bringForward(a);
+  for (const a of await store.query({ model: ref(modelId) }))
+    // a fail-closed custom migration (locked + not allowlisted, Phase 6) must not crash the
+    // sweep — and the boot sweep runs inside migrate(). Leave the atom behind its version; a
+    // real READ of it then fails closed where the actor can see the error, not at boot.
+    try { await bringForward(a); } catch (e) { console.error(`sweep ${modelId}/${a.id}: ${e.message}`); }
 }
 // sweep every model that has migrations — the boot "background job", run to completion
 async function sweepAll() { for (const modelId of (await migrationsByModel()).keys()) await sweepModel(modelId); }
@@ -2380,7 +2634,9 @@ const server = http.createServer(async (req, res) => {
       }
       // dev convenience only: with no mailer configured, surface the link for a
       // real token so local sign-in works. An unknown email still reveals nothing.
-      const devLink = link && !SENDGRID ? link : null;
+      // prod/locked never surface it — that is the "no dev magic-link fallback" rule
+      // (and the boot check guarantees prod has a real auth path: mail or admin secret).
+      const devLink = !PROD && link && !SENDGRID ? link : null;
       if (wantsHtml) return send(200, page('Check your email', devLink
         ? `<p>Email is not configured — use this link:</p><p><a href="${devLink}">${esc(devLink)}</a></p>`
         : `<p>If that email has an account, a sign-in link is on its way. It expires in 15 minutes.</p>`), true);
@@ -2405,7 +2661,29 @@ const server = http.createServer(async (req, res) => {
       return redirect('/', sessionCookie('', 0));
     }
 
-    const actor = await actorFromReq(req, cookies);
+    let actor = await actorFromReq(req, cookies);
+    // Phase 3 — purpose-bound reads. The request may carry a purpose (which restricted-
+    // field grants are matched against) and a free-text reason (evidence only, never
+    // trusted for access). Header or query form. We resolve the purpose to a real, active
+    // purpose atom ONCE here, so a per-field canReveal is a flag check, not a store round-
+    // trip per restricted field — and hang both on a per-request COPY of the actor (never
+    // mutate the resolved token/session atom, which may be shared or cached). Outside
+    // locked mode this is inert metadata, but threading it is cheap and uniform.
+    const _purpose = (req.headers['x-atomic-purpose'] || url.searchParams.get('purpose') || '').trim();
+    const _reason  = (req.headers['x-atomic-reason']  || url.searchParams.get('reason')  || '').trim();
+    if (_purpose || _reason) {
+      const pid = isRef(_purpose) ? refId(_purpose) : _purpose;
+      let _purposeOk = false;
+      if (pid) { const p = await store.get(pid); _purposeOk = !!p && p.model === 'atom://purpose' && p.lifecycle?.status !== 'retired'; }
+      actor = { ...actor, ...(pid ? { _purpose: pid, _purposeOk } : {}), ...(_reason ? { _reason } : {}) };
+    }
+    // Phase 4 — flush restricted-reveal evidence, THEN send. In locked mode a failed
+    // evidence write throws 503 here (caught below) and the projected body is never sent
+    // — disclosure is fail-closed. flushEvidence is a no-op unless a restricted field was
+    // actually revealed during projection, so every other read pays nothing. Used at the
+    // GET read-response sites (the only paths that project restricted data).
+    const reveal    = async (payload, html) => { await flushEvidence(actor); return send(200, payload, html); };
+    const revealCsv = async (filename, body) => { await flushEvidence(actor); return sendCsv(filename, body); };
     const isAnon = actor.id === '0';
     const [head, ...segs] = path.split('.');
 
@@ -2449,9 +2727,10 @@ const server = http.createServer(async (req, res) => {
       const ix = await getAtom(path);
       if (!await visible(actor, ix)) throw new Err(404, `no atom ${path}`); // can't run a query outside your tenant
       const atoms = await runQuery(ix, url.search, actor);
-      if (as === 'csv') return sendCsv(`${ix.id}.csv`, await atomsCsv(refId(ix.attr.over) === 'atom' ? null : refId(ix.attr.over), atoms));
-      if (wantsHtml) return send(200, await renderQueryPage(ix, atoms, actor, Object.fromEntries(url.searchParams)), true);
-      return send(200, atoms);
+      if (as === 'csv') { const over = refId(ix.attr.over); const g = await gateExport(actor, over, atoms, ix.id, url.search);
+        return await revealCsv(`${ix.id}.csv`, await atomsCsv(over === 'atom' ? null : over, g)); }
+      if (wantsHtml) return await reveal(await renderQueryPage(ix, atoms, actor, Object.fromEntries(url.searchParams)), true);
+      return await reveal(atoms);
     }
 
     if (req.method === 'GET') {
@@ -2461,8 +2740,8 @@ const server = http.createServer(async (req, res) => {
         const sorted = sortBy(readable, '-createdAt');
         const atoms = [];
         for (const a of sorted) atoms.push(await redact(actor, a));
-        if (wantsHtml) return send(200, page('atom — every atom', await renderCrossTable(atoms, actor), await navSelect(actor, ''), await footer(actor)), true);
-        return send(200, atoms);
+        if (wantsHtml) return await reveal(page('atom — every atom', await renderCrossTable(atoms, actor), await navSelect(actor, ''), await footer(actor)), true);
+        return await reveal(atoms);
       }
       const headAtom = await getAtom(head);
       const q = parseQuery(url.search);
@@ -2470,8 +2749,9 @@ const server = http.createServer(async (req, res) => {
       if (headAtom.model === 'atom://query') {
         if (!await visible(actor, headAtom)) throw new Err(404, `no atom ${head}`); // can't run a query outside your tenant
         const atoms = await runQuery(headAtom, url.search, actor);
-        if (as === 'csv') return sendCsv(`${headAtom.id}.csv`, await atomsCsv(refId(headAtom.attr.over) === 'atom' ? null : refId(headAtom.attr.over), atoms));
-        if (wantsHtml) return send(200, await renderQueryPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
+        if (as === 'csv') { const over = refId(headAtom.attr.over); const g = await gateExport(actor, over, atoms, headAtom.id, url.search);
+          return await revealCsv(`${headAtom.id}.csv`, await atomsCsv(over === 'atom' ? null : over, g)); }
+        if (wantsHtml) return await reveal(await renderQueryPage(headAtom, atoms, actor, Object.fromEntries(url.searchParams)), true);
         result = atoms;
       } else if (headAtom.model === 'atom://model' && segs.length === 0) {
         // a tenant-scoped model is invisible (and unaddressable) outside its tenant;
@@ -2483,8 +2763,9 @@ const server = http.createServer(async (req, res) => {
           return sendCsv(`${head}-template.csv`, await templateCsv(headAtom));
         }
         const atoms = await listModel(head, q, actor);           // already gated by read
-        if (as === 'csv') return sendCsv(`${head}.csv`, await atomsCsv(head, atoms));
-        if (wantsHtml) return send(200, await renderModelPage(head, atoms, actor, url.search), true);
+        if (as === 'csv') { const g = await gateExport(actor, head, atoms, head, url.search);
+          return await revealCsv(`${head}.csv`, await atomsCsv(head, g)); }
+        if (wantsHtml) return await reveal(await renderModelPage(head, atoms, actor, url.search), true);
         result = atoms;
       } else if (segs.length) {
         // a dotted path is a read like any other: gate the head atom, then traverse
@@ -2497,10 +2778,10 @@ const server = http.createServer(async (req, res) => {
           throw new Err(404, `no atom ${head}`);
         await bringForward(headAtom);             // lazy schema evolution: behind atoms are migrated on read
         const a = await redact(actor, headAtom);
-        if (wantsHtml) return send(200, await renderAtom(a, actor), true);
+        if (wantsHtml) return await reveal(await renderAtom(a, actor), true);
         result = a;
       }
-      return send(200, result);
+      return await reveal(result);
     }
 
     if (req.method === 'POST') {
@@ -2549,11 +2830,21 @@ function coreAtoms() {
     // core model definitions (the kernel's own types are model atoms)
     model('model',  'Model',  { label: { kind: 'text' }, version: { kind: 'integer', default: 1 },
       fields: { kind: 'map', required: true },
+      // Phase 5 — export posture. `disabled` blocks all CSV export of the model in locked
+      // mode; `grant` (the locked default) allows it but gates each confidential/restricted
+      // field on an explicit `export` grant; `approval` routes the export through a change
+      // request (Phase 8). Inert outside locked mode.
+      exports: { kind: 'enum', values: ['disabled', 'grant', 'approval'] },
       indexes: { kind: 'map' }, rules: { kind: 'json' }, display: { kind: 'json' }, behavior: { kind: 'json' } }),
     model('token',  'Token',  { email: { kind: 'email' }, login: { kind: 'enum', values: ['open'] },
       grants: { kind: 'list', of: 'embed://grant' }, roles: { kind: 'list', of: { kind: 'ref', to: 'atom://role' } } }),
     model('grant',  'Grant',  { path: { kind: 'text', required: true },
-      mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all'] } }),
+      mode: { kind: 'enum', values: ['read', 'create', 'update', 'delete', 'write', 'all', 'export'] },
+      // Phase 3 — an optional purpose binds a grant to a purpose atom (or a list). In
+      // locked mode a restricted field is revealed only when the request's purpose
+      // matches one the grant authorizes (an absent purpose authorizes any). Documentary:
+      // grants ride as list items, which the validator passes through unstripped.
+      purpose: { kind: 'ref', to: 'atom://purpose' } }),
     model('role',   'Role',   { label: { kind: 'text' }, grants: { kind: 'list', of: 'embed://grant' } }),
     model('tenant', 'Tenant', { name: { kind: 'text', required: true } }),
     model('query',  'Query',  { label: { kind: 'text' }, over: { kind: 'ref', to: 'atom://model' },
@@ -2561,6 +2852,38 @@ function coreAtoms() {
     model('log',    'Log',    { atom: { kind: 'ref', to: 'atom://atom' }, op: { kind: 'text' },
       actor: { kind: 'ref', to: 'atom://token' }, session: { kind: 'ref', to: 'atom://session' },
       at: { kind: 'datetime' }, changes: { kind: 'list' } }),
+    // purpose — a named reason a sensitive field may be read (Phase 3). Grants reference
+    // it to bind access; the request declares it (X-Atomic-Purpose / ?purpose=) and the
+    // kernel checks the grant authorizes it. A governance (dangerous-write) atom: defined
+    // in dev/bootstrap, not mintable directly in locked mode.
+    model('purpose', 'Purpose', { label: { kind: 'text', required: true }, description: { kind: 'text' } }),
+    // sensitive-read — evidence that a restricted field was actually revealed (Phase 4).
+    // Written by the kernel in the projection path, ONE per model per request (never per
+    // field per row): the revealed field names, the matched atom ids (a list — one write,
+    // not N), and a count. In locked mode the write is fail-closed (a failure → 503, the
+    // restricted body withheld). An evidence atom, like log — it cannot be imported (see
+    // EVIDENCE_MODELS); tamper-evidence (a hash chain) is Phase 10.
+    model('sensitive-read', 'Sensitive Read', {
+      actor: { kind: 'ref', to: 'atom://token', required: true },
+      session: { kind: 'ref', to: 'atom://session' },
+      purpose: { kind: 'ref', to: 'atom://purpose', required: true },
+      reason: { kind: 'text' },
+      model: { kind: 'text', required: true, filterable: true },
+      fields: { kind: 'list' }, atoms: { kind: 'list' }, query: { kind: 'ref', to: 'atom://query' },
+      count: { kind: 'integer' },
+      at: { kind: 'datetime', required: true, filterable: true, sortable: true } }),
+    // export-job — evidence that a bulk export ran (Phase 1). Locked-mode --export-all
+    // / --export-base write one of these BEFORE streaming a byte, so a shell operator's
+    // dump is no longer silent. `sealed` records whether the bytes were AES-GCM sealed
+    // (the locked-mode default) or plaintext (break-glass only, Phase 8). It is both a
+    // dangerous-write model and an evidence model: it cannot be forged in or edited out.
+    model('export-job', 'Export Job', { actor: { kind: 'text' }, scope: { kind: 'text', filterable: true },
+      count: { kind: 'integer' }, sealed: { kind: 'boolean' },
+      // Phase 5 — an HTTP CSV export of confidential/restricted fields records which model,
+      // which fields, and the filter string, alongside the Phase 1 bulk-dump fields.
+      model: { kind: 'text', filterable: true }, fields: { kind: 'list' }, filters: { kind: 'text' },
+      purpose: { kind: 'text' }, reason: { kind: 'text' },
+      at: { kind: 'datetime', filterable: true, sortable: true } }),
     model('session','Session',{ token: { kind: 'ref', to: 'atom://token' },
       createdAt: { kind: 'datetime' }, expiresAt: { kind: 'datetime' } }),
     // `run` names a vetted script in scripts/ — constrained to a bare basename
@@ -2733,7 +3056,7 @@ async function audit() {
   report('every atom conforms to its schema', badSchema);
 
   // every grant is well-formed: a known mode and a non-empty path
-  const MODES = new Set(['read', 'create', 'update', 'delete', 'write', 'all']);
+  const MODES = new Set(['read', 'create', 'update', 'delete', 'write', 'all', 'export']);
   const badGrants = [];
   for (const a of atoms) for (const g of (a.attr?.grants || []))
     if (!g || !g.path || !MODES.has(g.mode)) badGrants.push(`${a.id}: ${JSON.stringify(g)}`);
@@ -2742,7 +3065,7 @@ async function audit() {
   // every ledger entry is well-formed: a known op, with a subject + actor.
   // (Global contiguity is NOT an invariant — tenants are independent shards a
   //  node may carry or drop, which legitimately gaps the global log counter.)
-  const OPS = new Set(['genesis', 'create', 'merge', 'update', 'replace', 'delete', 'hook', 'migrate']);
+  const OPS = new Set(['genesis', 'create', 'merge', 'update', 'replace', 'delete', 'hook', 'migrate', 'hook-skipped']);
   report('every ledger entry is well-formed', atoms.filter((a) => a.model === 'atom://log')
     .filter((a) => !OPS.has(a.attr?.op) || !isRef(a.attr?.atom) || !isRef(a.attr?.actor))
     .map((a) => `${a.id}: op=${a.attr?.op}`));
@@ -2856,18 +3179,44 @@ if (_nb !== -1) {
   console.log(`  share URL: ${origin}/auth/open?token=${token.id}`);
   process.exit(0);
 }
+// Phase 1 — the bulk-export gate. The single biggest silent-exfil path was here:
+// these CLI commands streamed every atom as plaintext JSON, decrypted above the store
+// seam, with no record that it happened. In locked mode now: (1) an export-job evidence
+// atom is written BEFORE the first byte, so the dump leaves a trace, and (2) the bytes
+// are AES-GCM sealed (serializeLine), so they round-trip only under the same ATOMIC_KEY
+// rather than landing as cleartext on disk. dev/prod keep the verbatim plaintext stream
+// — that is the documented driver-migration tool and is out of the locked threat model.
+// (A plaintext bulk export under locked mode is a break-glass operation — Phase 8.)
+async function emitExportJob(scope, count, sealed) {
+  const id = `export-${randomUUID().slice(0, 8)}`;
+  await seed({
+    id, model: 'atom://export-job',
+    manifest: `export ${scope} — ${count} atoms (${sealed ? 'sealed' : 'PLAINTEXT'})`,
+    attr: {
+      actor: `cli:${process.env.USER || process.env.LOGNAME || 'operator'}`,
+      scope, count, sealed, at: now(),
+      ...(process.env.ATOMIC_EXPORT_REASON ? { reason: process.env.ATOMIC_EXPORT_REASON } : {}),
+    },
+    lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(),
+      createdBy: ref('0'), parent: ref('0'), expiration: 'atom://policy-never' },
+  });
+  return id;
+}
+const emit = (a) => process.stdout.write((LOCKED ? serializeLine(a) : JSON.stringify(a)) + '\n');
+
 // `node atomic.mjs --export-base <tenant> > base.ndjson` — a portable base is one
 // file: the tenant atom plus every atom in its shard, one JSON object per line.
 const _eb = process.argv.indexOf('--export-base');
 if (_eb !== -1) {
   const t = process.argv[_eb + 1];
   if (!t || !await store.has(t)) { console.error(`usage: --export-base <tenant-id>  (no atom "${t}")`); process.exit(2); }
-  let n = 0; const seen = new Set();
+  const atoms = []; const seen = new Set();
   for (const a of [await store.get(t), ...await store.query({ shards: [t] })]) {
-    if (!a || seen.has(a.id)) continue; seen.add(a.id);
-    process.stdout.write(JSON.stringify(a) + '\n'); n++;
+    if (!a || seen.has(a.id)) continue; seen.add(a.id); atoms.push(a);
   }
-  console.error(`exported ${n} atoms of base ${t}`);
+  if (LOCKED) await emitExportJob(t, atoms.length, true);   // evidence before the first byte
+  for (const a of atoms) emit(a);
+  console.error(`exported ${atoms.length} atoms of base ${t}${LOCKED ? ' (sealed; export-job recorded)' : ''}`);
   process.exit(0);
 }
 // `--export-all > all.ndjson` then `ATOMIC_DB=… --import-all all.ndjson` migrates a
@@ -2875,9 +3224,10 @@ if (_eb !== -1) {
 // import writes each verbatim (preserving id + lifecycle) and rebuilds the index, in
 // one transaction. Idempotent: re-importing overwrites by id.
 if (process.argv.includes('--export-all')) {
-  let n = 0;
-  for (const a of await store.values()) { process.stdout.write(JSON.stringify(a) + '\n'); n++; }
-  console.error(`exported ${n} atoms`);
+  const atoms = await store.values();
+  if (LOCKED) await emitExportJob('all', atoms.length, true);   // evidence before the first byte
+  for (const a of atoms) emit(a);
+  console.error(`exported ${atoms.length} atoms${LOCKED ? ' (sealed; export-job recorded)' : ''}`);
   process.exit(0);
 }
 const _ia = process.argv.indexOf('--import-all');
@@ -2885,10 +3235,30 @@ if (_ia !== -1) {
   const file = process.argv[_ia + 1];
   if (!file || !fs.existsSync(file)) { console.error(`usage: --import-all <file.ndjson>  (no file "${file}")`); process.exit(2); }
   const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  const parsed = lines.map(parseLine);
+  // Locked mode: a verbatim import preserving createdBy/lifecycle is a forgery vector.
+  // Refuse evidence atoms outright (no safe re-chaining until Phase 11), and re-validate
+  // every other atom against its model. Models from the dump are previewed into the
+  // control-plane cache first (read-only, no store write) so an instance can be checked
+  // against a schema that arrives in the same file. Fail closed before any byte is written.
+  if (LOCKED) {
+    const refused = [];
+    for (const a of parsed) if (a.model === 'atom://model') _ctl.set(a.id, a); // preview schemas for validate()
+    for (const a of parsed) {
+      if (EVIDENCE_MODELS.has(a.model)) { refused.push(`${a.id} (${a.model}: evidence cannot be imported in locked mode)`); continue; }
+      try { await validate(a.model === 'atom://model' ? 'model' : refId(a.model), a.attr || {}); }
+      catch (e) { refused.push(`${a.id} (${a.model}: ${e.message})`); }
+    }
+    if (refused.length) {
+      console.error(`locked mode: --import-all refused — ${refused.length} atom(s) rejected:`);
+      for (const r of refused.slice(0, 10)) console.error(`  - ${r}`);
+      if (refused.length > 10) console.error(`  … ${refused.length - 10} more`);
+      process.exit(1);
+    }
+  }
   let n = 0;
   await store.transact(async () => {
-    for (const line of lines) {
-      const a = parseLine(line);
+    for (const a of parsed) {
       await store.set(a.id, a);
       if (store.setIndex) await store.setIndex(a.id, await shardOf(a), a.model, await indexRows(a));
       n++;

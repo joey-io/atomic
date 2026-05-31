@@ -6,7 +6,7 @@
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0%20required-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
-![tests](https://img.shields.io/badge/tests-148%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-214%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Atomic is a single-file kernel for graph-relational data with no required dependencies (the
@@ -71,7 +71,7 @@ ATOMIC_DB=postgres://localhost/atomic npm start
 npm run seed
 
 # verify
-npm test         # 148 black-box HTTP assertions
+npm test         # 214 black-box HTTP assertions
 npm run check    # the kernel's own tests, which are themselves atoms
 npm run audit    # structural invariants (exits non-zero on any finding)
 ```
@@ -153,8 +153,16 @@ schema queryable.
 **Field kinds:** `text`, `longtext`, `email`, `url`, `uuid`, `datetime`, `integer`, `number`,
 `boolean`, `enum` (`values`), `ref` (`to`, `inverse`, `onDelete`), `list` (`of`), `map`,
 `json`, and `embed` (`of`). Common modifiers: `required`, `unique`, `default`, `min`/`max`,
-`minLength`/`maxLength`, `pattern`, and `filterable`/`sortable` (index the field — see
-[indexed reads](#how-it-works)).
+`minLength`/`maxLength`, `pattern`, `filterable`/`sortable` (index the field — see
+[indexed reads](#how-it-works)), and `sensitivity` (`public` · `internal` · `confidential` ·
+`restricted`; default `internal`). In `locked` mode a `restricted` field is revealed only by an
+**exact** `model.field` read grant — a wildcard (`*`/`**`, even a superuser's `**`) does not
+reveal it, so it redacts out of reads, lists, queries, path traversal, and CSV by default.
+Revealing a `restricted` field in `locked` mode also requires the request to declare a
+**purpose** the grant authorizes (`X-Atomic-Purpose` / `?purpose=`, naming a `purpose` atom);
+an optional `reason` (`X-Atomic-Reason` / `?reason=`) is recorded as evidence but never
+grants access. Outside `locked` mode `sensitivity` is recorded metadata and does not change
+access.
 
 ### References: `atom://` vs `embed://`
 
@@ -279,7 +287,16 @@ transaction.
   if you share its tenant ancestor (or you are a tenant-less root). Global atoms are
   world-readable and root-writable.
 - **Per-field redaction.** A read returns only the fields the actor is granted; path reads
-  honor scope, grants, and rules at every hop.
+  honor scope, grants, and rules at every hop. Fields can carry a `sensitivity` level; in
+  `locked` mode a `restricted` field is revealed only by an exact `model.field` read grant,
+  never a wildcard, and only when the request declares a `purpose` that grant authorizes.
+  Each such disclosure writes one bounded `sensitive-read` evidence atom (one per model per
+  request, not per row); in `locked` mode the read is fail-closed — if the evidence can't be
+  recorded, the restricted data is withheld.
+- **Export is its own right.** Reading a field and exporting it are separate: in `locked` mode
+  a confidential/restricted field leaves in a CSV only under an explicit `export`-mode grant
+  (never `read`/`write`/`all`), the model's `exports` posture (`disabled` · `grant` ·
+  `approval`) is enforced, and a sensitive export records an `export-job` evidence atom.
 - **One-click bases.** `POST /base { name }` (or `node atomic.mjs --new-base "<name>"`)
   provisions a tenant and an open-login token in one transaction and returns a **share URL** —
   open it and you are one-clicked into that base as a full, tenant-confined session.
@@ -354,6 +371,9 @@ Read from the environment, with `./.env` as a gitignored fallback.
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `PORT` | HTTP port | `3040` |
+| `ATOMIC_MODE` | `dev` (friendly local), `prod` (durable store + real auth required), or `locked` (prod + `ATOMIC_KEY` required, governance atoms frozen to direct edits, bulk export sealed + evidenced) | `dev` |
+| `ATOMIC_HOOKS` | Locked mode: comma-separated `run` basenames a hook may execute; others skip + record evidence | unset → none run |
+| `ATOMIC_MIGRATIONS` | Locked mode: comma-separated `run` basenames a custom migration may execute; others fail closed | unset → none run |
 | `ATOMIC_STORE` | Directory for the durable SQLite store | unset → in-memory |
 | `ATOMIC_DB` | Postgres connection URL → the Postgres driver (needs optional `pg`) | unset → SQLite/in-memory |
 | `ATOMIC_KEY` | Encryption key (64-hex or passphrase) for AES-256-GCM at rest | unset → plaintext |
@@ -372,7 +392,7 @@ Read from the environment, with `./.env` as a gitignored fallback.
 | `node atomic.mjs --audit` | Structural governance check (`npm run audit`); exits non-zero on any finding. |
 | `node atomic.mjs --new-base "<name>"` | Provision a base from the CLI and print its share URL. |
 | `node atomic.mjs --export-base <tenant>` | Dump a base (a tenant and its atoms) as NDJSON — a base is one file. |
-| `node atomic.mjs --export-all` / `--import-all` | Move every atom between drivers. |
+| `node atomic.mjs --export-all` / `--import-all` | Move every atom between drivers. In `locked` mode the export is AES-GCM sealed and records an `export-job` evidence atom; import re-validates every atom and refuses forged evidence. |
 
 ---
 
@@ -380,7 +400,7 @@ Read from the environment, with `./.env` as a gitignored fallback.
 
 Verification lives at two levels, and the second is itself made of atoms:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (148 assertions) covering validation,
+- **`test.mjs`** — an independent, black-box HTTP suite (214 assertions) covering validation,
   grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability
   across restart, and security regressions.
 - **`--check`** — the substrate's own acceptance suite, *as data*: a `test` atom is
@@ -410,7 +430,7 @@ package.json scripts; no required dependencies
 
 ## Status
 
-Atomic is pre-launch and experimental. It runs, and it is exercised by 148 HTTP test
+Atomic is pre-launch and experimental. It runs, and it is exercised by 214 HTTP test
 assertions, a self-test suite, and a structural audit — but interfaces may still change.
 
 ---

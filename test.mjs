@@ -3,7 +3,7 @@
 // prove durability. Self-contained (creates its own models/tenants). No deps.
 //   node test.mjs
 import { spawn } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 
 const PORT = 7790, STORE = '/tmp/atomic-test-store', base = `http://localhost:${PORT}`;
 const ADMIN = 'atk_test_admin_secret';                 // the kernel boots with ATOMIC_ADMIN_SECRET = this
@@ -26,7 +26,14 @@ async function mkToken(body) {
 // ATOMIC_TEST_DB (a postgres:// URL) runs the WHOLE suite against the Postgres
 // driver; otherwise SQLite at STORE. The pg tables are truncated once before the run
 // (externally), never on the mid-suite restart, so the durability check is real.
-const storeEnv = process.env.ATOMIC_TEST_DB ? { ATOMIC_DB: process.env.ATOMIC_TEST_DB } : { ATOMIC_STORE: STORE };
+// HERMETIC: the kernel auto-loads ./.env, whose loader fills only UNSET vars — so we
+// must pass BOTH store vars explicitly (emptying the unused one) or a child would
+// silently inherit the production ATOMIC_DB/ATOMIC_STORE from .env and run against
+// live data. Emptying = defined-but-falsy, which the loader skips and the kernel reads
+// as "not set". ATOMIC_MODE is left unset → dev, the mode this suite exercises.
+const storeEnv = process.env.ATOMIC_TEST_DB
+  ? { ATOMIC_DB: process.env.ATOMIC_TEST_DB, ATOMIC_STORE: '' }
+  : { ATOMIC_STORE: STORE, ATOMIC_DB: '' };
 const start = () => spawn('node', ['atomic.mjs'], { env: { ...process.env, PORT, ...storeEnv, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'ignore' });
 async function wait() { for (let i = 0; i < 50; i++) { try { await fetch(base + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); }
 
@@ -433,7 +440,7 @@ ok(await code('tk-all', 'POST', '/base', { name: 'Nope' }) === 403, 'base: only 
 rmSync('/tmp/atomic-cli-base', { recursive: true, force: true });
 const cliOut = await new Promise((res) => {
   let o = ''; const p = spawn('node', ['atomic.mjs', '--new-base', 'CLI Base'],
-    { env: { ...process.env, ATOMIC_STORE: '/tmp/atomic-cli-base', SENDGRID_API_KEY: '', ATOMIC_ORIGIN: 'http://example.test' } });
+    { env: { ...process.env, ATOMIC_STORE: '/tmp/atomic-cli-base', ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_ORIGIN: 'http://example.test' } });
   p.stdout.on('data', (d) => { o += d; }); p.on('exit', () => res(o));
 });
 ok(cliOut.includes('http://example.test/auth/open?token='), 'base: --new-base CLI prints a share URL');
@@ -463,6 +470,292 @@ srv.kill(); await new Promise((r) => setTimeout(r, 300));
 const checkCode = await new Promise((res) => spawn('node', ['atomic.mjs', '--check'],
   { env: { ...process.env, ...storeEnv, SENDGRID_API_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN }, stdio: 'inherit' }).on('exit', (c) => res(c)));
 ok(checkCode === 0, 'kernel --check runs the substrate’s own test atoms green (core + seeded)');
+
+// =============================================================================
+// Phase 1 — locked-mode posture (Phase 0 boot checks + the dangerous-write guard +
+// the closed bulk-export hole). These boot SEPARATE kernel processes on their own
+// PORT + STORE with ATOMIC_MODE=locked, so the dev suite above is untouched. Every
+// child gets an explicit store + empty ATOMIC_DB so .env can never point them at prod.
+// =============================================================================
+const LPORT = 7791, LSTORE = '/tmp/atomic-locked-store', lbase = `http://localhost:${LPORT}`;
+const LKEY = 'ab'.repeat(32);                                  // 64-hex AES-256 key
+const lenv = (extra = {}) => ({ ...process.env, PORT: LPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ...extra });
+const locked = (extra = {}) => lenv({ ATOMIC_STORE: LSTORE, ATOMIC_KEY: LKEY, ATOMIC_MODE: 'locked', ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
+// run a one-shot CLI/boot and resolve { code, out } when it exits. A process that
+// LISTENS (a successful boot) never exits, so a timer kills it — and the resulting
+// null code fails any "exit code === 1" assertion, which is what we want.
+const runCli = (args, extra = {}, killMs = 5000) => new Promise((res) => {
+  const p = spawn('node', ['atomic.mjs', ...args], { env: lenv(extra) });
+  let out = ''; p.stdout.on('data', (d) => out += d);
+  const t = setTimeout(() => p.kill(), killMs);
+  p.on('exit', (code) => { clearTimeout(t); res({ code, out }); });
+});
+const startLocked = () => spawn('node', ['atomic.mjs'], { env: locked(), stdio: 'ignore' });
+const waitOn = async (b) => { for (let i = 0; i < 50; i++) { try { await fetch(b + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+const LJ = (method, p, body) => fetch(lbase + p, { method, headers: { authorization: 'Bearer ' + ADMIN, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const lcode = (method, p, body) => LJ(method, p, body).then((r) => r.status);
+
+rmSync(LSTORE, { recursive: true, force: true });
+
+// --- Phase 0: boot checks fail closed on unsafe config (these exit before listening) ---
+ok((await runCli([], { ATOMIC_MODE: 'locked', ATOMIC_STORE: LSTORE, ATOMIC_KEY: '', ATOMIC_ADMIN_SECRET: ADMIN })).code === 1, 'locked: boot refused without ATOMIC_KEY');
+ok((await runCli([], { ATOMIC_MODE: 'prod', ATOMIC_STORE: '', ATOMIC_ADMIN_SECRET: ADMIN })).code === 1, 'prod: boot refused without a durable store (no in-memory)');
+ok((await runCli([], { ATOMIC_MODE: 'prod', ATOMIC_STORE: LSTORE, ATOMIC_ADMIN_SECRET: '', SENDGRID_API_KEY: '' })).code === 1, 'prod: boot refused without an admin secret or mail');
+ok((await runCli([], { ATOMIC_MODE: 'bananas', ATOMIC_STORE: LSTORE, ATOMIC_KEY: LKEY })).code === 1, 'unknown ATOMIC_MODE refused');
+
+// --- the locked server boots with a durable store + a key ---
+rmSync(LSTORE, { recursive: true, force: true });
+let lsrv = startLocked(); await waitOn(lbase);
+ok((await (await fetch(lbase + '/')).json()).id === '0', 'locked: server boots with a durable store + ATOMIC_KEY');
+
+// --- Phase 1a: the dangerous-write guard blocks direct edits to governance atoms ---
+ok(await lcode('POST', '/token', { attr: { email: 'x@y.com' } }) === 403, 'locked: guard blocks POST /token');
+ok(await lcode('POST', '/model', { id: 'm-x', attr: { label: 'X', version: 1, fields: { a: { kind: 'text' } } } }) === 403, 'locked: guard blocks POST /model');
+ok(await lcode('POST', '/hook', { id: 'h-x', attr: { run: 'x' } }) === 403, 'locked: guard blocks POST /hook');
+ok(await lcode('POST', '/condition', { id: 'c-x', attr: { field: 'a', op: 'eq', value: 1 } }) === 403, 'locked: guard blocks POST /condition');
+ok(await lcode('PATCH', '/policy-default', { attr: { label: 'tampered' } }) === 403, 'locked: guard blocks PATCH of a governance atom');
+ok(await lcode('DELETE', '/policy-default') === 403, 'locked: guard blocks DELETE of a governance atom');
+// the guard is selective — ordinary data writes still work
+ok(await lcode('POST', '/config', { id: 'cfg1', attr: { key: 'k', value: 1 } }) === 201, 'locked: a non-governance create still succeeds (guard is selective)');
+ok(await lcode('PATCH', '/cfg1', { attr: { key: 'k', value: 2 } }) === 200, 'locked: PATCH of a non-governance atom still succeeds');
+
+// --- Phase 1b: the bulk-export hole is closed (sealed bytes + an evidence record) ---
+lsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+const exp = await runCli(['--export-all'], { ATOMIC_STORE: LSTORE, ATOMIC_KEY: LKEY, ATOMIC_MODE: 'locked', ATOMIC_ADMIN_SECRET: ADMIN });
+const firstLine = exp.out.split('\n').filter(Boolean)[0] || '';
+ok(exp.code === 0 && firstLine.startsWith('enc:'), 'locked: --export-all streams AES-GCM-sealed bytes, not plaintext JSON');
+ok(!exp.out.includes('"email"') && !exp.out.includes('"key"'), 'locked: no plaintext field value leaks into the bulk export');
+// the export wrote an export-job evidence atom before the first byte — confirm it persisted
+lsrv = startLocked(); await waitOn(lbase);
+const jobs = await (await LJ('GET', '/export-job')).json();
+ok(Array.isArray(jobs) && jobs.length >= 1 && jobs[0].attr.sealed === true, 'locked: --export-all recorded a sealed export-job evidence atom');
+ok(jobs[0] && jobs[0].attr.count >= 1 && String(jobs[0].attr.actor).startsWith('cli:'), 'locked: the export-job records the operator + atom count');
+
+// --- Phase 1b: --import-all refuses forged evidence, accepts ordinary atoms ---
+lsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+const lc = `,"lifecycle":{"status":"active","version":1,"modelVersion":1,"createdAt":"2026-01-01T00:00:00.000Z","createdBy":"atom://0","parent":"atom://0","expiration":"atom://policy-never"}}`;
+writeFileSync('/tmp/atomic-forged.ndjson', `{"id":"log-forged","model":"atom://log","manifest":"forged","attr":{"atom":"atom://0","op":"genesis","actor":"atom://joey","at":"2026-01-01T00:00:00.000Z","changes":[]}${lc}\n`);
+ok((await runCli(['--import-all', '/tmp/atomic-forged.ndjson'], { ATOMIC_STORE: LSTORE, ATOMIC_KEY: LKEY, ATOMIC_MODE: 'locked', ATOMIC_ADMIN_SECRET: ADMIN })).code === 1, 'locked: --import-all refuses a forged evidence (log) atom');
+writeFileSync('/tmp/atomic-okimport.ndjson', `{"id":"imp-cfg","model":"atom://config","manifest":"imported","attr":{"key":"imported","value":1}${lc}\n`);
+ok((await runCli(['--import-all', '/tmp/atomic-okimport.ndjson'], { ATOMIC_STORE: LSTORE, ATOMIC_KEY: LKEY, ATOMIC_MODE: 'locked', ATOMIC_ADMIN_SECRET: ADMIN })).code === 0, 'locked: --import-all accepts a valid non-evidence atom');
+rmSync('/tmp/atomic-forged.ndjson', { force: true });
+rmSync('/tmp/atomic-okimport.ndjson', { force: true });
+rmSync(LSTORE, { recursive: true, force: true });
+
+// =============================================================================
+// Phase 2 — field sensitivity + redaction. A `restricted` field is set up in DEV
+// (model creation is blocked in locked mode by the Phase 1 guard), then the SAME store
+// is rebooted in LOCKED mode to prove a wildcard read no longer reveals the restricted
+// field — only an exact field-path grant does — while dev disclosure is unchanged.
+// =============================================================================
+const SPORT = 7792, SSTORE = '/tmp/atomic-sens-store', sbase = `http://localhost:${SPORT}`;
+const SSEC = { joey: ADMIN };                                  // tokenId -> clear API secret
+const senv = (mode) => ({ ...process.env, PORT: SPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_STORE: SSTORE, ATOMIC_ADMIN_SECRET: ADMIN, ...(mode === 'locked' ? { ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY } : {}) });
+const startMode = (mode) => spawn('node', ['atomic.mjs'], { env: senv(mode), stdio: 'ignore' });
+const SJ = (tok, method, p, body) => fetch(sbase + p, { method, headers: { ...(tok && SSEC[tok] ? { authorization: 'Bearer ' + SSEC[tok] } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const scode = (tok, method, p, body) => SJ(tok, method, p, body).then((r) => r.status);
+const sjson = (tok, p) => SJ(tok, 'GET', p).then((r) => r.json());
+const waitS = async () => { for (let i = 0; i < 50; i++) { try { await fetch(sbase + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+const mkTok2 = async (body) => { const j = await (await SJ('joey', 'POST', '/token', body)).json(); if (j.id && j.secret) SSEC[j.id] = j.secret; return j; };
+
+rmSync(SSTORE, { recursive: true, force: true });
+let ssrv = startMode('dev'); await waitS();
+// a model with a restricted field; a typo'd sensitivity level is rejected at create
+await SJ('joey', 'POST', '/model', { id: 'person', manifest: 'Person', attr: { label: 'Person', version: 1, fields: { name: { kind: 'text' }, email: { kind: 'email', sensitivity: 'confidential' }, ssn: { kind: 'text', sensitivity: 'restricted' } } } });
+ok(await scode('joey', 'POST', '/model', { id: 'badm', attr: { label: 'Bad', version: 1, fields: { x: { kind: 'text', sensitivity: 'sekret' } } } }) === 400, 'sensitivity: an unknown level is rejected at model create');
+// purpose atoms + a purpose-bound grant for Phase 3 — defined in DEV (governance atoms
+// can't be minted in locked mode). p-reveal holds an UNCONSTRAINED exact ssn grant (any
+// valid purpose authorizes it); p-bound's exact ssn grant is bound to purpose-eligibility.
+await SJ('joey', 'POST', '/purpose', { id: 'purpose-eligibility', attr: { label: 'Eligibility administration', description: 'Eligibility, compliance, or authorized administrative review.' } });
+await SJ('joey', 'POST', '/purpose', { id: 'purpose-audit', attr: { label: 'Audit', description: 'Internal audit review.' } });
+await mkTok2({ id: 'p-wild', attr: { email: 'pw@x.com', grants: [{ path: 'person.*', mode: 'read' }] } });
+await mkTok2({ id: 'p-reveal', attr: { email: 'pr@x.com', grants: [{ path: 'person.*', mode: 'read' }, { path: 'person.ssn', mode: 'read' }] } });
+await mkTok2({ id: 'p-bound', attr: { email: 'pb@x.com', grants: [{ path: 'person.*', mode: 'read' }, { path: 'person.ssn', mode: 'read', purpose: 'atom://purpose-eligibility' }] } });
+// Phase 5 — export-posture models + export-grant tokens (defined in dev; the posture and the
+// grants only bite once the store reboots in locked mode). p-exp-email may export the
+// confidential email; p-exp-ssn may reveal AND export the restricted ssn.
+await SJ('joey', 'POST', '/model', { id: 'vault', attr: { label: 'Vault', version: 1, exports: 'disabled', fields: { secret: { kind: 'text', sensitivity: 'confidential' } } } });
+await SJ('joey', 'POST', '/model', { id: 'review', attr: { label: 'Review', version: 1, exports: 'approval', fields: { note: { kind: 'text' } } } });
+await mkTok2({ id: 'p-exp-email', attr: { email: 'pee@x.com', grants: [{ path: 'person.*', mode: 'read' }, { path: 'person.email', mode: 'export' }] } });
+await mkTok2({ id: 'p-exp-ssn', attr: { email: 'pes@x.com', grants: [{ path: 'person.*', mode: 'read' }, { path: 'person.ssn', mode: 'read' }, { path: 'person.ssn', mode: 'export' }] } });
+await SJ('joey', 'POST', '/person', { id: 'p-1', attr: { name: 'Ada', email: 'ada@x.com', ssn: '111-22-3333' } });
+// DEV: a wildcard read still reveals the restricted field — sensitivity is inert outside locked
+ok((await sjson('p-wild', '/p-1')).attr.ssn === '111-22-3333', 'sensitivity (dev): a wildcard read still reveals a restricted field — dev unchanged');
+ok(await scode('p-wild', 'GET', '/p-1.ssn') === 200, 'sensitivity (dev): dotted read of a restricted field works');
+
+// reboot the SAME store in LOCKED mode — only the runtime posture changes
+ssrv.kill(); await new Promise((r) => setTimeout(r, 300));
+ssrv = startMode('locked'); await waitS();
+ok((await (await fetch(sbase + '/')).json()).id === '0', 'sensitivity (locked): the dev-built store reboots in locked mode');
+const wildView = await sjson('p-wild', '/p-1');
+ok(wildView.attr.name === 'Ada' && wildView.attr.ssn === undefined, 'locked: a wildcard read sees name but NOT the restricted ssn');
+ok((await sjson('joey', '/p-1')).attr.ssn === undefined, 'locked: even a ** superuser does not reveal a restricted field');
+ok(await scode('p-wild', 'GET', '/p-1.ssn') === 404, 'locked: dotted read of a restricted field is 404 for a wildcard actor');
+const list = await sjson('p-wild', '/person');
+ok(Array.isArray(list) && list[0] && list[0].attr.ssn === undefined, 'locked: list view redacts the restricted field for a wildcard actor');
+ok(!(await (await SJ('p-wild', 'GET', '/person?as=csv')).text()).includes('111-22-3333'), 'locked: CSV export omits the restricted value for a wildcard actor');
+
+// =============================================================================
+// Phase 3 — purpose-bound sensitive reads (same locked server). In locked mode an exact
+// field grant is necessary but NO LONGER SUFFICIENT: the request must also declare a
+// valid purpose the grant authorizes. The reason string is evidence only — never access.
+// =============================================================================
+// fetch a sensitive read carrying a purpose (header form) and/or reason.
+const sPurp = (tok, p, purpose, reason) => fetch(sbase + p, { headers: {
+  ...(SSEC[tok] ? { authorization: 'Bearer ' + SSEC[tok] } : {}),
+  ...(purpose ? { 'x-atomic-purpose': purpose } : {}), ...(reason ? { 'x-atomic-reason': reason } : {}) } });
+const ssnVia = async (tok, purpose, reason) => (await (await sPurp(tok, '/p-1', purpose, reason)).json()).attr.ssn;
+
+// an exact grant alone no longer reveals — purpose is now mandatory in locked mode
+ok(await ssnVia('p-reveal') === undefined, 'purpose: an exact grant WITHOUT a purpose no longer reveals (mandatory in locked)');
+ok(await ssnVia('p-reveal', 'purpose-nope') === undefined, 'purpose: an unknown/typo purpose is not an access key — still redacted');
+ok(await ssnVia('p-reveal', null, 'just curious') === undefined, 'purpose: a reason with NO purpose does not reveal (reason is evidence only)');
+ok(await ssnVia('p-reveal', 'purpose-eligibility') === '111-22-3333', 'purpose: exact grant + a valid purpose (header) reveals the restricted field');
+ok(await ssnVia('p-reveal', 'purpose-audit', 'compliance') === '111-22-3333', 'purpose: an UNCONSTRAINED exact grant accepts any valid purpose');
+// the query-param form works the same as the header
+ok((await (await SJ('p-reveal', 'GET', '/p-1?purpose=purpose-eligibility')).json()).attr.ssn === '111-22-3333', 'purpose: ?purpose= query form reveals just like the header');
+// even with a valid purpose, a ** superuser still has no EXACT grant → still redacted
+ok(await ssnVia('joey', 'purpose-eligibility') === undefined, 'purpose: a ** superuser with a valid purpose still cannot reveal (no exact grant)');
+// dotted traversal honours the same purpose gate
+ok((await sPurp('p-reveal', '/p-1.ssn')).status === 404, 'purpose: dotted read of a restricted field is 404 without a purpose');
+ok((await sPurp('p-reveal', '/p-1.ssn', 'purpose-eligibility')).status === 200, 'purpose: dotted read of a restricted field works with a valid purpose');
+// CSV honours the purpose gate
+ok(!(await (await SJ('p-reveal', 'GET', '/person?as=csv')).text()).includes('111-22-3333'), 'purpose: CSV omits the restricted value without a purpose');
+ok(!(await (await SJ('p-reveal', 'GET', '/person?as=csv&purpose=purpose-eligibility')).text()).includes('111-22-3333'), 'purpose: a valid purpose REVEALS but does not EXPORT — CSV still omits ssn without an export grant (Phase 5)');
+
+// a purpose-CONSTRAINED grant authorizes ONLY its purpose
+ok(await ssnVia('p-bound', 'purpose-eligibility') === '111-22-3333', 'purpose: a purpose-bound grant reveals for its own purpose');
+ok(await ssnVia('p-bound', 'purpose-audit') === undefined, 'purpose: a purpose-bound grant redacts for a different (valid) purpose');
+ok(await ssnVia('p-bound') === undefined, 'purpose: a purpose-bound grant redacts when no purpose is declared');
+
+// =============================================================================
+// Phase 4 — bounded, fail-closed sensitive-read evidence (same locked server). A reveal
+// of a restricted field writes exactly ONE sensitive-read per model per request (never
+// per field per row); a read that reveals nothing restricted writes nothing. joey (**)
+// can list the evidence — its own fields aren't restricted, so listing it is not itself a
+// sensitive read. We diff the evidence-id set across a request to isolate what it wrote.
+// =============================================================================
+const sreadList = async () => (await sjson('joey', '/sensitive-read')) || [];
+const sreadIds = async () => new Set((await sreadList()).map((a) => a.id));
+
+// a read that reveals NOTHING restricted records no evidence
+let ids0 = await sreadIds();
+await sjson('p-wild', '/p-1');                         // sees name, ssn redacted → nothing to record
+ok((await sreadIds()).size === ids0.size, 'evidence: a read revealing nothing restricted writes no sensitive-read');
+
+// a single-atom reveal records EXACTLY ONE sensitive-read, binding actor/purpose/reason
+ids0 = await sreadIds();
+await sPurp('p-reveal', '/p-1', 'purpose-eligibility', 'eligibility review');
+let fresh = (await sreadList()).filter((a) => !ids0.has(a.id));
+ok(fresh.length === 1, 'evidence: a single restricted reveal records exactly one sensitive-read');
+const rec = fresh[0];
+ok(rec.attr.model === 'person' && (rec.attr.fields || []).includes('ssn') && rec.attr.count === 1 && (rec.attr.atoms || []).includes('p-1'),
+  'evidence: the record names the model, the revealed field, the atom id, and count=1');
+ok(rec.attr.actor === 'atom://p-reveal' && rec.attr.purpose === 'atom://purpose-eligibility' && rec.attr.reason === 'eligibility review',
+  'evidence: the record binds actor + purpose and captures the free-text reason');
+
+// a LIST revealing a restricted field across N rows records ONE sensitive-read (not N)
+await SJ('joey', 'POST', '/person', { id: 'p-2', attr: { name: 'Bo', email: 'bo@x.com', ssn: '444-55-6666' } });
+ids0 = await sreadIds();
+const plist = await (await SJ('p-reveal', 'GET', '/person?purpose=purpose-eligibility')).json();
+const ssns = (Array.isArray(plist) ? plist : []).map((a) => a.attr.ssn);
+ok(ssns.includes('111-22-3333') && ssns.includes('444-55-6666'), 'evidence: a JSON list reveals the restricted field for both rows (authorized purpose)');
+fresh = (await sreadList()).filter((a) => !ids0.has(a.id));
+ok(fresh.length === 1, 'evidence: a list of N restricted rows records ONE sensitive-read, not N');
+ok(fresh[0].attr.count === 2 && (fresh[0].attr.atoms || []).includes('p-1') && (fresh[0].attr.atoms || []).includes('p-2'),
+  'evidence: the one record lists all matched atom ids + a count');
+
+// =============================================================================
+// Phase 5 — export control (same locked server). Reading a field and EXPORTING it (CSV)
+// are different rights: a confidential/restricted field leaves in a CSV only under an
+// explicit `export` grant; the model's `exports` posture is enforced; a sensitive export
+// records an export-job. `read`/`all` do NOT imply export in locked mode.
+// =============================================================================
+const csvOf = async (tok, p) => (await SJ(tok, 'GET', p + (p.includes('?') ? '&' : '?') + 'as=csv')).text();
+const ejobs = async () => (await sjson('joey', '/export-job')) || [];
+const ejobIds = async () => new Set((await ejobs()).map((a) => a.id));
+
+// a confidential field is READABLE in JSON but NOT exportable without an export grant
+ok((await sjson('p-wild', '/p-1')).attr.email === 'ada@x.com', 'export: a confidential field is readable in JSON (reveal ≠ export)');
+ok(!(await csvOf('p-wild', '/person')).includes('ada@x.com'), 'export: a confidential field is omitted from CSV without an export grant');
+ok(!(await csvOf('joey', '/person')).includes('ada@x.com'), 'export: even a ** all grant does not export a confidential field in locked mode');
+
+// an explicit export grant exports the confidential field — and records one export-job
+let ej0 = await ejobIds();
+const emailCsv = await csvOf('p-exp-email', '/person');
+ok(emailCsv.includes('ada@x.com') && !emailCsv.includes('111-22-3333'), 'export: an export grant exports email (confidential); ssn stays out (no ssn export grant)');
+let ejNew = (await ejobs()).filter((a) => !ej0.has(a.id));
+ok(ejNew.length === 1 && ejNew[0].attr.model === 'person' && (ejNew[0].attr.fields || []).includes('email') && ejNew[0].attr.sealed === false,
+  'export: a sensitive CSV export records one export-job (model, fields, sealed=false)');
+ok(ejNew[0].attr.actor === 'atom://p-exp-email' && Number(ejNew[0].attr.count) >= 2, 'export: the export-job binds the actor + row count');
+
+// exporting a restricted field needs BOTH reveal (read+purpose) AND an export grant
+ok(!(await csvOf('p-exp-ssn', '/person')).includes('444-55-6666'), 'export: restricted needs a purpose to reveal first — no purpose, no ssn in CSV');
+ok((await csvOf('p-exp-ssn', '/person?purpose=purpose-eligibility')).includes('444-55-6666'), 'export: read + purpose + export grant exports the restricted ssn');
+
+// a CSV that exports nothing confidential/restricted records no export-job
+ej0 = await ejobIds();
+await csvOf('p-wild', '/person');                     // only name survives the gate
+ok((await ejobIds()).size === ej0.size, 'export: a CSV exporting no sensitive field records no export-job');
+
+// model export posture: disabled blocks all CSV export; approval is refused pending Phase 8
+ok(await scode('joey', 'GET', '/vault?as=csv') === 403, 'export: posture "disabled" blocks CSV export of the model');
+ok(await scode('joey', 'GET', '/review?as=csv') === 403, 'export: posture "approval" refuses CSV export pending a change request (Phase 8)');
+
+ssrv.kill(); await new Promise((r) => setTimeout(r, 200));
+rmSync(SSTORE, { recursive: true, force: true });
+
+// =============================================================================
+// Phase 6 — hook + migration allowlists. In locked mode a hook runs only if its `run` is
+// in ATOMIC_HOOKS (else it SKIPS and records evidence); a custom migration runs only if its
+// `run` is in ATOMIC_MIGRATIONS (else it FAILS CLOSED on read). Built in dev (hooks, models,
+// and migrations are dangerous atoms), then rebooted locked with and without the allowlists.
+// =============================================================================
+const HPORT = 7793, HSTORE = '/tmp/atomic-hook-store', hbase = `http://localhost:${HPORT}`;
+const HSEC = { joey: ADMIN };
+const henv = (extra = {}) => ({ ...process.env, PORT: HPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_STORE: HSTORE, ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
+const startH = (extra = {}) => spawn('node', ['atomic.mjs'], { env: henv(extra), stdio: 'ignore' });
+const HJ = (tok, method, p, body) => fetch(hbase + p, { method, headers: { ...(HSEC[tok] ? { authorization: 'Bearer ' + HSEC[tok] } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const hcode = (tok, method, p, body) => HJ(tok, method, p, body).then((r) => r.status);
+const hjson = (tok, p) => HJ(tok, 'GET', p).then((r) => r.json());
+const waitH = async () => { for (let i = 0; i < 50; i++) { try { await fetch(hbase + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+
+rmSync(HSTORE, { recursive: true, force: true });
+let hsrv = startH(); await waitH();
+// a stamping hook on widget6.create; a custom migration on gadget6 (v1 → v2 derives slug)
+await HJ('joey', 'POST', '/hook', { id: 'stamp6', attr: { run: 'test-stamp', grants: [{ path: 'widget6.stamp', mode: 'write' }] } });
+await HJ('joey', 'POST', '/model', { id: 'widget6', manifest: 'W6', hooks: { create: ['atom://stamp6'] }, attr: { label: 'W6', version: 1, fields: { name: { kind: 'text' }, stamp: { kind: 'text' } } } });
+await HJ('joey', 'POST', '/model', { id: 'gadget6', attr: { label: 'G6', version: 2, fields: { title: { kind: 'text' }, slug: { kind: 'text' } } } });
+await HJ('joey', 'POST', '/migration', { id: 'gadget6@1-2', attr: { model: 'atom://gadget6', from: 1, to: 2, op: 'custom', run: 'test-migrate' } });
+await HJ('joey', 'POST', '/widget6', { id: 'wd', attr: { name: 'Gamma' } });
+ok((await hjson('joey', '/wd')).attr.stamp === 'ok', 'hooks (dev): an allowlist-free hook runs and stamps the atom');
+hsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+// inject a gadget6 atom STILL at modelVersion 1 (behind the v2 model), so a read must bring
+// it forward through the custom migration — import preserves the lifecycle verbatim, and the
+// eager dev sweep can't catch an atom that doesn't exist until after the model is shipped.
+const g6lc = `"lifecycle":{"status":"active","version":1,"modelVersion":1,"createdAt":"2026-01-01T00:00:00.000Z","createdBy":"atom://0","parent":"atom://0","expiration":"atom://policy-never"}`;
+writeFileSync('/tmp/atomic-g6.ndjson', `{"id":"g6","model":"atom://gadget6","manifest":"g6","attr":{"title":"Hello World"},${g6lc}}\n`);
+await new Promise((res) => spawn('node', ['atomic.mjs', '--import-all', '/tmp/atomic-g6.ndjson'], { env: henv(), stdio: 'ignore' }).on('exit', res));
+
+// reboot LOCKED with NO allowlists → hook skips (+ evidence), custom migration fails closed
+hsrv = startH({ ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY }); await waitH();
+await HJ('joey', 'POST', '/widget6', { id: 'wd2', attr: { name: 'Delta' } });
+ok((await hjson('joey', '/wd2')).attr.stamp === undefined, 'hooks (locked, no allowlist): the hook is SKIPPED — no stamp written');
+const skiplog = await hjson('joey', '/log.byAtom?atom=atom://wd2');
+ok(Array.isArray(skiplog) && skiplog.some((l) => l.attr.op === 'hook-skipped'), 'hooks (locked): the skip is recorded as evidence (a hook-skipped log)');
+ok(await hcode('joey', 'GET', '/g6') === 403, 'migration (locked, no allowlist): a custom migration FAILS CLOSED on read');
+hsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+// reboot LOCKED WITH both allowlists → the hook runs again, the custom migration runs
+hsrv = startH({ ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY, ATOMIC_HOOKS: 'test-stamp', ATOMIC_MIGRATIONS: 'test-migrate' }); await waitH();
+await HJ('joey', 'POST', '/widget6', { id: 'wd3', attr: { name: 'Echo' } });
+ok((await hjson('joey', '/wd3')).attr.stamp === 'ok', 'hooks (locked, allowlisted): the hook runs again and stamps');
+const g6 = await hjson('joey', '/g6');
+ok(g6.attr && g6.attr.slug === 'hello-world' && g6.lifecycle.modelVersion === 2, 'migration (locked, allowlisted): the custom migration runs and brings the atom forward');
+hsrv.kill(); await new Promise((r) => setTimeout(r, 200));
+rmSync(HSTORE, { recursive: true, force: true });
+rmSync('/tmp/atomic-g6.ndjson', { force: true });
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

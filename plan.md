@@ -43,7 +43,7 @@ Atomic already has the right substrate. It currently includes:
 - Hook atoms running vetted scripts by safe basename; migration atoms; retention via
   policy/condition atoms; `log` atoms for changes.
 - AES-256-GCM encryption at rest when `ATOMIC_KEY` is set.
-- Structural audit, atom self-tests, and 148 black-box HTTP assertions.
+- Structural audit, atom self-tests, and 179 black-box HTTP assertions.
 
 The gap is not architecture. The gap is governance posture — and a few concrete leaks below.
 
@@ -118,6 +118,15 @@ kernel. Name them so procurement and ops know where they live:
 
 ## Phase 0 — `ATOMIC_MODE` and locked boot checks
 
+> **Status: implemented (2026-05-31).** `MODE`/`LOCKED`/`PROD` constants + `assertBootMode()`
+> ship in `atomic.mjs`. Boot fails closed when `prod`/`locked` lack a durable store, a real
+> auth path (admin secret or mail), or — in `locked` — `ATOMIC_KEY`; an unknown mode is
+> rejected. The dev magic-link fallback is suppressed in `prod`/`locked`. The *runtime* locked
+> rules that don't belong to "boot" (open-login rejection, `**`-grant rejection) arrive with
+> their phases — and creating an open-login token or a base already falls under the Phase 1
+> dangerous-write guard, so neither can be minted in locked mode today. CSP/security headers
+> are already always-on.
+
 ```bash
 ATOMIC_MODE=dev|prod|locked     # default: dev
 ```
@@ -148,6 +157,19 @@ Put guardrails in the **existing** read/write/export/hook paths. Add no new rout
 ## Phase 1 — Close the bulk-export hole + dangerous-write guard
 
 > Highest leak, smallest code. This lands first.
+
+> **Status: implemented (2026-05-31).** Both halves ship behind `locked` mode (no change to
+> `dev`/`prod`). The dangerous-write guard rejects direct `create`/`update`/`replace`/`delete`
+> (REST *and* `/tx`) of the governance models at the one shared chokepoint. Bulk export now
+> writes an `export-job` evidence atom **before** the first byte and streams **AES-GCM-sealed**
+> bytes (`serializeLine`) instead of plaintext. `--import-all` refuses evidence atoms and
+> re-validates every other atom against its model, failing closed before any write. Covered by
+> 19 new locked-mode assertions in `test.mjs`. **Scoped to what is buildable before later
+> phases:** with break-glass not yet built (Phase 8), `locked` allows only the *sealed* export
+> path — the *plaintext* louder export, and gating the commands themselves behind active
+> break-glass, land in Phase 8. Evidence-chain re-chaining on import is Phase 11; until then
+> locked import refuses evidence outright rather than re-chaining it. The `export-job` evidence
+> atom is written to the same store, so it is **not yet tamper-proof** — that is Phase 10.
 
 **The hole.** `--export-all` and `--export-base` read straight from the store and dump every
 atom verbatim — no actor, no grants, no redaction, no purpose, no evidence (`atomic.mjs`
@@ -181,6 +203,25 @@ retention-policy  legal-hold  purpose  export-job  break-glass
 
 ## Phase 2 — Field sensitivity + redaction
 
+> **Status: implemented (2026-05-31).** `sensitivity` is parsed off the field def (levels
+> validated at model write — a typo'd level is a 400, so it can't silently downgrade to
+> `internal`). A `canReveal()` gate sits in the two — and only two — per-field disclosure
+> chokepoints (`redact()` for whole-atom/list/query/CSV/HTML, `readField()` for dotted
+> traversal). In `locked` mode a `restricted` field is revealed **only** by an exact
+> `model.field` read grant; a wildcard (`*`/`**`, **including a superuser's `**`**) does not,
+> so it redacts everywhere by default. Outside `locked` mode sensitivity is inert metadata, so
+> dev/prod disclosure is unchanged. 12 new assertions in `test.mjs` (a dev→locked store reboot,
+> since model creation is blocked in locked by the Phase 1 guard).
+>
+> **Scoped / deferred, stated plainly:** (1) the `confidential` level is recorded but does
+> nothing yet — it gates **export** in Phase 5. (2) Reveal under an active break-glass `**` is
+> Phase 8; until then even root needs an exact grant. (3) `restricted` is **not** yet protected
+> on the *write* side (a wildcard-write actor can blind-write it) — disclosure was the Phase 2
+> deliverable. (4) **Known oracle gap:** a `restricted` field that is also `filterable`, or any
+> value reachable by the `?q=` full-text scan, can still be used as an **equality/substring
+> oracle** (the row matches and returns with the field redacted, but the match itself leaks the
+> value). Closing the query-side oracle is a separate hardening pass, not done here.
+
 Sensitivity lives on the model field definition. No separate classification engine.
 
 ```json
@@ -209,6 +250,36 @@ Levels: `public` · `internal` · `confidential` · `restricted`. Missing → `i
 ---
 
 ## Phase 3 — Purpose-bound sensitive reads
+
+> **Status: implemented (2026-05-31).** A native `purpose` model ships in `coreAtoms()`
+> (a governance/dangerous-write atom — defined in dev/bootstrap, not mintable in locked).
+> Grants carry an optional `purpose` (a ref, or a list of them), passed through unstripped
+> because grants ride as list items the validator does not recurse into. The request's
+> purpose + reason are read from `X-Atomic-Purpose`/`X-Atomic-Reason` **or** `?purpose=`/
+> `?reason=`, the purpose is resolved to a real, active `purpose` atom **once per request**
+> (→ `actor._purposeOk`), and both are hung on a per-request **copy** of the actor (the
+> resolved token/session atom is never mutated). `parseQuery` now reserves `purpose`/
+> `reason` so a `?purpose=` on a list/CSV can't be misread as a row filter. The Phase 2
+> `canReveal()` chokepoint gains the purpose gate: in `locked`, a `restricted` field is
+> revealed only when an **exact** field-path read grant exists **and** the request carries
+> a valid purpose that grant authorizes. **Enforcement is grant-match; the free-text reason
+> is never consulted for access.** 16 assertions in `test.mjs` (the Phase 2 "exact grant
+> reveals" cases moved here, since reveal now also requires a purpose).
+>
+> **Design decision, stated plainly:** a grant with **no** `purpose` authorizes **any**
+> valid purpose — so an unconstrained exact grant still reveals, but the requester must
+> declare *some* real purpose (recorded as evidence in Phase 4). Add a `purpose` to a grant
+> to bind it to specific purposes. A purpose-bound grant reveals only for its own purpose;
+> a different (even valid) purpose redacts.
+>
+> **Scoped / deferred, stated plainly:** (1) the resolved `reason` (and the purpose) are
+> hung on the actor but **not yet written anywhere** — the `sensitive-read` evidence atom
+> that captures them is Phase 4; today purpose-binding *gates* the read but produces no
+> record. (2) Enforcement is `locked`-only; in dev/prod purpose is inert metadata, like
+> sensitivity. (3) Hooks reading restricted fields carry no purpose, so they redact in
+> locked mode — threading purpose through hook identity is a later concern. (4) The Phase 2
+> query-side oracle gap (a `filterable` restricted field) is unchanged — purpose gates
+> *disclosure*, not the equality/substring match.
 
 Add a native `purpose` atom; extend grants with an optional `purpose`.
 
@@ -240,6 +311,32 @@ or `GET /person-123?purpose=purpose-eligibility-admin&reason=eligibility-review`
 ---
 
 ## Phase 4 — Sensitive-read evidence (bounded — reads must not become unbounded writes)
+
+> **Status: implemented (2026-05-31).** The `sensitive-read` model ships in `coreAtoms()`
+> (an evidence model — on the import-refusal list; written only by the kernel). Reveals are
+> accumulated in the projection path: `redact()` and `readField()` call `noteReveal()` only
+> when a `restricted` field is *actually* disclosed, grouping by model on the request-scoped
+> actor copy (`{ fields:Set, atoms:Set }` per model — so a list of N rows is ONE record with
+> an N-element `atoms` list, never N records). A `reveal`/`revealCsv` wrapper at every GET
+> read-response site calls `flushEvidence()` **after projection, before the bytes go out**:
+> it writes one `sensitive-read` per model touched (actor, session, purpose, reason, model,
+> fields, atoms, count, at) into the data's tenant shard via `seed` (bypassing the
+> dangerous-write guard, like `logIt`). **Fail-closed in locked:** a failed evidence write
+> throws `503` and the projected (restricted) body is never sent. A read that reveals nothing
+> restricted writes nothing — `flushEvidence` is a no-op, so non-sensitive reads keep their
+> millisecond path. 7 assertions in `test.mjs` (one-per-single-read, one-per-N-row-list,
+> binds actor/purpose, captures reason, non-restricted writes nothing).
+>
+> **Scoped / deferred, stated plainly:** (1) **Locked-mode only.** The plan's `prod`
+> best-effort path is NOT built: Phase 2 made sensitivity inert in `prod`, so `prod` reveals
+> via wildcard without a purpose — recording there would mean an evidence atom missing its
+> required `purpose`, plus new writes on the live read path. Recording stays a locked-mode
+> governance feature end-to-end. (2) **Not yet tamper-evident.** sensitive-read atoms are
+> written to the same store with no hash chain — forge/edit resistance is Phase 10. (3) The
+> fail-closed *fault-injection* regression (Phase 11, item 8) needs a write-fault harness, not
+> a behavioral assertion; the code path (throw → 503 → body withheld) is in place and the
+> positive/bounded behaviors are tested. (4) HTML admin-UI renders flush through the same
+> seam, so a UI reveal is recorded too; dedup by Set keeps it bounded.
 
 Add a `sensitive-read` model. Record read evidence **only when a restricted field is actually
 revealed**, and bound the cost so the read path stays fast.
@@ -285,6 +382,35 @@ Append evidence in the **projection/redaction path**, not in every route.
 
 ## Phase 5 — Export control (CSV *and* the CLI paths from Phase 1)
 
+> **Status: implemented (2026-05-31).** `export` is now a grant mode; `model.exports`
+> (`disabled` | `grant` | `approval`, locked default `grant`) is a posture; `export-job`
+> gained `model`/`fields`/`filters`. A `canExport()` gate plus a `gateExport()` pass run on
+> every HTTP CSV path (model list, single-model query, cross-model `atom://atom` query): in
+> locked mode a confidential **or** restricted field leaves in a CSV **only** under an exact
+> `export`-mode grant on its path — never `read`, `write`, or even `all` (those don't imply
+> export in locked). Ungranted sensitive fields become empty CSV cells (`atomsCsv` reads
+> `dotGet`, so a deleted attr is blank), never a leak. Posture is enforced up front:
+> `disabled` → 403, `approval` → 403 (pointer to the Phase 8 change request). A CSV export
+> that carries ≥1 sensitive field records **one** `export-job` (actor, model, fields,
+> filters, count, purpose, reason, `sealed:false`) through the **same fail-closed flush seam**
+> as Phase 4 — so an export and any reveal it entails are evidenced together, before the bytes
+> go out. 11 assertions in `test.mjs`.
+>
+> **Read vs. export is now distinct (and two earlier tests moved):** a valid purpose *reveals*
+> a restricted field in JSON but does **not** *export* it to CSV without an export grant — so
+> the Phase 3 "CSV includes with purpose" and Phase 4 "list via CSV" assertions were rewritten
+> to use JSON reads (reveal) and a dedicated export grant (export).
+>
+> **Scoped / deferred, stated plainly:** (1) **Locked-mode only**, like the rest of the
+> sensitivity stack. (2) **The CLI bulk paths already self-evidence (Phase 1)** and stay
+> sealed/break-glass-gated in Phase 8 — this phase governs the *HTTP CSV* paths the Phase 1
+> work didn't. (3) **`approval` posture rejects** rather than routing — the change-request
+> workflow is Phase 7/8; deny-first, like the dangerous-write guard. (4) **Cross-model
+> (`atom://atom`) CSV** gates each field by its atom's own model but cannot enforce a single
+> model posture, so a `disabled` model's *non-sensitive* fields can still appear in an
+> `atom://atom` export — single-model CSV (the common path) enforces posture fully. (5) The
+> export-job is written to the same store, **not yet tamper-evident** (Phase 10).
+
 Add an `export` grant mode and a model-level export posture.
 
 ```json
@@ -305,6 +431,30 @@ Add an `export` grant mode and a model-level export posture.
 ---
 
 ## Phase 6 — Hook and migration allowlists
+
+> **Status: implemented (2026-05-31).** `ATOMIC_HOOKS` / `ATOMIC_MIGRATIONS` parse once into
+> sets of allowed `run` basenames. In `runHooks`, locked + a hook whose `run` isn't listed →
+> **skip** (never `import` or execute) and write a `hook-skipped` `log` against the target atom
+> (evidence: which hook, which run, when — a silently-disabled automation leaves a trace). In
+> `applyMigration` (op `custom`), locked + a `run` not listed → **fail closed** (`throw 403`)
+> rather than silently returning the un-transformed bag — so an atom never reads back through
+> unvetted code. Empty/unset allowlists mean nothing runs (the secure default). Inert outside
+> locked. 6 assertions in `test.mjs` (dev hook runs; locked-no-allowlist hook skips + logs and
+> migration 403s; locked-allowlisted both run).
+>
+> **One subtlety the build surfaced:** the boot-time schema sweep (`migrate → sweepAll →
+> sweepModel → bringForward`) would have crashed the kernel on a fail-closed migration. Fixed
+> by catching per-atom in `sweepModel` — an un-allowlisted atom is **left behind its version**
+> at boot and fails closed only on an actual READ (where the requester sees the 403), so the
+> server still boots. Testing the migration path also required injecting a behind-version atom
+> via `--import-all` (the eager dev sweep otherwise migrates everything before locked boot).
+>
+> **Scoped / deferred, stated plainly:** (1) **Locked-mode only.** (2) Hook/migration atoms are
+> already dangerous-write models (Phase 1), so add/modify already needs the change-request path
+> (Phase 7). (3) Hook `patch`/`upsert` still runs under the hook's own grants — unchanged. (4)
+> Only the **single-atom read** path brings atoms forward, so a *list* of behind atoms returns
+> their raw (un-transformed) prior shape rather than failing closed — the unvetted transform
+> still never runs, which is the security property; surfacing list-side staleness is cosmetic.
 
 Hook/migration `run` is already locked to safe basenames. In locked mode, add an explicit
 allowlist:
@@ -469,13 +619,13 @@ metadata first.
 
 ## Implementation order (ranked by leak-size-to-code)
 
-1. `ATOMIC_MODE` + locked boot checks (Phase 0).
-2. **Close the bulk-export hole + dangerous-write guard (Phase 1)** — biggest leak, least code.
-3. Field `sensitivity` + restricted redaction (Phase 2).
-4. Purpose parsing + purpose-bound restricted reads (Phase 3).
-5. Bounded `sensitive-read` evidence with fail-closed semantics (Phase 4).
-6. Explicit `export` grant mode + CSV/CLI export audit (Phase 5).
-7. Hook/migration allowlists (Phase 6).
+1. ✅ `ATOMIC_MODE` + locked boot checks (Phase 0).
+2. ✅ **Close the bulk-export hole + dangerous-write guard (Phase 1)** — biggest leak, least code.
+3. ✅ Field `sensitivity` + restricted redaction (Phase 2).
+4. ✅ Purpose parsing + purpose-bound restricted reads (Phase 3).
+5. ✅ Bounded `sensitive-read` evidence with fail-closed semantics (Phase 4).
+6. ✅ Explicit `export` grant mode + CSV/CLI export audit (Phase 5).
+7. ✅ Hook/migration allowlists (Phase 6).
 8. Change-request + approval, with the bootstrap path (Phase 7).
 9. Break-glass (Phase 8).
 10. Legal hold + retention hardening (Phase 9).
