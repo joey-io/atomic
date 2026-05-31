@@ -103,6 +103,16 @@ tbody tr:last-child > td { border-bottom: 0 }
 thead th[data-dir="1"]::after { content: var(--asc); color: var(--accent) }
 thead th[data-dir="-1"]::after { content: var(--desc); color: var(--accent) }
 
+/* inline-editable grid cells — click a cell, type, Tab to the next. A subtle
+   affordance only on the editable ones; saved flashes, conflicts/errors outline. */
+td[data-edit] { cursor: text }
+td[data-edit] select, td[data-edit] input { min-width: 0 }
+td[data-edit] input[type="checkbox"] { cursor: pointer }
+td[contenteditable]:focus { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--surface); border-radius: 4px }
+td[data-busy] { opacity: .5 }
+td[data-saved] { background: var(--accent-weak) }
+td[data-error] { outline: 2px solid #c0392b; outline-offset: -2px }
+
 /* forms — controls and a repeater (<fieldset>) */
 label { font-weight: 500 }
 input, select, textarea {
@@ -190,6 +200,61 @@ const CLIENT = function () {
   // it works on read-only pages too.
   document.querySelectorAll('select[data-nav]').forEach(function (sel) {
     sel.addEventListener('change', function () { if (sel.value) location.href = sel.value; });
+  });
+
+  // inline grid editing — a [data-edit] cell PATCHes its single field on blur/change
+  // with If-Match optimistic concurrency. The update path, per-field grants, and the
+  // version already exist server-side; this is only the wiring. Runs before the form
+  // early-return below, so the grid is editable on list pages with no create form.
+  function cellRaw(td) {
+    var ip = td.querySelector('select, input');
+    return ip ? (ip.type === 'checkbox' ? ip.checked : ip.value) : td.textContent.trim();
+  }
+  function revert(td) {
+    var ip = td.querySelector('select, input'), o = td.getAttribute('data-orig');
+    if (ip && ip.type === 'checkbox') ip.checked = (o === 'true');
+    else if (ip) ip.value = o; else td.textContent = o;
+  }
+  function commitCell(td) {
+    var raw = cellRaw(td);
+    if (td.getAttribute('data-orig') === String(raw)) return;          // unchanged → no write
+    var kind = td.getAttribute('data-kind');
+    var val = (kind === 'number') ? (raw === '' ? null : Number(raw)) : raw;
+    if (kind === 'number' && val !== null && isNaN(val)) { revert(td); td.setAttribute('data-error', '1'); td.title = 'not a number'; return; }
+    var attr = {}; attr[td.getAttribute('data-field')] = val;
+    td.removeAttribute('data-error'); td.removeAttribute('data-saved'); td.setAttribute('data-busy', '1');
+    fetch('/' + td.getAttribute('data-id'), { method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'if-match': td.getAttribute('data-ver') },
+      body: JSON.stringify({ attr: attr }) })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; },
+        function () { return { ok: r.ok, status: r.status, j: {} }; }); })
+      .then(function (res) {
+        td.removeAttribute('data-busy');
+        if (res.ok) {
+          td.setAttribute('data-ver', res.j.lifecycle.version);       // advance version for the next edit
+          td.setAttribute('data-orig', String(raw)); td.removeAttribute('title');
+          td.setAttribute('data-saved', '1'); setTimeout(function () { td.removeAttribute('data-saved'); }, 900);
+        } else if (res.status === 409) {
+          td.setAttribute('data-error', '1'); td.title = 'changed elsewhere — reloading';
+          setTimeout(function () { location.reload(); }, 800);         // someone else won; resync
+        } else {
+          revert(td); td.setAttribute('data-error', '1'); td.title = (res.j && res.j.error) || ('error ' + res.status);
+        }
+      })
+      .catch(function () { td.removeAttribute('data-busy'); revert(td); td.setAttribute('data-error', '1'); td.title = 'network error'; });
+  }
+  document.querySelectorAll('td[data-edit]').forEach(function (td) {
+    td.setAttribute('data-orig', String(cellRaw(td)));
+    var ip = td.querySelector('select, input');
+    if (ip) ip.addEventListener('change', function () { commitCell(td); });
+    else {
+      td.addEventListener('focus', function () { td.setAttribute('data-orig', td.textContent.trim()); td.removeAttribute('data-error'); td.removeAttribute('title'); });
+      td.addEventListener('blur', function () { commitCell(td); });
+      td.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); td.blur(); }     // commit; Tab moves to next cell natively
+        else if (e.key === 'Escape') { e.preventDefault(); td.textContent = td.getAttribute('data-orig'); td.blur(); }
+      });
+    }
   });
 
   // the generated create/edit form (present only when the actor may write here)
@@ -1593,12 +1658,37 @@ async function txBatch(ops, actor) {
 
 function renderTable(modelId, atoms, actor) {
   const m = getAtom(modelId);
-  const cols = m.attr.display?.row || Object.keys(m.attr.fields || {});
+  const fields = m.attr.fields || {};
+  const cols = m.attr.display?.row || Object.keys(fields);
   const head = ['id', ...cols].map((c) => `<th>${esc(c)}</th>`).join('');
-  const rows = atoms.map((a) =>
-    `<tr><td>${link(actor, a.id)}</td>` +
-    cols.map((c) => `<td>${atomValue(a.attr?.[c], actor)}</td>`).join('') + '</tr>').join('');
+  const rows = atoms.map((a) => {
+    const canEditRow = writable(actor, a);   // tenant scope + write rule, once per row
+    return `<tr><td>${link(actor, a.id)}</td>` +
+      cols.map((c) => gridCell(actor, modelId, a, c, fields[c], canEditRow)).join('') + '</tr>';
+  }).join('');
   return `<figure><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></figure>`;
+}
+// one data cell of the grid. Inline-editable — click, type, Tab to the next — when
+// the actor may update this field on this atom and the field is a simple scalar;
+// ref/embed/list/map/json/longtext stay read-only (open the row to edit those). An
+// edit is a single-field PATCH with If-Match (wired in app.js); the per-field grant
+// and optimistic-concurrency version already exist server-side, so this is the spec
+// of "what is editable here" rendered straight from the model + grants.
+function gridCell(actor, modelId, a, c, def, canEditRow) {
+  const v = a.attr?.[c];
+  if (!def || !canEditRow || !allows(actor, `${modelId}.${c}`, 'update'))
+    return `<td>${atomValue(v, actor)}</td>`;
+  const kind = embedOf(def) ? 'embed' : (def.kind || 'text');
+  if (['ref', 'embed', 'list', 'map', 'json', 'longtext'].includes(kind))
+    return `<td>${atomValue(v, actor)}</td>`;
+  const meta = `data-id="${esc(a.id)}" data-field="${esc(c)}" data-ver="${a.lifecycle?.version ?? 0}"`;
+  if (kind === 'enum')
+    return `<td data-edit ${meta}><select>${['', ...(def.values || [])]
+      .map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select></td>`;
+  if (kind === 'boolean')
+    return `<td data-edit ${meta}><input type="checkbox"${v ? ' checked' : ''}></td>`;
+  const dk = (kind === 'number' || kind === 'integer') ? 'number' : 'text';
+  return `<td data-edit contenteditable data-kind="${dk}" ${meta}>${v === undefined || v === null ? '' : esc(v)}</td>`;
 }
 
 // a form to create a session (sign in) — a session is itself an atom

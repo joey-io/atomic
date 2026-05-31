@@ -318,6 +318,19 @@ ok(p5.attr.home.city === 'Town' && p5.attr.work.line1 === '7 Work', 'embed: dott
 const csvOut = await (await J('joey', 'GET', '/person2?as=csv')).text();
 ok(csvOut.includes('home.line1') && csvOut.split('\n').some((l) => l.includes('Town')), 'embed: CSV export emits dotted columns');
 
+// --- grid editor: inline single-field edits (the cells app.js wires to PATCH) ----
+// the model grid renders editable cells only where the actor may update the field.
+const ghtml = await (await J('tk-all', 'GET', '/widget', null, { accept: 'text/html' })).text();
+ok(ghtml.includes('data-edit') && ghtml.includes('contenteditable'), 'grid: editable cells render for a token with update grant');
+const rhtml = await (await J('tk-read', 'GET', '/widget', null, { accept: 'text/html' })).text();
+ok(!rhtml.includes('data-edit'), 'grid: cells are read-only for a token without update grant');
+// an inline edit is exactly a single-field PATCH with If-Match — drive it directly.
+await J('tk-all', 'POST', '/widget', { id: 'gw', attr: { name: 'Grid', size: 1, kind: 'a' } });
+const gv = (await jsonOf('tk-all', '/gw')).lifecycle.version;
+ok(await code('tk-all', 'PATCH', '/gw', { attr: { size: 42 } }, { 'if-match': gv }) === 200, 'grid: single-field edit with a matching If-Match succeeds');
+ok((await jsonOf('tk-all', '/gw')).attr.size === 42, 'grid: the edited cell is persisted');
+ok(await code('tk-all', 'PATCH', '/gw', { attr: { size: 7 } }, { 'if-match': gv }) === 409, 'grid: a stale If-Match is a 409 (the conflict the grid resolves by reloading)');
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();
