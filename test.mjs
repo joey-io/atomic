@@ -349,11 +349,45 @@ ok(await code('tk-all', 'PATCH', '/gw', { attr: { size: 42 } }, { 'if-match': gv
 ok((await jsonOf('tk-all', '/gw')).attr.size === 42, 'grid: the edited cell is persisted');
 ok(await code('tk-all', 'PATCH', '/gw', { attr: { size: 7 } }, { 'if-match': gv }) === 409, 'grid: a stale If-Match is a 409 (the conflict the grid resolves by reloading)');
 
+// --- secondary index: filter / range / sort / paginate pushed into SQL ----------
+// declare a model with filterable + sortable fields, then prove the read is scoped,
+// filtered, ordered, and limited correctly (index path) — and tenant-isolated in SQL.
+await J('joey', 'POST', '/model', { id: 'rec', attr: { label: 'Rec', version: 1, fields: {
+  n: { kind: 'integer', filterable: true, sortable: true },
+  status: { kind: 'enum', values: ['open', 'done'], filterable: true },
+  note: { kind: 'text' } } } });
+for (let i = 0; i < 30; i++) await J('tk-all', 'POST', '/rec', { id: `r1-${i}`, attr: { n: i, status: i % 2 ? 'open' : 'done', note: `r${i}` } });
+for (let i = 0; i < 5; i++) await J('tk2', 'POST', '/rec', { id: `r2-${i}`, attr: { n: 100 + i, status: 'open', note: `t2-${i}` } });
+// equality filter on an indexed field
+const recOpen = await jsonOf('tk-all', '/rec?status=open');
+ok(recOpen.length === 15 && recOpen.every((a) => a.attr.status === 'open'), 'index: equality filter returns the right subset');
+// range filter on an indexed numeric field
+const recHi = await jsonOf('tk-all', '/rec?n>=25');
+ok(recHi.length === 5 && recHi.every((a) => a.attr.n >= 25), 'index: range filter on a numeric field');
+// sort + limit (a page of the largest)
+const recTop = await jsonOf('tk-all', '/rec?sort=-n&limit=3');
+ok(recTop.length === 3 && recTop[0].attr.n === 29 && recTop[2].attr.n === 27, 'index: sort desc + limit');
+const recAsc = await jsonOf('tk-all', '/rec?sort=n&limit=3');
+ok(recAsc[0].attr.n === 0 && recAsc[2].attr.n === 2, 'index: sort asc + limit');
+// filter + sort together
+const recFS = await jsonOf('tk-all', '/rec?status=open&sort=-n');
+ok(recFS.length === 15 && recFS[0].attr.n === 29 && recFS.every((a) => a.attr.status === 'open'), 'index: filter + sort together');
+// tenant scope is enforced inside the index — no cross-tenant leak
+ok(recOpen.every((a) => a.id.startsWith('r1-')), 'index: a filtered read is shard-scoped (no cross-tenant leak)');
+ok((await jsonOf('tk2', '/rec')).length === 5, 'index: t2 sees only its own records');
+// cursor pagination continues past the first page
+const recP1 = await jsonOf('tk-all', '/rec?sort=-n&limit=10');
+const recP2 = await jsonOf('tk-all', `/rec?sort=-n&limit=10&cursor=${recP1[recP1.length - 1].attr.n}`);
+ok(recP1.length === 10 && recP2.length === 10 && recP2[0].attr.n < recP1[recP1.length - 1].attr.n, 'index: cursor pagination continues the page');
+// a filter on an UNindexed field falls back to the scan — still correct
+ok((await jsonOf('tk-all', '/rec?note=r7')).length === 1, 'unindexed filter falls back to the scan (still correct)');
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();
 ok((await jsonOf('joey', '/w1')).attr.name === 'Alpha', 'atom persists across restart');
 ok((await jsonOf('joey', '/p-3')).attr.work.city === 'Metro', 'embedded reusable shape persists across restart');
+ok((await jsonOf('tk-all', '/rec?sort=-n&limit=2'))[0].attr.n === 29, 'secondary index survives restart (persisted, not rebuilt each boot)');
 ok((await jsonOf('tk-all', '/tx-a')).attr.name === 'TxA', '/tx commit is durable across restart (real SQLite COMMIT)');
 ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook-written field persists');
 // the migrated shape is durable — the rewrite was persisted, not recomputed each read

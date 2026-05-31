@@ -380,7 +380,7 @@ let storeGen = 0;
 // Put an atom straight into the store (bootstrap / seed — bypasses checks).
 // Every write funnels a log atom through seed(), so bumping here invalidates
 // the read memos after any mutation, not just direct seeds.
-function seed(atom) { store.set(atom.id, atom); storeGen++; return atom; }
+function seed(atom) { store.set(atom.id, atom); store.setIndex?.(atom.id, shardOf(atom), atom.model, indexRows(atom)); storeGen++; return atom; }
 
 // ---------------------------------------------------------------------------
 // Inverse-edge registry (built from model atoms)
@@ -905,24 +905,63 @@ function sqliteStore() {
   db.exec('CREATE TABLE IF NOT EXISTS atom (id TEXT PRIMARY KEY, shard TEXT NOT NULL, model TEXT NOT NULL, body TEXT NOT NULL)');
   db.exec('CREATE INDEX IF NOT EXISTS atom_by_shard ON atom(shard)');
   db.exec('CREATE INDEX IF NOT EXISTS atom_by_model ON atom(model)');
+  // secondary index over chosen attr fields (+ built-in createdAt/updatedAt): one
+  // opaque (shard, model, field, value, id) row per indexed value. `value` has no
+  // declared affinity, so a number is stored as a number and a string as a string —
+  // within a field (one kind) ordering is correct, so equality, range, AND sort are
+  // all index-backed. The store stays dumb: the KERNEL decides which fields to project.
+  db.exec('CREATE TABLE IF NOT EXISTS idx (shard TEXT, model TEXT, field TEXT, value, id TEXT)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_lookup ON idx(model, field, value, shard, id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_by_id ON idx(id)');
   const cache = new Map();                                   // sql string -> prepared statement
   const prep = (sql) => { let s = cache.get(sql); if (!s) cache.set(sql, s = db.prepare(sql)); return s; };
   const q = {
-    get:   prep('SELECT body FROM atom WHERE id = ?'),
-    has:   prep('SELECT 1 FROM atom WHERE id = ?'),
-    put:   prep('INSERT INTO atom(id, shard, model, body) VALUES(?, ?, ?, ?) ' +
-                'ON CONFLICT(id) DO UPDATE SET shard = excluded.shard, model = excluded.model, body = excluded.body'),
-    del:   prep('DELETE FROM atom WHERE id = ?'),
-    all:   prep('SELECT body FROM atom'),
-    count: prep('SELECT count(*) AS c FROM atom'),
+    get:    prep('SELECT body FROM atom WHERE id = ?'),
+    has:    prep('SELECT 1 FROM atom WHERE id = ?'),
+    put:    prep('INSERT INTO atom(id, shard, model, body) VALUES(?, ?, ?, ?) ' +
+                 'ON CONFLICT(id) DO UPDATE SET shard = excluded.shard, model = excluded.model, body = excluded.body'),
+    del:    prep('DELETE FROM atom WHERE id = ?'),
+    all:    prep('SELECT body FROM atom'),
+    count:  prep('SELECT count(*) AS c FROM atom'),
+    idxDel: prep('DELETE FROM idx WHERE id = ?'),
+    idxIns: prep('INSERT INTO idx(shard, model, field, value, id) VALUES(?, ?, ?, ?, ?)'),
+    idxCnt: prep('SELECT count(*) AS c FROM idx'),
   };
   return {
     get(id)      { const r = q.get.get(id); return r ? parseLine(r.body) : undefined; },
     set(id, a)   { q.put.run(id, shardOf(a), a.model, serializeLine(a)); },
     has(id)      { return !!q.has.get(id); },
-    delete(id)   { q.del.run(id); },
+    delete(id)   { q.del.run(id); q.idxDel.run(id); },
     values()     { return q.all.all().map((r) => parseLine(r.body)); },
     get size()   { return Number(q.count.get().c); },
+    // replace the secondary-index rows for one atom (rows = [{field, value}]).
+    setIndex(id, shard, model, rows) {
+      q.idxDel.run(id);
+      for (const r of rows) q.idxIns.run(shard, model, r.field, r.value, id);
+    },
+    indexCount() { return Number(q.idxCnt.get().c); },
+    // an index-backed page: scoped + filtered + sorted + limited entirely in SQL, so
+    // a read never materializes the model's full set. `anchorField` drives the order
+    // (always an indexed field); each filter is an id-membership probe on idx. A
+    // value-only cursor continues the page (ties at the boundary value are tolerated,
+    // matching the existing index pagination). Returns [{ body, cursor }].
+    page({ shards, model, anchorField, anchorDesc, filters, cursor, limit }) {
+      const w = ['x.model = ?', 'x.field = ?'], p = [model, anchorField];
+      if (shards) { w.push(`x.shard IN (${shards.map(() => '?').join(', ')})`); p.push(...shards); }
+      for (const f of filters) {
+        const sub = ['model = ?', 'field = ?'], sp = [model, f.field];
+        if (shards) { sub.push(`shard IN (${shards.map(() => '?').join(', ')})`); sp.push(...shards); }
+        if (f.op === '=' && Array.isArray(f.val)) { sub.push(`value IN (${f.val.map(() => '?').join(', ')})`); sp.push(...f.val); }
+        else { sub.push(`value ${f.op} ?`); sp.push(f.val); }
+        w.push(`x.id IN (SELECT id FROM idx WHERE ${sub.join(' AND ')})`); p.push(...sp);
+      }
+      if (cursor != null) { w.push(anchorDesc ? 'x.value < ?' : 'x.value > ?'); p.push(cursor); }
+      const dir = anchorDesc ? 'DESC' : 'ASC';
+      const sql = `SELECT a.body AS body, x.value AS av FROM idx x JOIN atom a ON a.id = x.id`
+        + ` WHERE ${w.join(' AND ')} ORDER BY x.value ${dir}, x.id ${dir} LIMIT ?`;
+      p.push(limit);
+      return prep(sql).all(...p).map((r) => ({ body: parseLine(r.body), cursor: r.av }));
+    },
     // scoped read: pushes the tenant (shard) and type (model) filters into SQL so a
     // read hits the atom_by_shard / atom_by_model indexes and never materializes
     // atoms outside its scope — this is what holds up at billions of atoms/tenant.
@@ -944,7 +983,27 @@ function sqliteStore() {
   };
 }
 store = ROOT ? sqliteStore() : memStore();
-function persist(atom) { store.set(atom.id, atom); storeGen++; } // durable write-back; bumps the read-memo gen
+// secondary-index projection for one atom: built-in createdAt/updatedAt plus every
+// attr field the model declares `filterable`/`sortable`. Scalars only; a retired
+// atom projects nothing (so it leaves the index). Under ATOMIC_KEY a value is stored
+// as a keyed hash (blind index) — equality survives, order/range do not.
+const blind = (v) => sha256(KEY.toString('hex') + '\0' + String(v));
+function indexRows(atom) {
+  if (atom.lifecycle?.status === 'retired') return [];
+  const rows = [];
+  const lc = atom.lifecycle || {};
+  for (const f of ['createdAt', 'updatedAt']) if (lc[f] != null) rows.push({ field: f, value: KEY ? blind(lc[f]) : lc[f] });
+  let model; try { model = store.get(refId(atom.model)); } catch { model = null; }
+  for (const [f, def] of Object.entries(model?.attr?.fields || {})) {
+    if (!def || typeof def !== 'object' || !(def.filterable || def.sortable)) continue;
+    const v = atom.attr?.[f];
+    if (v == null || typeof v === 'object') continue;            // scalars only
+    rows.push({ field: f, value: KEY ? blind(v) : v });
+  }
+  return rows;
+}
+// durable write-back; also refreshes the atom's secondary-index rows. Bumps the gen.
+function persist(atom) { store.set(atom.id, atom); store.setIndex?.(atom.id, shardOf(atom), atom.model, indexRows(atom)); storeGen++; }
 
 // --- Transactions. A batch of mutations that commits all-or-nothing. The store
 // driver supplies begin/commit/rollback (SQLite's native transaction; a deep
@@ -1256,17 +1315,22 @@ function retire(id, actor) {
 // ---------------------------------------------------------------------------
 
 function parseQuery(search) {
-  const filters = []; let sort = null, as = null;
-  for (const part of search.replace(/^\?/, '').split('&').filter(Boolean)) {
+  const filters = []; let sort = null, as = null, limit = null, cursor = null;
+  for (const raw of search.replace(/^\?/, '').split('&').filter(Boolean)) {
+    // decode the whole part FIRST, so URL-encoded comparison operators survive: the
+    // WHATWG URL parser percent-encodes `>`/`<` (→ %3E/%3C), and matching the operator
+    // on the encoded text would misread `n>=25` as field `n>` with op `=`.
+    let part; try { part = decodeURIComponent(raw); } catch { part = raw; }
     const m = part.match(/^([^<>=]+)(>=|<=|>|<|=)(.*)$/);
     if (!m) continue;
-    const [, rawK, op, rawV] = m;
-    const k = decodeURIComponent(rawK), v = decodeURIComponent(rawV);
-    if (k === 'sort') { sort = v; continue; }
-    if (k === 'as')   { as = v; continue; }
+    const [, k, op, v] = m;
+    if (k === 'sort')   { sort = v; continue; }
+    if (k === 'as')     { as = v; continue; }
+    if (k === 'limit')  { limit = Number(v) || null; continue; }
+    if (k === 'cursor') { cursor = v; continue; }
     filters.push({ field: k, op, val: v });
   }
-  return { filters, sort, as };
+  return { filters, sort, as, limit, cursor };
 }
 
 // read a sortable/filterable value from attr, falling back to lifecycle
@@ -1426,10 +1490,60 @@ function sortBy(atoms, sort) {
   });
 }
 
+// Is this model field index-backed? Built-in createdAt/updatedAt, or a field the
+// model declares `filterable`/`sortable`.
+function indexedField(modelId, field) {
+  if (field === 'createdAt' || field === 'updatedAt') return true;
+  let m; try { m = store.get(modelId); } catch { return false; }
+  const def = m?.attr?.fields?.[field];
+  return !!(def && typeof def === 'object' && (def.filterable || def.sortable));
+}
+const numericField = (modelId, field) => {
+  let m; try { m = store.get(modelId); } catch { return false; }
+  const def = m?.attr?.fields?.[field];
+  return !!(def && (def.kind === 'number' || def.kind === 'integer'));
+};
+
+// Index-backed read: scope + filters + sort + limit pushed entirely into SQL, so a
+// read never materializes the model's full set — the lever for 100M-row models.
+// Returns the page of redacted atoms, or null when the query isn't index-eligible,
+// in which case the caller scans (the correctness oracle). Eligible = the store
+// supports paging, the sort + every filter field is indexed, and (under encryption,
+// where values are blind-hashed) the query is equality-only.
+function indexedRead(modelId, { filters = [], sort = null, limit = null, cursor = null }, actor) {
+  if (!store.page) return null;                                  // memStore → scan
+  const sortField = sort ? sort.replace(/^-/, '') : null;
+  if (sortField && !indexedField(modelId, sortField)) return null;
+  if (filters.some((f) => f.field === 'q' || !indexedField(modelId, f.field))) return null;
+  if (KEY && (sortField || filters.some((f) => f.op !== '='))) return null;   // blind index: equality only
+  const ut = tenantOf(actor);
+  const shards = ut === null ? null : ['_global', ut];
+  const anchorField = sortField || 'createdAt';
+  const anchorDesc = sort ? sort.startsWith('-') : true;          // default: newest first
+  const cast = (field, s) => KEY ? blind(s) : (numericField(modelId, field) ? Number(s) : s);
+  const typed = filters.map((f) => (f.op === '=' && String(f.val).includes(','))
+    ? { field: f.field, op: f.op, val: String(f.val).split(',').map((s) => cast(f.field, s)) }
+    : { field: f.field, op: f.op, val: cast(f.field, f.val) });
+  const want = Math.min(limit || 500, 1000);
+  // over-fetch a margin so per-actor read rules (which the index can't apply) can
+  // drop rows without under-filling the page; then gate exactly like the scan path.
+  const page = store.page({ shards, model: ref(modelId), anchorField, anchorDesc, filters: typed,
+    cursor: cursor == null ? null : cast(anchorField, cursor), limit: want * 3 + 10 });
+  const out = [];
+  for (const { body } of page) {
+    if (out.length >= want) break;
+    if (body.model === 'atom://session' || !visible(actor, body) || !readableAtom(actor, body)) continue;
+    out.push(redact(actor, body));
+  }
+  return out;
+}
+
 function listModel(modelId, q, actor) {
   if (!canOp(actor, modelId, 'read')) return []; // no read grant -> no listing
-  // model + tenant scope both pushed into the store (the atom_by_model / atom_by_shard
-  // indexes), so listing one type reads only that type's rows in the actor's scope.
+  const idx = indexedRead(modelId, q, actor);
+  if (idx) return idx;                            // index-backed page (never materializes the full set)
+  // fallback scan — an unindexed filter/sort field, root scope, or memStore. model +
+  // tenant scope are still pushed into the store (atom_by_model / atom_by_shard).
   const ut = tenantOf(actor);
   const shards = ut === null ? null : ['_global', ut];
   let atoms = store.query({ shards, model: ref(modelId) }).filter(
@@ -1449,6 +1563,31 @@ function runIndex(indexAtom, search, actor) {
   const all = over === 'atom';                 // pseudo-model atom://atom = every atom
   const params = new URLSearchParams(search);
   const match = indexAtom.attr.match || {};
+  const sorts = indexAtom.attr.sort || [];
+  const pg = indexAtom.attr.page;
+  // Fast path: a single-model index whose match is simple equality and whose sort is
+  // a single indexed field maps straight onto the secondary index — pushed into SQL,
+  // never materializing the model's set. atom://atom (cross-model) always scans.
+  if (!all) {
+    const filters = []; let eligible = true;
+    for (const [field, cond] of Object.entries(match)) {
+      if (typeof cond === 'string' && cond.startsWith('params.')) {
+        const v = params.get(cond.slice('params.'.length));
+        if (v == null) { eligible = false; break; }
+        filters.push({ field, op: '=', val: v });
+      } else if (cond && typeof cond === 'object' && Array.isArray(cond.in)) {
+        filters.push({ field, op: '=', val: cond.in.join(',') });
+      } else filters.push({ field, op: '=', val: String(cond) });
+    }
+    const sort = sorts.length === 1 ? (() => { const [f, d] = Object.entries(sorts[0])[0]; return d === 'desc' ? `-${f}` : f; })() : null;
+    const sortField = sort ? sort.replace(/^-/, '') : null;
+    if (eligible && sorts.length <= 1 && (!pg || pg.cursor === sortField)) {
+      const idx = indexedRead(over, { filters, sort,
+        limit: Number(params.get('limit')) || pg?.limit || (pg ? 25 : null),
+        cursor: pg ? params.get('before') : null }, actor);
+      if (idx) return idx;
+    }
+  }
   // scope the scan to the index's model AND the actor's shards — the same
   // index-backed lever listModel uses — instead of materializing every atom in
   // scope just to drop all but one model. atom://atom legitimately spans every
@@ -1469,12 +1608,11 @@ function runIndex(indexAtom, search, actor) {
       atoms = atoms.filter((a) => fieldVal(a, field) === cond);
     }
   }
-  for (const s of indexAtom.attr.sort || []) {
+  for (const s of sorts) {
     const [field, dir] = Object.entries(s)[0];
     atoms = sortBy(atoms, dir === 'desc' ? `-${field}` : field);
   }
-  const pg = indexAtom.attr.page;             // paginate by a date cursor + limit
-  if (pg) {
+  if (pg) {                                   // paginate by a date cursor + limit
     const before = params.get('before');
     if (before) atoms = atoms.filter((a) => String(fieldVal(a, pg.cursor)) < before);
     atoms = atoms.slice(0, Number(params.get('limit')) || pg.limit || 25);
@@ -2466,6 +2604,16 @@ if (process.env.ATOMIC_ADMIN_SECRET) {
     const h = sha256(process.env.ATOMIC_ADMIN_SECRET);
     if (joey.attr.secret !== h) { joey.attr.secret = h; persist(joey); }
   }
+}
+
+// Backfill the secondary index for a store written before it existed (a fresh
+// bootstrap already indexed as it seeded, so this is a one-time upgrade step). If
+// the index is empty but atoms exist, project every atom once, in one transaction.
+if (store.indexCount && store.size > 0 && store.indexCount() === 0) {
+  store.begin?.();
+  try { for (const a of store.values()) store.setIndex(a.id, shardOf(a), a.model, indexRows(a)); store.commit?.(); }
+  catch (e) { store.rollback?.(); throw e; }
+  console.log(`indexed ${store.size} atoms into the secondary index`);
 }
 
 if (process.argv.includes('--audit')) process.exit(audit()); // governance check, then stop — never listens
