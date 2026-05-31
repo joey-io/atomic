@@ -289,6 +289,13 @@ const now = () => new Date().toISOString();
 const isRef = (v) => typeof v === 'string' && v.startsWith('atom://');
 const refId = (v) => v.slice('atom://'.length);
 const ref   = (id) => `atom://${id}`;
+// an embed field inlines another model's shape, by reference — the reusable-shape
+// mechanism. Two spellings: the string shorthand `'embed://<model>'`, or the object
+// form `{ kind: 'embed', of: 'atom://<model>', required? }` (which can also be required).
+// embedOf(def) returns the embedded model id (bare), or null if def isn't an embed.
+const embedOf = (def) =>
+  typeof def === 'string' ? (def.startsWith('embed://') ? def.slice('embed://'.length) : null)
+  : (def && def.kind === 'embed' && def.of) ? (isRef(def.of) ? refId(def.of) : def.of) : null;
 
 class Err extends Error { constructor(code, msg) { super(msg); this.code = code; } }
 
@@ -396,10 +403,19 @@ function validate(modelId, attr) {
   const fields = m.attr.fields || {};
   const out = {};
   for (const [key, def] of Object.entries(fields)) {
-    // embed://x shorthand — inline another model's fields
-    if (typeof def === 'string' && def.startsWith('embed://')) {
-      const sub = def.slice('embed://'.length);
-      if (attr[key] !== undefined) out[key] = validate(sub, attr[key]); // returns plain object
+    // an embed inlines another model's shape (string shorthand or { kind:'embed', of, required }).
+    // A required embed must be present; when present it must be an object, and its own
+    // required fields are enforced by the recursive validate — required propagates inward.
+    const sub = embedOf(def);
+    if (sub) {
+      const ev = attr[key];
+      if (ev === undefined) {
+        if (def.required) throw new Err(400, `missing required field "${key}"`);
+        continue;
+      }
+      if (typeof ev !== 'object' || ev === null || Array.isArray(ev))
+        throw new Err(400, `field "${key}" must be an embedded ${sub} object`);
+      out[key] = validate(sub, ev); // returns a plain, validated object
       continue;
     }
     let val = attr[key];
@@ -1424,14 +1440,30 @@ const csvCell = (v) => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 const csvRow = (cells) => cells.map(csvCell).join(',');
-const modelCols = (modelAtom) => Object.keys(modelAtom.attr.fields || {});
+// CSV columns: an embed field flattens into dotted sub-columns (one level per embed,
+// recursively) so a reusable shape is first-class in a spreadsheet — address.street,
+// address.city, … — not one opaque JSON blob. Every non-embed field is one column.
+function csvColumns(modelAtom, prefix = '', depth = 0) {
+  const cols = [];
+  for (const [k, def] of Object.entries(modelAtom.attr.fields || {})) {
+    const sub = embedOf(def);
+    if (sub && depth < 6) cols.push(...csvColumns(getAtom(sub), `${prefix}${k}.`, depth + 1));
+    else cols.push(prefix + k);
+  }
+  return cols;
+}
+const dotGet = (obj, parts) => parts.reduce((o, p) => (o == null ? undefined : o[p]), obj);
 // header-only template: the shape to fill in for import
-const templateCsv = (modelAtom) => csvRow(['id', 'manifest', ...modelCols(modelAtom)]) + '\n';
-// the field-kind map an importer uses to coerce each cell (embed → a json object)
-function fieldKinds(modelAtom) {
+const templateCsv = (modelAtom) => csvRow(['id', 'manifest', ...csvColumns(modelAtom)]) + '\n';
+// the kind map an importer uses to coerce each cell, keyed by (possibly dotted) column
+// name — an embed's sub-columns are coerced by the sub-model's own field kinds.
+function csvKinds(modelAtom, prefix = '', depth = 0) {
   const out = {};
-  for (const [k, def] of Object.entries(modelAtom.attr.fields || {}))
-    out[k] = (typeof def === 'string' && def.startsWith('embed://')) ? 'json' : (def.kind || 'text');
+  for (const [k, def] of Object.entries(modelAtom.attr.fields || {})) {
+    const sub = embedOf(def);
+    if (sub && depth < 6) Object.assign(out, csvKinds(getAtom(sub), `${prefix}${k}.`, depth + 1));
+    else out[prefix + k] = (typeof def === 'string') ? 'text' : (def.kind || 'text');
+  }
   return out;
 }
 // export a set of atoms. modelId null → cross-model (an index over atom://atom).
@@ -1441,9 +1473,9 @@ function atomsCsv(modelId, atoms) {
     for (const a of atoms) lines.push(csvRow([a.id, refId(a.model), a.manifest || '', a.lifecycle?.createdAt || '']));
     return lines.join('\n') + '\n';
   }
-  const cols = modelCols(getAtom(modelId));
+  const cols = csvColumns(getAtom(modelId));
   const lines = [csvRow(['id', 'manifest', ...cols])];
-  for (const a of atoms) lines.push(csvRow([a.id, a.manifest || '', ...cols.map((c) => a.attr?.[c])]));
+  for (const a of atoms) lines.push(csvRow([a.id, a.manifest || '', ...cols.map((c) => dotGet(a.attr, c.split('.')))]));
   return lines.join('\n') + '\n';
 }
 
@@ -1472,12 +1504,19 @@ function coerceCsv(kind, raw) {
   if (kind === 'json' || kind === 'map' || kind === 'list') { try { return JSON.parse(raw); } catch { return raw; } }
   return raw; // text/email/url/uuid/ref/datetime/enum pass through as-is
 }
-// a CSV (id, manifest, then fields) → create bodies, coercing each cell by kind
+// set a value at a (possibly dotted) path, creating intermediate objects as needed
+function dotSet(obj, parts, val) {
+  let o = obj;
+  for (let i = 0; i < parts.length - 1; i++) o = (o[parts[i]] ??= {});
+  o[parts[parts.length - 1]] = val;
+}
+// a CSV (id, manifest, then fields / dotted sub-fields) → create bodies, coercing each
+// cell by its column kind. A dotted header (address.city) rebuilds the embedded object.
 function csvToBodies(modelId, text) {
   const rows = parseCsvText(text);
   if (rows.length < 2) return [];
   const header = rows[0].map((h) => h.trim());
-  const kinds = fieldKinds(getAtom(modelId));
+  const kinds = csvKinds(getAtom(modelId));
   const bodies = [];
   for (let r = 1; r < rows.length; r++) {
     const cells = rows[r];
@@ -1487,7 +1526,7 @@ function csvToBodies(modelId, text) {
       const v = cells[ci]; if (v === undefined || v === '') return;
       if (h === 'id') body.id = v;
       else if (h === 'manifest') body.manifest = v;
-      else { const cv = coerceCsv(kinds[h] || 'text', v); if (cv !== undefined) body.attr[h] = cv; }
+      else { const cv = coerceCsv(kinds[h] || 'text', v); if (cv !== undefined) dotSet(body.attr, h.split('.'), cv); }
     });
     bodies.push(body);
   }
@@ -1583,7 +1622,8 @@ function renderForm(modelId, atom, actor) {
   // the stack: past the limit, the field falls back to a raw JSON textarea.
   function control(name, def, v, depth = 0) {
     if (depth > 8) return json(name, v);
-    if (typeof def === 'string' && def.startsWith('embed://')) return embed(name, def.slice('embed://'.length), v || {}, depth);
+    const sub = embedOf(def);
+    if (sub) return embed(name, sub, v || {}, depth);
     if (def.kind === 'enum')
       return `<select name="${esc(name)}"><option value="">—</option>${def.values.map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
     if (def.kind === 'boolean')

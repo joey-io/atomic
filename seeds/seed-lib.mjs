@@ -104,7 +104,8 @@ export async function defineModels() {
   await model('advocate', 'Advocate', {
     name: { kind: 'text', required: true },
     email: { kind: 'email' },
-    address: 'embed://address',
+    address: 'embed://address',                          // home address — geocoded by the census hook (string shorthand)
+    mailing: { kind: 'embed', of: 'atom://address' },    // optional second address — the SAME shape, reused by reference (object form)
     cd: { kind: 'ref', to: 'atom://census', inverse: 'residents' }, // congressional district, linked by the census hook
     district: { kind: 'ref', to: 'atom://district', inverse: 'advocates' },
   }, {}, { create: ['atom://census-district'], update: ['atom://census-district'] });

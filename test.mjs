@@ -287,10 +287,42 @@ const best = await (await J('tk-all', 'POST', '/widget', [
 ])).json();
 ok(best.imported === 1 && best.failed.length === 1, 'default import stays per-row best-effort');
 
+// --- reusable shapes: embed://<model> as a first-class, shared schema fragment --
+// addr2 is a shape; person2 reuses it under TWO fields — `home` (object form,
+// required) and `work` (string shorthand). One shape, referenced twice.
+await J('joey', 'POST', '/model', { id: 'addr2', attr: { label: 'Addr2', version: 1, fields: {
+  line1: { kind: 'text', required: true }, city: { kind: 'text' }, zip: { kind: 'text' } } } });
+await J('joey', 'POST', '/model', { id: 'person2', attr: { label: 'Person2', version: 1, fields: {
+  name: { kind: 'text', required: true },
+  home: { kind: 'embed', of: 'atom://addr2', required: true },   // object form, required
+  work: 'embed://addr2',                                          // string shorthand — SAME shape reused
+} } });
+// required-propagation: a required embed must be present, and its inner required fields propagate
+ok(await code('joey', 'POST', '/person2', { id: 'p-1', attr: { name: 'A' } }) === 400, 'embed: required embedded shape enforced (home missing)');
+ok(await code('joey', 'POST', '/person2', { id: 'p-1', attr: { name: 'A', home: { city: 'X' } } }) === 400, 'embed: inner required field propagates (home.line1)');
+ok(await code('joey', 'POST', '/person2', { id: 'p-1', attr: { name: 'A', home: { line1: '1 Main', city: 'X' } } }) === 201, 'embed: valid required embed accepted');
+ok(await code('joey', 'POST', '/person2', { id: 'p-2', attr: { name: 'B', home: 'oops' } }) === 400, 'embed: a scalar where an embedded object is expected is rejected');
+// reuse: the SAME addr2 shape under a second field
+ok(await code('joey', 'POST', '/person2', { id: 'p-3', attr: { name: 'C', home: { line1: '2 Oak' }, work: { line1: '9 Office', city: 'Metro' } } }) === 201, 'embed: same shape reused under a second field');
+ok((await jsonOf('joey', '/p-3')).attr.work.city === 'Metro', 'embed: reused shape value round-trips');
+// CSV: an embed flattens into dotted columns, not one opaque JSON blob
+const tmpl = await (await J('joey', 'GET', '/person2?as=template')).text();
+ok(tmpl.includes('home.line1') && tmpl.includes('work.city'), 'embed: CSV template flattens the shape into dotted columns');
+// a dotted CSV import rebuilds the nested objects
+const impRes = await fetch(base + '/person2', { method: 'POST', headers: { authorization: 'Bearer joey', 'content-type': 'text/csv' },
+  body: 'id,manifest,name,home.line1,home.city,work.line1\np-5,,Dot,5 Pine,Town,7 Work\n' });
+ok(impRes.status === 200, 'embed: dotted CSV import accepted');
+const p5 = await jsonOf('joey', '/p-5');
+ok(p5.attr.home.city === 'Town' && p5.attr.work.line1 === '7 Work', 'embed: dotted CSV import reconstructs the nested shape');
+// and export emits those dotted columns too (round-trip)
+const csvOut = await (await J('joey', 'GET', '/person2?as=csv')).text();
+ok(csvOut.includes('home.line1') && csvOut.split('\n').some((l) => l.includes('Town')), 'embed: CSV export emits dotted columns');
+
 // --- persistence across restart ----------------------------------------------
 srv.kill(); await new Promise((r) => setTimeout(r, 300));
 srv = start(); await wait();
 ok((await jsonOf('joey', '/w1')).attr.name === 'Alpha', 'atom persists across restart');
+ok((await jsonOf('joey', '/p-3')).attr.work.city === 'Metro', 'embedded reusable shape persists across restart');
 ok((await jsonOf('tk-all', '/tx-a')).attr.name === 'TxA', '/tx commit is durable across restart (real SQLite COMMIT)');
 ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook-written field persists');
 // the migrated shape is durable — the rewrite was persisted, not recomputed each read
