@@ -757,5 +757,59 @@ hsrv.kill(); await new Promise((r) => setTimeout(r, 200));
 rmSync(HSTORE, { recursive: true, force: true });
 rmSync('/tmp/atomic-g6.ndjson', { force: true });
 
+// =============================================================================
+// Phase 7 — change requests + approval (maker-checker). The dangerous-write guard blocks
+// direct edits to governance atoms; this is the sanctioned path. Built in dev (tokens are
+// dangerous atoms), rebooted locked. A maker FILES a change; a DIFFERENT approver applies it
+// through the normal write path under their own authority.
+// =============================================================================
+const CPORT = 7794, CSTORE = '/tmp/atomic-cr-store', cbase = `http://localhost:${CPORT}`;
+const CSEC = { joey: ADMIN };
+const cenv = (extra = {}) => ({ ...process.env, PORT: CPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_STORE: CSTORE, ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
+const startC = (extra = {}) => spawn('node', ['atomic.mjs'], { env: cenv(extra), stdio: 'ignore' });
+const CJ = (tok, method, p, body) => fetch(cbase + p, { method, headers: { ...(CSEC[tok] ? { authorization: 'Bearer ' + CSEC[tok] } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const ccode = (tok, method, p, body) => CJ(tok, method, p, body).then((r) => r.status);
+const cjson = (tok, p) => CJ(tok, 'GET', p).then((r) => r.json());
+const waitC = async () => { for (let i = 0; i < 50; i++) { try { await fetch(cbase + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+const mkTokC = async (body) => { const j = await (await CJ('joey', 'POST', '/token', body)).json(); if (j.id && j.secret) CSEC[j.id] = j.secret; return j; };
+
+rmSync(CSTORE, { recursive: true, force: true });
+let csrv = startC(); await waitC();
+// maker may file change-requests + read tokens; approver may approve + write tokens; target is edited
+await mkTokC({ id: 'maker', attr: { email: 'mk@x.com', grants: [{ path: 'change-request.*', mode: 'all' }, { path: 'token.*', mode: 'read' }] } });
+await mkTokC({ id: 'approver', attr: { email: 'ap@x.com', grants: [{ path: 'approval.*', mode: 'all' }, { path: 'change-request.*', mode: 'read' }, { path: 'token.*', mode: 'all' }] } });
+// target holds no grants the approver lacks — apply runs attenuate under the approver, which
+// requires the approver to cover the resulting atom's grants (separation of duties).
+await mkTokC({ id: 'target', attr: { email: 'before@x.com' } });
+csrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+csrv = startC({ ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY }); await waitC();
+// a direct edit of a token (a dangerous atom) is blocked in locked mode — even for the approver
+ok(await ccode('approver', 'PATCH', '/target', { attr: { email: 'direct@x.com' } }) === 403, 'cr: a direct edit of a governance atom is blocked (the guard)');
+// the maker files a change-request to update the target token's email
+const cr = await (await CJ('maker', 'POST', '/change-request', { attr: { target: 'atom://target', op: 'update', after: { email: 'approved@x.com' }, reason: 'rotate contact' } })).json();
+ok(cr.id && cr.attr.status === 'submitted' && Array.isArray(cr.attr.diff) && cr.attr.diff.length > 0, 'cr: a filed change-request is submitted and shows a diff');
+ok(cr.attr.before && cr.attr.before.email === 'before@x.com', 'cr: the change-request captures the before-state');
+// a change-request with no diff is refused
+ok(await ccode('maker', 'POST', '/change-request', { attr: { target: 'atom://target', op: 'update', after: { email: 'before@x.com' } } }) === 400, 'cr: a change-request with no diff is refused');
+// the maker cannot approve their own change
+ok(await ccode('maker', 'POST', '/approval', { attr: { change: 'atom://' + cr.id, decision: 'approved' } }) === 403, 'cr: the maker cannot approve their own change');
+ok((await cjson('approver', '/target')).attr.email === 'before@x.com', 'cr: the target is unchanged before approval');
+// a DIFFERENT approver approves → the change applies through the normal write path
+const appr = await (await CJ('approver', 'POST', '/approval', { attr: { change: 'atom://' + cr.id, decision: 'approved', reason: 'ok' } })).json();
+ok(appr.id && appr.attr.decision === 'approved' && appr.attr.approver === 'atom://approver', 'cr: a different approver records an approval');
+ok((await cjson('approver', '/target')).attr.email === 'approved@x.com', 'cr: the approved change is applied to the target via the normal write path');
+ok((await cjson('approver', '/' + cr.id)).attr.status === 'applied', 'cr: the change-request is marked applied');
+// an already-applied change cannot be re-approved
+ok(await ccode('approver', 'POST', '/approval', { attr: { change: 'atom://' + cr.id, decision: 'approved' } }) === 409, 'cr: an already-applied change cannot be re-approved');
+
+// a rejected change is retained and never touches the target
+const cr2 = await (await CJ('maker', 'POST', '/change-request', { attr: { target: 'atom://target', op: 'update', after: { email: 'nope@x.com' } } })).json();
+await CJ('approver', 'POST', '/approval', { attr: { change: 'atom://' + cr2.id, decision: 'rejected', reason: 'no' } });
+ok((await cjson('approver', '/' + cr2.id)).attr.status === 'rejected', 'cr: a rejected change-request is retained as rejected');
+ok((await cjson('approver', '/target')).attr.email === 'approved@x.com', 'cr: a rejected change does not touch the target');
+csrv.kill(); await new Promise((r) => setTimeout(r, 200));
+rmSync(CSTORE, { recursive: true, force: true });
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

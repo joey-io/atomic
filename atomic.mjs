@@ -1450,8 +1450,8 @@ function guardDangerous(modelRef, op) {
     throw new Err(403, `locked mode: cannot ${op} ${modelRef} directly — governance atoms change only through an approved change request (POST /change-request) or active break-glass`);
 }
 
-async function create(modelId, body, actor) {
-  guardDangerous(ref(modelId), 'create');
+async function create(modelId, body, actor, viaApproval = false) {
+  if (!viaApproval) guardDangerous(ref(modelId), 'create');   // an approved change-request is the sanctioned bypass (Phase 7)
   const modelAtom = await getAtom(modelId);
   const fields = Object.keys(body.attr || {});
   // a baseline create grant on the model is required even for an all-default/empty
@@ -1548,10 +1548,10 @@ async function create(modelId, body, actor) {
 // keep the atom's id and provenance (createdAt/createdBy), bump the version, and
 // append to the ledger — the only differences are the next-attr expression and
 // the log op label, so they share one body.
-async function writeAtom(id, body, actor, ifMatch, mode) {
+async function writeAtom(id, body, actor, ifMatch, mode, viaApproval = false) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
-  guardDangerous(atom.model, mode);
+  if (!viaApproval) guardDangerous(atom.model, mode);   // an approved change-request is the sanctioned bypass (Phase 7)
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
   for (const f of fields) if (!await allows(actor, `${modelId}.${f}`, 'update'))
@@ -1696,14 +1696,87 @@ async function retireWithRefs(atom, actor, seen) {
   return atom;
 }
 
-async function retire(id, actor) {
+async function retire(id, actor, viaApproval = false) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
-  guardDangerous(atom.model, 'delete');
+  if (!viaApproval) guardDangerous(atom.model, 'delete');   // an approved change-request is the sanctioned bypass (Phase 7)
   if (!await canOp(actor, refId(atom.model), 'delete'))
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
   if (!await writable(actor, atom)) throw new Err(403, `cannot delete ${refId(atom.model)} (tenant scope or write rule)`);
   return tx(() => retireWithRefs(atom, actor, new Set()));    // all-or-nothing across the cascade
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 — change requests + approval (maker-checker). The dangerous-write guard blocks
+// direct edits to governance atoms; this is the sanctioned path. A maker FILES a change,
+// a DIFFERENT approver applies it through the normal write path — re-validating, checking
+// the approver's grants, attenuating, and logging — bypassing only the guard.
+// ---------------------------------------------------------------------------
+
+// File a change-request: capture the target's before-state and the diff (a change MUST show
+// one) under the maker's own create grant. change-request is not a dangerous atom, so this
+// works in locked mode. Status starts 'submitted'.
+async function submitChange(body, actor) {
+  const attr = body.attr || {};
+  const op = attr.op;
+  if (!['create', 'update', 'replace', 'delete'].includes(op)) throw new Err(400, 'op must be create | update | replace | delete');
+  const target = isRef(attr.target) ? refId(attr.target) : attr.target;
+  if (!target) throw new Err(400, 'change-request needs a target (an atom id, or a model id for create)');
+  let before = {};
+  if (op !== 'create') {
+    const t = await getAtom(target);                       // 404 if the target is gone
+    if (!await visible(actor, t)) throw new Err(404, `no atom ${target}`);
+    before = t.attr || {};
+  }
+  const after = attr.after || {};
+  // the diff is what the op WOULD change. `update` merges, so only the fields named in
+  // `after` count (comparing the full before would flag every field the merge leaves alone);
+  // `replace`/`create` set the whole attr, so compare it all.
+  let diff;
+  if (op === 'delete') diff = [{ path: 'status', from: 'active', to: 'retired' }];
+  else if (op === 'update') { const rel = {}; for (const k of Object.keys(after)) rel[k] = before[k]; diff = changeset(rel, after); }
+  else diff = changeset(before, after);
+  if (!diff.length) throw new Err(400, 'change-request must show a diff (before === after)');
+  return await create('change-request', { attr: { target, op, before, after, diff, status: 'submitted',
+    ...(attr.reason ? { reason: attr.reason } : {}) } }, actor);
+}
+
+// Apply an approved change through the normal write path, under the APPROVER's authority,
+// bypassing only the dangerous-write guard. Validation, grant checks, attenuation, rules,
+// and the ledger all still run — a sanctioned edit, not an unchecked one.
+async function applyChange(change, approver) {
+  const op = change.attr.op, target = change.attr.target, after = change.attr.after || {};
+  if (op === 'create')  return await create(target, { attr: after }, approver, true);
+  if (op === 'update')  return await writeAtom(target, { attr: after }, approver, undefined, 'update', true);
+  if (op === 'replace') return await writeAtom(target, { attr: after }, approver, undefined, 'replace', true);
+  if (op === 'delete')  return await retire(target, approver, true);
+  throw new Err(400, `unknown change op ${op}`);
+}
+
+// Record an approval and, if approved, apply the change — both in one transaction so the
+// evidence and the effect commit together. Maker-checker: the approver must NOT be the maker,
+// and the approver supplies the authority (their grants are what the apply checks).
+async function submitApproval(body, actor) {
+  const attr = body.attr || {};
+  const changeId = isRef(attr.change) ? refId(attr.change) : (attr.change || '');
+  const change0 = await getAtom(changeId);
+  if (change0.model !== 'atom://change-request') throw new Err(400, `${change0.id} is not a change-request`);
+  if (!await visible(actor, change0)) throw new Err(404, `no atom ${changeId}`);
+  if (refId(change0.lifecycle.createdBy) === actor.id) throw new Err(403, 'maker cannot approve their own change');
+  const decision = attr.decision;
+  if (!['approved', 'rejected'].includes(decision)) throw new Err(400, 'decision must be approved or rejected');
+  return await tx(async () => {
+    const change = await getAtom(changeId);                 // re-read inside the tx: a decided change is final
+    if (['applied', 'rejected'].includes(change.attr.status)) throw new Err(409, `change ${change.id} is already ${change.attr.status}`);
+    const approval = await create('approval', { attr: { change: ref(change.id), approver: ref(actor.id), decision, at: now(),
+      ...(attr.reason ? { reason: attr.reason } : {}) } }, actor);
+    if (decision === 'rejected') { change.attr.status = 'rejected'; await persist(change); return approval; }
+    const applied = await applyChange(change, actor);
+    change.attr.status = 'applied';
+    if (applied?.id) change.attr.applied = applied.id;
+    await persist(change);
+    return approval;
+  });
 }
 
 // Provision a base: one tenant + one open-login token scoped to it, in a single
@@ -2721,6 +2794,12 @@ const server = http.createServer(async (req, res) => {
       return send(201, { tenant: ref(tenant.id), token: ref(token.id), url: `${origin}/auth/open?token=${token.id}` });
     }
 
+    // --- Phase 7 maker-checker: file a change-request, then approve it (applies it). These
+    // are the sanctioned path for the edits guardDangerous blocks. Handled before the generic
+    // POST so the before/diff capture and the approver≠maker + apply logic run.
+    if (req.method === 'POST' && path === 'change-request') return send(201, await submitChange(await readBody(req), actor));
+    if (req.method === 'POST' && path === 'approval') return send(201, await submitApproval(await readBody(req), actor));
+
     // an atom id may itself contain dots (query ids like 'atom.byDate'); a whole-
     // path match on a real atom wins over dot-path traversal of atom://atom.
     if (req.method === 'GET' && path && await store.has(path) && (await getAtom(path)).model === 'atom://query') {
@@ -2872,6 +2951,21 @@ function coreAtoms() {
       fields: { kind: 'list' }, atoms: { kind: 'list' }, query: { kind: 'ref', to: 'atom://query' },
       count: { kind: 'integer' },
       at: { kind: 'datetime', required: true, filterable: true, sortable: true } }),
+    // change-request / approval — the maker-checker workflow (Phase 7). A dangerous edit is
+    // proposed as a change-request (NOT a dangerous atom — locked mode must be able to FILE
+    // the change that edits everything else), then an approval by a DIFFERENT actor applies it
+    // through the normal write path. Both are evidence models (see EVIDENCE_MODELS).
+    model('change-request', 'Change Request', {
+      target: { kind: 'text', required: true, filterable: true },   // atom id (update/replace/delete) or model id (create)
+      op: { kind: 'enum', values: ['create', 'update', 'replace', 'delete'], required: true },
+      before: { kind: 'json' }, after: { kind: 'json' }, diff: { kind: 'json' },
+      status: { kind: 'enum', values: ['draft', 'submitted', 'approved', 'rejected', 'applied'], filterable: true },
+      applied: { kind: 'text' }, reason: { kind: 'text' } }),
+    model('approval', 'Approval', {
+      change: { kind: 'ref', to: 'atom://change-request', required: true },
+      approver: { kind: 'ref', to: 'atom://token' },
+      decision: { kind: 'enum', values: ['approved', 'rejected'], required: true },
+      reason: { kind: 'text' }, at: { kind: 'datetime' } }),
     // export-job — evidence that a bulk export ran (Phase 1). Locked-mode --export-all
     // / --export-base write one of these BEFORE streaming a byte, so a shell operator's
     // dump is no longer silent. `sealed` records whether the bytes were AES-GCM sealed

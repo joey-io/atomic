@@ -473,6 +473,35 @@ ATOMIC_MIGRATIONS=person-v2-normalize
 
 ## Phase 7 — Change requests + approval (the maker-checker workflow)
 
+> **Status: implemented (2026-05-31).** `change-request` and `approval` models ship in
+> `coreAtoms()` (evidence models, but NOT dangerous-write — locked mode must be able to FILE
+> the change that edits everything else). `POST /change-request` (`submitChange`) captures the
+> target's `before`, computes the `diff` (a merge-`update` diffs only the fields in `after`;
+> `replace`/`create` diff the whole attr) and **refuses an empty diff**. `POST /approval`
+> (`submitApproval`) enforces **maker ≠ approver** (`change.lifecycle.createdBy !== actor.id`),
+> then in one transaction records the approval and, if approved, calls `applyChange` — which
+> runs the edit through the **normal `create`/`writeAtom`/`retire` path** under the approver's
+> authority (re-validating, checking the approver's grants, attenuating, logging), bypassing
+> only `guardDangerous` via a new `viaApproval` flag. A rejected change is retained as
+> `rejected`; an already-decided change can't be re-approved (409). 12 assertions in
+> `test.mjs`.
+>
+> **Authority model (a real consequence):** apply runs under the **approver**, so `attenuate`
+> requires the approver to cover the *resulting* atom's grants — i.e. you can only approve
+> changes to tokens within your own authority. That's separation-of-duties, not a bug.
+>
+> **Bootstrap:** `ATOMIC_ADMIN_SECRET` (the genesis `joey` / `**`) is the out-of-band first
+> approver, so locked mode is recoverable. Gating that `**` behind active break-glass is
+> Phase 8 — until then it simply works, as Phase 1 already noted.
+>
+> **Scoped / deferred, stated plainly:** (1) approval triggers apply immediately — there is no
+> separate draft→submitted→apply staging beyond the status field. (2) `exports: "approval"`
+> (Phase 5) still rejects rather than routing here; wiring an export through a change-request
+> is a later nicety. (3) A change-request's own fields aren't yet tamper-locked against a
+> direct PATCH by its maker (it's not a dangerous model) — evidence-tamper hardening is Phase
+> 10. (4) Status transitions persist without their own ledger entry; the `approval` atom is
+> the evidence of the decision.
+
 The Phase 1 guard already blocks direct edits to dangerous atoms. This phase adds the path to
 make those edits safely.
 
@@ -626,7 +655,7 @@ metadata first.
 5. ✅ Bounded `sensitive-read` evidence with fail-closed semantics (Phase 4).
 6. ✅ Explicit `export` grant mode + CSV/CLI export audit (Phase 5).
 7. ✅ Hook/migration allowlists (Phase 6).
-8. Change-request + approval, with the bootstrap path (Phase 7).
+8. ✅ Change-request + approval, with the bootstrap path (Phase 7).
 9. Break-glass (Phase 8).
 10. Legal hold + retention hardening (Phase 9).
 11. Per-tenant hash-chained evidence with persisted head (Phase 10).
