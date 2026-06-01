@@ -1101,6 +1101,7 @@ function memStore() {                                   // in-memory (no ATOMIC_
       try { return await fn(); }
       catch (e) { m.clear(); for (const [k, v] of snap) m.set(k, v); throw e; }
     },
+    async advisoryLock() {},   // single writer — the in-process tx lock already serializes
     async close() {},
   };
 }
@@ -1196,6 +1197,7 @@ function sqliteStore() {
       try { const r = await fn(); db.exec('COMMIT'); return r; }
       catch (e) { db.exec('ROLLBACK'); throw e; }
     },
+    async advisoryLock() {},   // single writer (one process holds atoms.db) — the tx serializes
     async close()      { db.close(); },
   };
 }
@@ -1266,6 +1268,10 @@ async function pgStore() {
       } catch (e) { try { await client.query('ROLLBACK'); } catch { /* connection already gone */ } throw e; }
       finally { client.release(); }
     },
+    // Phase 10 — serialize per-tenant evidence appends across CONCURRENT writers (multiple pm2
+    // processes on one MVCC database). Held until the surrounding tx commits; routed to the tx
+    // client via the AsyncLocalStorage, so it only bites inside transact().
+    async advisoryLock(key) { await q('SELECT pg_advisory_xact_lock(hashtext($1))', [String(key)]); },
     async close() { await pool.end(); },
   };
 }
@@ -1361,7 +1367,7 @@ async function redact(actor, atom) {
 async function logIt(atomId, op, actorId, changes, sessionId) {
   const id = `log-${++logSeq}`;
   const subj = await store.get(atomId);
-  await seed({
+  await appendEvidence({                              // Phase 10 — every log links into its shard's hash chain
     id, model: 'atom://log', manifest: `${op} ${atomId}`,
     attr: { atom: ref(atomId), op, actor: ref(actorId),
       ...(sessionId ? { session: ref(sessionId) } : {}), at: now(), changes },
@@ -1379,7 +1385,7 @@ async function logIt(atomId, op, actorId, changes, sessionId) {
 // recording is the price of disclosure. Idempotent: clears the accumulator after a flush.
 async function writeSensitiveRead(actor, modelId, e) {
   const atoms = [...e.atoms];
-  await seed({
+  await appendEvidence({
     id: `sread-${randomUUID()}`, model: 'atom://sensitive-read',
     manifest: `read ${[...e.fields].join(', ')} on ${modelId} (${atoms.length})`,
     attr: {
@@ -1397,7 +1403,7 @@ async function writeSensitiveRead(actor, modelId, e) {
 // sensitive-read). `sealed:false` — unlike the CLI bulk dump, this is a deliberate,
 // grant-authorized plaintext export to the client.
 async function writeExportJob(actor, j) {
-  await seed({
+  await appendEvidence({
     id: `export-${randomUUID().slice(0, 12)}`, model: 'atom://export-job',
     manifest: `export ${j.fields.join(', ')} on ${j.model} (${j.count})`,
     attr: {
@@ -1464,7 +1470,7 @@ async function resolveExpiration(body, actor, fallback) {
 const DANGEROUS_MODELS = new Set([
   'atom://model', 'atom://token', 'atom://role', 'atom://hook', 'atom://migration',
   'atom://policy', 'atom://condition', 'atom://retention-policy', 'atom://legal-hold',
-  'atom://purpose', 'atom://export-job', 'atom://break-glass',
+  'atom://purpose', 'atom://export-job', 'atom://break-glass', 'atom://evhead',
 ]);
 // Evidence atoms — append-only by construction (the kernel writes them via seed/logIt,
 // never the write surface). Importing one verbatim would forge history, so locked-mode
@@ -1481,6 +1487,43 @@ function guardDangerous(modelRef, op, actor) {
   // governance atoms directly, the way an approved change-request (viaApproval) does.
   if (LOCKED && DANGEROUS_MODELS.has(modelRef) && !actor?._breakGlass)
     throw new Err(403, `locked mode: cannot ${op} ${modelRef} directly — governance atoms change only through an approved change request (POST /change-request) or active break-glass`);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — tamper-evident evidence: a per-tenant (per-shard) hash chain. Every evidence
+// atom is linked { prev, hash, seq } where hash = sha256(prev + canonical_event). One chain
+// per shard keeps cross-tenant writes concurrent; a persisted head atom (evhead-<shard>) makes
+// an append O(1); and the append runs inside a transaction holding a per-shard advisory lock,
+// so two writers on one Postgres can't fork the chain. node:crypto only. Locked-mode only —
+// dev/prod write evidence unchained, so a fresh locked store starts a clean chain.
+// ---------------------------------------------------------------------------
+const GENESIS = '0'.repeat(64);
+// change-request mutates after it is chained (status/applied transition through the workflow),
+// so those fields are excluded from the hash — what is signed is the immutable PROPOSAL.
+const MUTABLE_EVIDENCE = { 'atom://change-request': new Set(['status', 'applied']) };
+function canonicalEvidence(atom) {
+  const skip = MUTABLE_EVIDENCE[atom.model] || new Set();
+  const attr = {};
+  for (const k of Object.keys(atom.attr || {}).sort()) if (!skip.has(k)) attr[k] = atom.attr[k];
+  return JSON.stringify([atom.id, atom.model, attr, atom.lifecycle?.createdBy ?? null, atom.lifecycle?.createdAt ?? null]);
+}
+async function appendEvidence(atom) {
+  if (!LOCKED) return await seed(atom);   // tamper-evident chaining is a locked-mode guarantee
+  return await tx(async () => {
+    const shard = await shardOf(atom);
+    await store.advisoryLock(shard);       // serialize this shard's chain across concurrent writers
+    const headId = `evhead-${shard}`;
+    const head = await store.get(headId);
+    const prev = head?.attr?.hash || GENESIS;
+    const seq = (head?.attr?.seq ?? -1) + 1;
+    atom.lifecycle = { ...atom.lifecycle, chain: { prev, hash: sha256(prev + canonicalEvidence(atom)), seq } };
+    await seed(atom);
+    await seed({ id: headId, model: 'atom://evhead', manifest: `evidence head: ${shard}`,
+      attr: { tenant: shard, hash: atom.lifecycle.chain.hash, seq },
+      lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(),
+        createdBy: ref('0'), parent: ref(shard === '_global' ? '0' : shard), expiration: 'atom://policy-never' } });
+    return atom;
+  });
 }
 
 async function create(modelId, body, actor, viaApproval = false) {
@@ -1557,7 +1600,8 @@ async function create(modelId, body, actor, viaApproval = false) {
     mintedSecret = 'atk_' + randomBytes(32).toString('hex');
     atom.attr.secret = sha256(mintedSecret);
   }
-  await seed(atom);
+  // change-request / approval are evidence (Phase 7) — chain them like any other (Phase 10).
+  if (EVIDENCE_MODELS.has(atom.model)) await appendEvidence(atom); else await seed(atom);
   if (mintedSecret) Object.defineProperty(atom, '_secret', { value: mintedSecret, enumerable: false });
   if (modelId === 'model') {
     await buildInverse(); // a new model may declare inverse edges
@@ -1852,7 +1896,7 @@ async function activateBreakGlass(body, actor) {
     lifecycle: { status: 'active', version: 1, modelVersion: 1, createdAt: now(), updatedAt: now(),
       createdBy: ref(actor.id), parent: ref('0'), expiration: 'atom://policy-never' },
   };
-  await seed(bg);
+  await appendEvidence(bg);   // the break-glass atom itself links into the chain (Phase 10)
   await logIt(id, 'break-glass', actor.id, [{ path: 'status', from: null, to: 'active' }], actor._session); // noisy by design
   return bg;
 }
@@ -3076,6 +3120,11 @@ function coreAtoms() {
       scope: { kind: 'enum', values: ['atom', 'tenant', 'model', 'query'] },
       reason: { kind: 'text' }, status: { kind: 'enum', values: ['active', 'released'], filterable: true },
       createdAt: { kind: 'datetime' }, releasedAt: { kind: 'datetime' } }),
+    // evhead — the persisted head of a tenant's evidence hash chain (Phase 10). One per shard;
+    // kernel-managed (written only inside appendEvidence, never the write surface). Carries the
+    // last `hash` + `seq` so an append is O(1) and correct under concurrent writers.
+    model('evhead', 'Evidence Head', { tenant: { kind: 'text', filterable: true },
+      hash: { kind: 'text' }, seq: { kind: 'integer' } }),
     // export-job — evidence that a bulk export ran (Phase 1). Locked-mode --export-all
     // / --export-base write one of these BEFORE streaming a byte, so a shell operator's
     // dump is no longer silent. `sealed` records whether the bytes were AES-GCM sealed
@@ -3286,6 +3335,29 @@ async function audit() {
   for (const a of atoms) if (a.lifecycle?.status !== 'retired' && await isExpired(a) && await heldBy(a)) expiredHeld++;
   console.log(` ok   ${expiredHeld} expired-but-held atom${expiredHeld === 1 ? '' : 's'} (retained by a legal hold)`);
 
+  // Phase 10 — re-walk each tenant's evidence hash chain in seq order: every seq is contiguous,
+  // every prev links the previous hash, and every hash recomputes from the atom's content. A
+  // break (a tampered, deleted, or inserted evidence atom) is a finding. Only chained atoms
+  // are walked, so a dev-built store (unchained evidence) is simply empty here.
+  const chains = new Map();
+  for (const a of atoms) if (a.lifecycle?.chain && EVIDENCE_MODELS.has(a.model)) {
+    const shard = await shardOf(a);
+    (chains.get(shard) || chains.set(shard, []).get(shard)).push(a);
+  }
+  const chainBreaks = [];
+  for (const [shard, evs] of chains) {
+    evs.sort((x, y) => x.lifecycle.chain.seq - y.lifecycle.chain.seq);
+    let prev = GENESIS;
+    evs.forEach((a, i) => {
+      const c = a.lifecycle.chain;
+      if (c.seq !== i) chainBreaks.push(`${shard}/${a.id}: seq ${c.seq} (expected ${i})`);
+      else if (c.prev !== prev) chainBreaks.push(`${shard}/${a.id}: prev does not link`);
+      else if (c.hash !== sha256(prev + canonicalEvidence(a))) chainBreaks.push(`${shard}/${a.id}: hash mismatch — tampered`);
+      prev = c.hash;
+    });
+  }
+  report(`evidence hash chain intact (${chains.size} shard${chains.size === 1 ? '' : 's'})`, chainBreaks);
+
   console.log(`\naudit: ${atoms.length} atoms, ${findings.length} finding${findings.length === 1 ? '' : 's'}`);
   return findings.length ? 1 : 0;
 }
@@ -3399,7 +3471,7 @@ if (_nb !== -1) {
 // (A plaintext bulk export under locked mode is a break-glass operation — Phase 8.)
 async function emitExportJob(scope, count, sealed) {
   const id = `export-${randomUUID().slice(0, 8)}`;
-  await seed({
+  await appendEvidence({
     id, model: 'atom://export-job',
     manifest: `export ${scope} — ${count} atoms (${sealed ? 'sealed' : 'PLAINTEXT'})`,
     attr: {

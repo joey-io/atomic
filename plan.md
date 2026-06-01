@@ -630,6 +630,31 @@ Expiration today is lazy and non-destructive — keep that. Add explicit holds.
 > "many writers," and more than one `atomic` process already runs under pm2. A global in-memory
 > chain head forks the moment two writers append concurrently, and `--audit` fails.
 
+> **Status: implemented (2026-06-01).** Every evidence write (`log` via `logIt`, `sensitive-read`,
+> `export-job` incl. the CLI dump, `break-glass`, and `change-request`/`approval` via `create`)
+> now routes through `appendEvidence`, which — in locked mode — links the atom into its **shard's**
+> hash chain: `lifecycle.chain = { prev, hash: sha256(prev + canonical_event), seq }`. A persisted
+> `evhead-<shard>` atom holds the head, so an append is O(1); the append runs **inside one
+> transaction holding a per-shard advisory lock** (`store.advisoryLock` → `pg_advisory_xact_lock`
+> on Postgres, a no-op on the single-writer SQLite/mem drivers), so concurrent writers on one MVCC
+> database can't fork the chain. `canonical_event` excludes a `change-request`'s mutable
+> `status`/`applied` (what's signed is the immutable proposal) and the `chain`/version fields
+> themselves. `--audit` re-walks each shard's chain in `seq` order — contiguous seq, linked `prev`,
+> recomputed `hash` — and a break is a **finding** (`node:crypto` only). 4 assertions in `test.mjs`:
+> atoms carry the link, an intact chain audits clean, and an insider edit (even under break-glass)
+> is **detected** as a hash mismatch.
+>
+> **Locked-mode only** (consistent with the rest of the stack), so a dev/prod store writes evidence
+> unchained and our live `dev`-mode deployment is unchanged. **Cost, honestly:** every locked-mode
+> write now takes the in-process tx lock + a head read/write, serializing evidence per shard.
+>
+> **Scoped / deferred, stated plainly:** (1) the **concurrent two-process** regression (Phase 11,
+> item 15) needs a real Postgres + `ATOMIC_TEST_DB`; the advisory-lock machinery is in place and
+> the single-writer chain is verified, but the multi-process race test belongs to Phase 11. (2)
+> Evidence atoms are still **editable** under break-glass — Phase 10 *detects* the edit rather than
+> preventing it (locking evidence against all edits is Phase 11, item 16). (3) `--import-all` still
+> refuses evidence (no safe re-chaining on import yet).
+
 Make evidence (`log`, `sensitive-read`, `export-job`, `change-request`, `approval`,
 `break-glass`) tamper-evident with **per-tenant hash chains and a persisted head**:
 
@@ -708,7 +733,7 @@ metadata first.
 8. ✅ Change-request + approval, with the bootstrap path (Phase 7).
 9. ✅ Break-glass (Phase 8).
 10. ✅ Legal hold + retention hardening (Phase 9).
-11. Per-tenant hash-chained evidence with persisted head (Phase 10).
+11. ✅ Per-tenant hash-chained evidence with persisted head (Phase 10).
 12. Locked-mode `--audit` checks + locked-mode test suite (Phase 11).
 
 Steps 1–2 deliver the most safety per line and stop the silent-exfil path immediately.

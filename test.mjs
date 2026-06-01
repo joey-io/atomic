@@ -913,5 +913,39 @@ ok(await lhcode('joey', 'DELETE', '/r3') === 423, 'hold: a legal hold trumps eve
 lhsrv.kill(); await new Promise((r) => setTimeout(r, 200));
 rmSync(LHSTORE, { recursive: true, force: true });
 
+// =============================================================================
+// Phase 10 — tamper-evident evidence. In locked mode every evidence atom links into its
+// shard's hash chain. `--audit` re-walks each chain; editing an evidence atom (even by an
+// insider with break-glass) leaves its content out of step with its stored hash, which the
+// re-walk detects. Built in locked, audited intact, tampered via the API, audited broken.
+// =============================================================================
+const PXPORT = 7797, PXSTORE = '/tmp/atomic-px-store', pxbase = `http://localhost:${PXPORT}`;
+const pxenv = (extra = {}) => ({ ...process.env, PORT: PXPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_STORE: PXSTORE, ATOMIC_KEY: LKEY, ATOMIC_MODE: 'locked', ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
+const startPX = () => spawn('node', ['atomic.mjs'], { env: pxenv(), stdio: 'ignore' });
+const PXJ = (tok, method, p, body) => fetch(pxbase + p, { method, headers: { ...(tok ? { authorization: 'Bearer ' + ADMIN } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const waitPX = async () => { for (let i = 0; i < 50; i++) { try { await fetch(pxbase + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+const auditPX = () => new Promise((res) => spawn('node', ['atomic.mjs', '--audit'], { env: pxenv(), stdio: 'ignore' }).on('exit', res));
+
+rmSync(PXSTORE, { recursive: true, force: true });
+let pxsrv = startPX(); await waitPX();
+await breakGlass((m, p, b) => PXJ('joey', m, p, b));     // act in locked mode
+await PXJ('joey', 'POST', '/config', { id: 'c1', attr: { key: 'a', value: 1 } });
+await PXJ('joey', 'POST', '/config', { id: 'c2', attr: { key: 'b', value: 2 } });
+// grab a chained 'create' log to tamper with later
+const pxLogs = await (await PXJ('joey', 'GET', '/log')).json();
+const tamperTarget = (Array.isArray(pxLogs) ? pxLogs : []).find((l) => l.lifecycle?.chain && l.attr.op === 'create');
+ok(tamperTarget && tamperTarget.lifecycle.chain.hash && typeof tamperTarget.lifecycle.chain.seq === 'number', 'chain: evidence atoms carry a { prev, hash, seq } chain link in locked mode');
+pxsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+// the intact chain audits clean
+ok(await auditPX() === 0, 'chain: --audit passes on an intact per-tenant evidence chain');
+// tamper: an insider with break-glass edits an evidence atom's content (its hash is now stale)
+pxsrv = startPX(); await waitPX();
+ok((await PXJ('joey', 'PATCH', '/' + tamperTarget.id, { attr: { op: 'forged' } })).status === 200, 'chain: an evidence atom can be edited (break-glass) — but the edit cannot be hidden');
+pxsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+// the chain now fails the audit — the tampered atom no longer hashes to its stored link
+ok(await auditPX() === 1, 'chain: --audit DETECTS the tampered evidence atom (hash mismatch → finding)');
+rmSync(PXSTORE, { recursive: true, force: true });
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

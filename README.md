@@ -6,7 +6,7 @@
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0%20required-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
-![tests](https://img.shields.io/badge/tests-246%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-250%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Atomic is a single-file kernel for graph-relational data with no required dependencies (the
@@ -71,7 +71,7 @@ ATOMIC_DB=postgres://localhost/atomic npm start
 npm run seed
 
 # verify
-npm test         # 246 black-box HTTP assertions
+npm test         # 250 black-box HTTP assertions
 npm run check    # the kernel's own tests, which are themselves atoms
 npm run audit    # structural invariants (exits non-zero on any finding)
 ```
@@ -409,7 +409,7 @@ Read from the environment, with `./.env` as a gitignored fallback.
 
 Verification lives at two levels, and the second is itself made of atoms:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (246 assertions) covering validation,
+- **`test.mjs`** — an independent, black-box HTTP suite (250 assertions) covering validation,
   grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability
   across restart, and security regressions.
 - **`--check`** — the substrate's own acceptance suite, *as data*: a `test` atom is
@@ -419,6 +419,11 @@ Verification lives at two levels, and the second is itself made of atoms:
   exits green.)
 - **`--audit`** — a structural fsck: every atom resolves to a model, every reference resolves,
   every atom conforms to its schema, and every grant, ledger entry, and parent is well-formed.
+  In `locked` mode it also re-walks each tenant's **evidence hash chain** — every evidence atom
+  (`log`, `sensitive-read`, `export-job`, `change-request`, `approval`, `break-glass`) links to
+  the previous by `sha256(prev + event)`, so a tampered, deleted, or inserted record is a
+  finding. The chain is per-tenant (concurrent across tenants) with a persisted head, appended
+  under a per-tenant lock so multiple writers on one database can't fork it.
 
 `--audit` covers structural invariants; `--check` covers behavioural ones. Point either at a
 real store with `ATOMIC_STORE` / `ATOMIC_DB`.
@@ -439,7 +444,7 @@ package.json scripts; no required dependencies
 
 ## Status
 
-Atomic is pre-launch and experimental. It runs, and it is exercised by 246 HTTP test
+Atomic is pre-launch and experimental. It runs, and it is exercised by 250 HTTP test
 assertions, a self-test suite, and a structural audit — but interfaces may still change.
 
 ---
