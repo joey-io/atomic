@@ -768,22 +768,28 @@ Steps 1–2 deliver the most safety per line and stop the silent-exfil path imme
 
 Atomic is minimally ready for a sensitive enterprise pilot when all of this is true:
 
-- `ATOMIC_MODE=locked` exists and refuses unsafe boot configurations.
-- **No export path — CSV or CLI bulk — leaks restricted data without an explicit grant and an
-  `export-job` evidence record.**
-- Restricted fields redact by default; restricted reads require purpose and produce bounded,
+- ✅ `ATOMIC_MODE=locked` exists and refuses unsafe boot configurations.
+- ✅ **No HTTP export path leaks restricted data without an explicit grant and an `export-job`
+  evidence record.** (CLI bulk is sealed + evidenced; a *plaintext* CLI export gated on
+  break-glass is the one deferred louder-export item.)
+- ✅ Restricted fields redact by default; restricted reads require purpose and produce bounded,
   fail-closed evidence.
-- Dangerous atoms require approved change requests, and locked mode is recoverable (bootstrap
-  path defined).
-- Hooks and custom migrations are allowlisted.
-- Legal holds block deletion.
-- Break-glass is temporary, reasoned, and logged.
-- **The per-tenant evidence chain verifies in `npm run audit` after concurrent multi-writer
-  appends.**
-- Locked-mode tests pass.
+- ✅ Dangerous atoms require approved change requests, and locked mode is recoverable (the
+  `ATOMIC_ADMIN_SECRET` break-glass bootstrap).
+- ✅ Hooks and custom migrations are allowlisted.
+- ✅ Legal holds block deletion.
+- ✅ Break-glass is temporary, reasoned, and logged.
+- ◑ **The per-tenant evidence chain verifies in `npm run audit`** — single-writer + tamper/delete
+  detection are tested; the *two-process concurrent* verification is gated on `ATOMIC_TEST_DB`
+  (Postgres) and skipped on the SQLite suite.
+- ✅ Locked-mode tests pass (257 assertions, 5 self-tests, structural + chain audit clean).
 
-Until then, Atomic should not be the direct system of record for high-sensitivity data. It can
-safely continue as the kernel prototype, control-plane model, admin-UI generator, and testbed.
+**Phases 0–11 are implemented, committed, and deployed** — but inert on the live box, which runs
+`ATOMIC_MODE=dev`. The remaining work is the three honest gaps named above (plaintext CLI export
+under break-glass, import re-chaining, the Postgres concurrency regression) plus the explicit
+out-of-scope items (SSO/MFA, KMS/rotation, network controls). None is load-bearing for a first
+locked-mode pilot. Until a deployment actually sets `ATOMIC_MODE=locked`, Atomic stays the kernel
+prototype, control-plane model, and admin-UI generator it already is.
 
 ---
 
