@@ -24,7 +24,7 @@ query builder, permission system, or UI framework to wire together — and no ge
 to keep in sync. The whole thing is `atomic.mjs`: about 3,500 lines, zero required
 dependencies.
 
-[Why](#why) · [Quick start](#quick-start) · [Concepts](#concepts) · [How it works](#how-it-works) · [HTTP API](#http-api) · [Identity & access](#identity--access) · [Locked mode](#locked-mode) · [Lifecycle](#lifecycle) · [The generated UI](#the-generated-ui) · [Persistence](#persistence) · [Configuration](#configuration) · [CLI](#cli) · [Testing & governance](#testing--governance) · [Status](#status) · [License](#license)
+[Why](#why) · [Quick start](#quick-start) · [Concepts](#concepts) · [How it works](#how-it-works) · [HTTP API](#http-api) · [Identity & access](#identity--access) · [Locked mode](#locked-mode) · [Lifecycle](#lifecycle) · [The generated UI](#the-generated-ui) · [Persistence](#persistence) · [Mechanism reference](#mechanism-reference) · [Configuration](#configuration) · [CLI](#cli) · [Testing & governance](#testing--governance) · [Status](#status) · [License](#license)
 
 ---
 
@@ -167,6 +167,50 @@ schema queryable.
   shape directly into this atom. The values live in the parent's `attr`, are validated against
   `x`, and carry no `id` or `lifecycle` of their own. The *same* shape can be reused under
   multiple fields — `home` and `work` can both be `embed://address`.
+
+### Rules
+
+A model may carry `rules.read` / `rules.write` — a predicate that runs *in addition* to grants
+and tenancy (an atom is readable/writable only if its grants **and** its rule pass). A rule is
+one comparison — `LEFT == RIGHT` or `LEFT != RIGHT` — where each side is a literal (`true`,
+`'text'`, `atom://id`) or a dotted path read, against the **atom** by default or the **actor**
+with an `actor.` prefix. Anything the safe evaluator can't parse denies (access is never granted
+by error).
+
+```json
+{ "id": "house", "model": "atom://model",
+  "attr": {
+    "label": "House", "version": 1,
+    "fields": { "home": { "kind": "ref", "to": "atom://house" } },
+    "rules":  { "write": "home == actor.house" }
+  } }
+```
+
+A `house` atom is then writable only by the token whose own `house` field points at it —
+field-level ownership, expressed as data. (`tenant == actor.tenant` is another common one.)
+
+### Queries
+
+A `query` atom is a saved, parameterized read over a model, run by id (`GET /<query-id>`) and
+rendered as a table or page:
+
+```json
+{ "id": "log.byAtom", "model": "atom://query",
+  "attr": {
+    "over":   "atom://log",
+    "params": { "atom": { "kind": "ref", "to": "atom://atom" } },
+    "match":  { "atom": "params.atom" },
+    "sort":   [{ "at": "asc" }],
+    "returns": "set"
+  } }
+```
+
+- **`over`** — the model to read (or `atom://atom` for every model).
+- **`params`** — typed inputs, filled from the query string: `GET /log.byAtom?atom=atom://c1`.
+- **`match`** — `{ field: literal }` or `{ field: "params.<name>" }`; equality on a `filterable`
+  field pushes into the index.
+- **`sort`** — `[{ field: "asc" | "desc" }]`. Add `page: { cursor, limit }` for cursor
+  pagination (`returns: "page"`); otherwise `returns: "set"`.
 
 ---
 
@@ -344,6 +388,30 @@ Two guarantees hold in **every** mode, not just locked: a **legal hold** (see
 `legal-hold` · `evhead` (the per-tenant evidence-chain head). They are ordinary models — readable
 and queryable like everything else.
 
+### The governance endpoints
+
+These are ordinary `POST`s; the kernel fills the derived fields (a change-request's
+`before`/`diff`/`status`, an approval's `approver`/`at`, the break-glass `actor`/`status`):
+
+```jsonc
+// 1. the maker proposes a governance edit (kernel records before + diff, status: submitted)
+POST /change-request  { "attr": { "target": "atom://tok-eng", "op": "update",
+                                  "after": { "email": "eng@x.com" }, "reason": "rotate contact" } }
+
+// 2. a DIFFERENT actor approves — applies it through the normal write path (maker ≠ approver)
+POST /approval        { "attr": { "change": "atom://cr-1f3a", "decision": "approved" } }
+
+// emergency: recover ** — admin secret only, reason + future expiry mandatory
+POST /break-glass     { "attr": { "reason": "incident 412", "expiresAt": "2026-06-02T00:00:00Z" } }
+
+// place a litigation hold (a governance atom: direct in dev; via break-glass or a change-request in locked)
+POST /legal-hold      { "attr": { "target": "atom://person-123", "scope": "atom",
+                                  "reason": "subpoena", "status": "active" } }
+```
+
+A `change-request` `op` is `create` (then `target` is the model id) · `update` · `replace` ·
+`delete`. Releasing a hold is an `update` to `status: released`.
+
 ### Turning it on
 
 Set `ATOMIC_MODE=locked`, which then *requires* `ATOMIC_KEY`, a durable store, and
@@ -359,8 +427,11 @@ SSO/MFA, KMS and key rotation, and network rate-limiting/DoS.
 - **Hooks.** A `hook` is a capability atom `{ run, grants }` registered in an atom's (or a
   model's) `lifecycle.hooks`, keyed `create` / `update` / `delete`. It runs `scripts/<run>.mjs`
   under its *own* grants — the caller needs no invoke permission, and `run` is locked to a safe
-  basename. (Example: `scripts/census-district.mjs` geocodes an address and links a
-  congressional-district atom on write.)
+  basename. The handler is `export default async (atom, { patch, upsert, getAtom, ref, refId })
+  => {…}`: `patch(fields)` writes fields onto the triggering atom, and `upsert(model, id, attr)`
+  creates-or-updates and links a related atom — both under the hook's own grants. (Example:
+  `scripts/census-district.mjs` geocodes an address and links a congressional-district atom on
+  write.)
 - **Expiration.** `lifecycle.expiration` points at a `policy` (a set of `condition` atoms). An
   atom is expired when all of its policy's conditions hold; expired atoms are filtered out of
   reads but never mutated — editing one brings it back. The default policy is "not updated in
@@ -416,6 +487,190 @@ and changes nothing above the port.
   blind-hashed (equality only, no range or sort).
 
 Migrate between any two drivers with `node atomic.mjs --export-all` and `--import-all`.
+
+---
+
+## Mechanism reference
+
+The precise rules behind each subsystem. Every behavior in the kernel is one of these
+mechanisms applied to atoms; nothing here is type-specific.
+
+### Request lifecycle
+
+One handler serves every request. It parses the URL and cookies, resolves the actor, and — in
+`prod`/`locked` — annotates a **per-request copy** of the actor with the request's `purpose`,
+`reason`, and active break-glass (so the effective grants are recomputed per request and a
+break-glass's wall-clock expiry is honored). It then routes by method + path:
+
+```
+resolve actor (+ per-request context) → route
+  read   →  load → bringForward (lazy migrate) → project (redact) → flush evidence → render
+  write  →  guard → validate + grants → mutate → log (+ chain) → run hooks → render
+```
+
+Reads project through `redact`; writes run `create` / `writeAtom` / `retire`, then `runHooks`.
+Responses negotiate JSON (default), HTML (`Accept: text/html` or `?as=html`), or CSV
+(`?as=csv`). Every response carries `nosniff` / `X-Frame-Options: DENY` / `Referrer-Policy:
+no-referrer`; HTML adds a strict CSP (`default-src 'none'; script-src 'self'; …`) — there is no
+inline script. Errors are an `Err(code, message)` thrown anywhere and caught once at the top.
+
+### Actor resolution
+
+- `Authorization: Bearer <x>` — if `x` starts with `sess-`, it's a session id; otherwise it's a
+  token's API **secret**, looked up by `sha256(x)` against the token table. A token's **public id
+  is never accepted** as a credential.
+- The cookie `atomic_session` is a session id, identical to a `Bearer sess-…`.
+- Anything else resolves to `atom://0` — the anonymous identity with no grants.
+- A **session** is itself an atom binding a cookie to a token, parented into that token's tenant,
+  7-day expiry, never served through the surface.
+- **Magic-link:** `POST /auth { email }` mints a one-time code (15-minute expiry, held in memory);
+  `GET /auth/verify?code=` exchanges it for a session cookie. With no mailer, the link is surfaced
+  in the response (dev only — never in `prod`/`locked`).
+- The literal `ATOMIC_ADMIN_SECRET` bearer additionally marks the actor `_admin` — the only
+  identity that may activate break-glass.
+
+### Validation
+
+`validate(model, attr)` walks the model's declared fields: a field that is an embed recurses;
+otherwise the value gets its `default`, a `required` check, then `checkKind` — `text` ·
+`longtext` · `email` · `url` · `uuid` (format-checked) · `integer` · `number` (with `min`/`max`)
+· `boolean` · `datetime` · `enum` (∈ `values`) · `ref` (must be `atom://…`) · `list` (an array) ·
+`map` (an object) · `json` (anything) — plus `minLength`/`maxLength`/`pattern` on strings.
+**Undeclared fields are dropped; list items are *not* recursed** (which is why an embedded `grant`
+inside a `token.grants` list rides through unvalidated). A model write also rejects an unknown
+`sensitivity` level.
+
+### Grants, roles & attenuation
+
+A token's **effective grants** are its own `grants` plus every referenced role's grants.
+
+- `permits(mode, op)` — `all` permits everything; `read` is permitted only by `read` or `all`;
+  `write` permits any *mutation* (create/update/delete) but **not** read; otherwise the mode must
+  equal the op. `export` is its own mode, checked only by the export gate.
+- `grantMatch(path, target)` — segment-wise over a dotted path: `*` matches exactly one segment,
+  `**` matches any number (including zero). So `person.*` covers `person.email` but not
+  `person.address.zip`; `**` covers everything.
+- `allows(actor, target, op)` = some effective grant both `permits` the op and `grantMatch`es the
+  target. `canOp` is the model-level form.
+- **Attenuation:** on every `token`/`hook` write, each granted grant (inline *and* via a worn
+  role) must be a subset of the issuer's own — you can never mint more authority than you hold.
+
+### Tenancy & visibility
+
+`lifecycle.parent` forms a tenant tree. `tenantOf(atom)` walks parents to the owning tenant;
+`shardOf` is that tenant or `_global` for tenant-less atoms. `visible(actor, atom)` passes when
+the atom is not retired, not expired, and either global, or in the actor's tenant subtree, or the
+actor is a tenant-less root. **Writes** additionally require sharing the tenant ancestor and
+passing the model's write rule. Reads and the secondary index are always scoped to
+`['_global', <tenant>]`, so a query never even loads another tenant's atoms.
+
+### The write path
+
+- **create** — `guardDangerous` → baseline create grant → `validate` → resolve tenant/parent →
+  (tokens) mint a high-entropy secret, store only its hash → `seed` → log `create`. Defining a
+  `model` mints the creator full grants on the new type; a unique index dedups by identity.
+- **update** (PATCH, merge) / **replace** (PUT, whole `attr`) via `writeAtom` — `visible` →
+  evidence-immutability check → `guardDangerous` → per-field update grant → optimistic-concurrency
+  `If-Match` (version must match) → `validate` (merged or replaced) → `attenuate` → writable
+  (tenant + rule) → `bump` (version++, `updatedAt`, `updatedBy`) → log.
+- **retire** (DELETE) — `guardDangerous` → delete grant → writable → then, inside one
+  transaction: the **legal-hold check** and the `onDelete` cascade → set `status: retired` → log
+  `delete`. Deletes are soft; nothing is physically removed.
+
+Every mutation appends a `log` atom (and, in `locked` mode, links it into the hash chain).
+
+### Referential integrity
+
+`inboundRefs(target)` finds live atoms pointing at it through a **declared `inverse`** edge (so
+the ledger's bookkeeping refs are never mistaken for edges). Each referring field's `onDelete`
+decides: `restrict` → `409`; `cascade` → retire the referrer too (recursively, cycle-guarded);
+`null` → clear the cell and re-validate (a `required` ref can't be nulled). All of it runs in the
+retire transaction, so a half-applied cascade can't corrupt the graph.
+
+### Indexed reads
+
+`filterable`/`sortable` fields are projected into `idx (shard, model, field, value, id)` on every
+write. `indexedRead` serves a query straight from the index **when** the store has a `page`
+method (not in-memory), the sort field and every filter field are indexed, the full-text `q`
+filter isn't used, and — under encryption — only equality filters are present (blind-hashed
+values can't range or sort). Otherwise it returns `null` and the kernel falls back to a
+tenant+model-scoped scan. The store pushes shard + model + filters + sort + cursor into SQL; the
+kernel over-fetches ~3× to re-apply per-actor read rules the index can't see, then redacts.
+Pagination is cursor-based on the sort field (`page: { cursor, limit }`).
+
+### Expiration & retention
+
+`lifecycle.expiration` → a `policy` atom → a set of `condition` atoms `{ field, op, value }`. An
+op is `eq` · `ne` · `in` · `older` · `newer` (the last two compare a date field to a duration like
+`3y`/`30d` before now). An atom is **expired when *all* of its policy's conditions hold**; a
+policy with no conditions never expires (the default is "not updated in three years"). Expiration
+only *hides* — `visible` filters expired atoms out of reads, but they're never mutated, so editing
+one (which bumps `updatedAt`) brings it back. A **legal hold** (`heldBy`, by atom/tenant/model
+scope) blocks retire unconditionally — it overrides break-glass and approved changes alike.
+
+### Schema migration
+
+A `model` carries a `version`; each atom records the `modelVersion` it was last written under. A
+`migration` atom is a one-way step `from → to`: `rename` or `default` (from a `spec`) or `custom`
+(a vetted `scripts/<run>.mjs`). `bringForward` applies the **contiguous** chain starting at the
+atom's version on read (a gap stops the walk); `sweepModel`/`sweepAll` complete the rewrite when a
+model or migration is written and to completion on boot, then persist and log `migrate`. In
+`locked` mode a `custom` migration must be in `ATOMIC_MIGRATIONS` or it fails closed — and the
+boot sweep tolerates that (it leaves the atom behind rather than crashing).
+
+### The store port
+
+The kernel↔store seam is a small interface — `get` · `has` · `set` · `delete` · `values` ·
+`count` · `query({shards, model})` · `page({…cursor})` · `setIndex` · `indexCount` · `transact` ·
+`advisoryLock`. Three drivers implement it (in-memory, SQLite, Postgres) over the **same two
+tables**, `atom` and `idx`. Atom bodies are `serializeLine`d — JSON, or `enc:`-prefixed
+AES-256-GCM under `ATOMIC_KEY` (the `id`/`shard`/`model` columns stay plaintext for routing).
+`tx()` is a reentrant in-process lock that serializes top-level transactions and joins nested
+ones; `transact` is the driver's `BEGIN/COMMIT` (a structuredClone snapshot for memory);
+`advisoryLock(key)` is `pg_advisory_xact_lock(hashtext(key))` on Postgres and a no-op on the
+single-writer drivers.
+
+### Boot sequence
+
+`loadAll()` (a durable store on disk) → `migrate()` (idempotently add any missing core atoms,
+refresh changed core-model schemas, backfill new lifecycle fields, run schema migrations) — or
+`bootstrap()` on a fresh store (seed the core atoms, log each as `genesis`). Then refresh the
+admin token's secret from `ATOMIC_ADMIN_SECRET`, backfill the secondary index if empty, and — for
+`--audit`/`--check`/`--export-*`/`--import-all`/`--new-base` — run that command and exit instead
+of listening. `prod`/`locked` run `assertBootMode` first and **exit non-zero** on an unsafe config.
+
+### Locked-mode enforcement
+
+Each guard is a small check threaded into the existing paths, active only when `LOCKED`:
+
+- **`canReveal`** — a `restricted` field is projected only when the actor holds an *exact*
+  `model.field` read grant **and** the request's `purpose` resolves to a live `purpose` atom the
+  grant authorizes (or an active break-glass covers it). Otherwise it's redacted everywhere
+  (`redact`, `readField`, lists, CSV).
+- **`noteReveal` / `flushEvidence`** — reveals accumulate per request, grouped by model, on the
+  actor copy; the response seam writes **one** `sensitive-read` per model *before* the bytes flush.
+  In `locked` a failed evidence write throws `503` and the data is withheld (fail-closed).
+- **`gateExport`** — before a CSV is built, every confidential/restricted column the actor lacks
+  an `export` grant for is blanked; the model's `exports` posture is enforced; a sensitive export
+  records an `export-job`.
+- **`guardDangerous`** — a direct `POST/PATCH/PUT/DELETE` to a governance model throws unless the
+  write is an approved change-request apply (`viaApproval`) or the actor holds an active
+  break-glass.
+- **`grantsOf`** — in `locked` it drops every `**` grant unless `activeBreakGlass(actor)` restores
+  it; a break-glass's grants then expand the effective set.
+- **`appendEvidence`** — links each evidence atom `{ prev, hash: sha256(prev + canonical), seq }`
+  into its shard's chain inside a transaction holding the shard's advisory lock, advancing the
+  persisted `evhead-<shard>`. The canonical form excludes a change-request's mutable
+  `status`/`applied`, so the proposal stays signed across its workflow.
+
+### Audit & self-test
+
+`--audit` is a structural fsck — every atom resolves to a model, every ref/parent resolves, every
+atom conforms to its schema, every grant and ledger entry is well-formed — plus, over a `locked`
+store, the per-shard **evidence-chain re-walk** (contiguous `seq`, linked `prev`, recomputed
+`hash`, head-matches-tail) and an informational expired-but-held count. `--check` runs the `test`
+atoms over a live ephemeral surface as each test's `as` token, asserting `status` + `condition`
+atoms against the response.
 
 ---
 
