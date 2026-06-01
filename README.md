@@ -6,7 +6,7 @@
 ![node](https://img.shields.io/badge/node-%E2%89%A522.5-3f6df6)
 ![dependencies](https://img.shields.io/badge/dependencies-0%20required-brightgreen)
 ![kernel](https://img.shields.io/badge/kernel-single%20file-blue)
-![tests](https://img.shields.io/badge/tests-256%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-257%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Atomic is a single-file kernel for graph-relational data with no required dependencies (the
@@ -71,7 +71,7 @@ ATOMIC_DB=postgres://localhost/atomic npm start
 npm run seed
 
 # verify
-npm test         # 256 black-box HTTP assertions
+npm test         # 257 black-box HTTP assertions
 npm run check    # the kernel's own tests, which are themselves atoms
 npm run audit    # structural invariants (exits non-zero on any finding)
 ```
@@ -409,7 +409,7 @@ Read from the environment, with `./.env` as a gitignored fallback.
 
 Verification lives at two levels, and the second is itself made of atoms:
 
-- **`test.mjs`** — an independent, black-box HTTP suite (256 assertions) covering validation,
+- **`test.mjs`** — an independent, black-box HTTP suite (257 assertions) covering validation,
   grants, tenancy, hooks, transactions, embed shapes, the editable grid, migration, durability
   across restart, and security regressions.
 - **`--check`** — the substrate's own acceptance suite, *as data*: a `test` atom is
@@ -444,7 +444,7 @@ package.json scripts; no required dependencies
 
 ## Status
 
-Atomic is pre-launch and experimental. It runs, and it is exercised by 256 HTTP test
+Atomic is pre-launch and experimental. It runs, and it is exercised by 257 HTTP test
 assertions, a self-test suite, and a structural audit — but interfaces may still change.
 
 ---
