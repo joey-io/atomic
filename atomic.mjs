@@ -1384,6 +1384,9 @@ async function logIt(atomId, op, actorId, changes, sessionId) {
 // failed evidence write throws 503 and the projected (restricted) body is never sent —
 // recording is the price of disclosure. Idempotent: clears the accumulator after a flush.
 async function writeSensitiveRead(actor, modelId, e) {
+  // TEST-ONLY fault injection (never set in production): forces the evidence write to fail so
+  // the fail-closed path (flushEvidence → 503, restricted body withheld) can be exercised.
+  if (process.env.ATOMIC_FAULT_SREAD === '1') throw new Err(500, 'sensitive-read evidence write fault (test)');
   const atoms = [...e.atoms];
   await appendEvidence({
     id: `sread-${randomUUID()}`, model: 'atom://sensitive-read',
@@ -1628,6 +1631,11 @@ async function create(modelId, body, actor, viaApproval = false) {
 async function writeAtom(id, body, actor, ifMatch, mode, viaApproval = false) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
+  // Phase 11 — evidence is append-only. No API path (not even break-glass or an approved
+  // change-request) may edit a log/sensitive-read/export-job/change-request/approval/break-
+  // glass atom — the kernel writes them itself, and the hash chain (Phase 10) would flag a
+  // tamper anyway. A change-request's status still transitions, but via kernel persist, not here.
+  if (EVIDENCE_MODELS.has(atom.model)) throw new Err(403, `${refId(atom.model)} is append-only evidence — it cannot be edited`);
   if (!viaApproval) guardDangerous(atom.model, mode, actor);   // bypass: approved change-request (Phase 7) or active break-glass (Phase 8)
   const modelId = refId(atom.model);
   const fields = Object.keys(body.attr || {});
@@ -1797,6 +1805,7 @@ async function retireWithRefs(atom, actor, seen) {
 async function retire(id, actor, viaApproval = false) {
   const atom = await getAtom(id);
   if (!await visible(actor, atom)) throw new Err(404, `no atom ${id}`);
+  if (EVIDENCE_MODELS.has(atom.model)) throw new Err(403, `${refId(atom.model)} is append-only evidence — it cannot be deleted`);  // Phase 11
   if (!viaApproval) guardDangerous(atom.model, 'delete', actor);   // bypass: approved change-request (Phase 7) or active break-glass (Phase 8)
   if (!await canOp(actor, refId(atom.model), 'delete'))
     throw new Err(403, `${actor.id} cannot delete ${refId(atom.model)}`);
@@ -3355,6 +3364,10 @@ async function audit() {
       else if (c.hash !== sha256(prev + canonicalEvidence(a))) chainBreaks.push(`${shard}/${a.id}: hash mismatch — tampered`);
       prev = c.hash;
     });
+    // the persisted head must match the chain tail — else an evidence atom was deleted off the end
+    const head = byId.get(`evhead-${shard}`), last = evs[evs.length - 1];
+    if (head && last && (head.attr.hash !== last.lifecycle.chain.hash || head.attr.seq !== last.lifecycle.chain.seq))
+      chainBreaks.push(`${shard}: head (seq ${head.attr.seq}) is ahead of the chain tail (seq ${last.lifecycle.chain.seq}) — evidence deleted?`);
   }
   report(`evidence hash chain intact (${chains.size} shard${chains.size === 1 ? '' : 's'})`, chainBreaks);
 

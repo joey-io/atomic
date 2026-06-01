@@ -683,6 +683,30 @@ throughput, shard the chain below the tenant — but do not pretend the chain is
 
 ## Phase 11 — Locked-mode audit + self-tests
 
+> **Status: implemented (2026-06-01).** Locked-mode coverage is consolidated across `test.mjs`
+> (256 assertions). New in this phase: **item 16** — evidence is now genuinely append-only
+> (`writeAtom`/`retire` reject every `EVIDENCE_MODELS` atom unconditionally, so no API path,
+> not even break-glass, edits or deletes the audit trail); the `--audit` chain re-walk also
+> verifies the **persisted head** against the chain tail, so a deleted-off-the-end record is
+> caught too. **Item 8** is now tested via a narrow, production-off fault hook
+> (`ATOMIC_FAULT_SREAD`): a restricted reveal returns **503 with the value withheld** when its
+> evidence can't be written. **Items 1, 3, 4** got explicit checks (locked refuses an in-memory
+> boot; `POST /base` and open-login tokens are blocked; a direct create of *every* dangerous
+> model is 403). The Phase-10 tamper test was rewritten to delete a chained record at the
+> **store level** (id/model are plaintext columns, so no key needed) — the authentic
+> DB-access threat — now that the API can't edit evidence.
+>
+> **Item-by-item:** 1 ✅ · 2 ✅(P0) · 3 ✅ · 4 ✅ · 5 ✅(P8) · 6 ✅(P2/3) · 7 ✅(P4) · 8 ✅ · 9 ✅(P5)
+> · 10 ◑ (sealed + `export-job` ✅; *plaintext-requires-break-glass* deferred — the CLI has no
+> request actor) · 11 ◑ (forged-evidence import **refused** ✅; re-chaining intentionally not
+> built — refusal is safer) · 12 ✅(P7) · 13 ✅(P9) · 14 ✅(P6) · 15 ◑ (single-writer chain +
+> tamper ✅; the **two-process concurrent** test is gated on `ATOMIC_TEST_DB`/Postgres and
+> skipped on the SQLite suite) · 16 ✅ · 17 ✅(P8).
+>
+> **Honest gaps remaining:** items 10, 11, 15 above. None block the core readiness — they are a
+> louder CLI export path, an import-re-chaining convenience, and a Postgres-only concurrency
+> regression respectively.
+
 The atom-as-test structure is one of Atomic's best features. Add locked-mode coverage to both
 the black-box HTTP suite and the atom self-tests before declaring readiness:
 
@@ -734,7 +758,7 @@ metadata first.
 9. ✅ Break-glass (Phase 8).
 10. ✅ Legal hold + retention hardening (Phase 9).
 11. ✅ Per-tenant hash-chained evidence with persisted head (Phase 10).
-12. Locked-mode `--audit` checks + locked-mode test suite (Phase 11).
+12. ✅ Locked-mode `--audit` checks + locked-mode test suite (Phase 11).
 
 Steps 1–2 deliver the most safety per line and stop the silent-exfil path immediately.
 

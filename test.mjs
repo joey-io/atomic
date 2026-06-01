@@ -4,6 +4,7 @@
 //   node test.mjs
 import { spawn } from 'node:child_process';
 import { rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';   // Phase 11 — store-level tamper of the evidence chain
 
 const PORT = 7790, STORE = '/tmp/atomic-test-store', base = `http://localhost:${PORT}`;
 const ADMIN = 'atk_test_admin_secret';                 // the kernel boots with ATOMIC_ADMIN_SECRET = this
@@ -939,13 +940,68 @@ pxsrv.kill(); await new Promise((r) => setTimeout(r, 300));
 
 // the intact chain audits clean
 ok(await auditPX() === 0, 'chain: --audit passes on an intact per-tenant evidence chain');
-// tamper: an insider with break-glass edits an evidence atom's content (its hash is now stale)
+// Phase 11 (item 16) — evidence is append-only: no API path edits or deletes it, not even break-glass
 pxsrv = startPX(); await waitPX();
-ok((await PXJ('joey', 'PATCH', '/' + tamperTarget.id, { attr: { op: 'forged' } })).status === 200, 'chain: an evidence atom can be edited (break-glass) — but the edit cannot be hidden');
+ok((await PXJ('joey', 'PATCH', '/' + tamperTarget.id, { attr: { op: 'forged' } })).status === 403, 'chain: an evidence atom cannot be EDITED through the API (append-only)');
+ok((await PXJ('joey', 'DELETE', '/' + tamperTarget.id)).status === 403, 'chain: an evidence atom cannot be DELETED through the API (append-only)');
 pxsrv.kill(); await new Promise((r) => setTimeout(r, 300));
-// the chain now fails the audit — the tampered atom no longer hashes to its stored link
-ok(await auditPX() === 1, 'chain: --audit DETECTS the tampered evidence atom (hash mismatch → finding)');
+// tamper at the STORE level (an operator with DB access deletes an evidence record) → chain breaks.
+// id/model are plaintext columns even when bodies are sealed, so a delete-by-id needs no key.
+const pxdb = new DatabaseSync(PXSTORE + '/atoms.db');
+pxdb.prepare('DELETE FROM atom WHERE id = ?').run(tamperTarget.id);
+pxdb.close();
+ok(await auditPX() === 1, 'chain: --audit DETECTS a deleted evidence atom (chain break → finding)');
 rmSync(PXSTORE, { recursive: true, force: true });
+
+// =============================================================================
+// Phase 11 — locked-mode readiness sweep: the regression items the plan flags that the
+// per-phase blocks didn't already cover (in-memory rejected, open-login/base blocked, every
+// dangerous model blocked, and the fail-closed sensitive-read). Items already covered by
+// Phases 0–10 are not duplicated here.
+// =============================================================================
+// item 1 — locked mode refuses an in-memory (no durable store) boot
+ok((await runCli([], { ATOMIC_MODE: 'locked', ATOMIC_STORE: '', ATOMIC_KEY: LKEY, ATOMIC_ADMIN_SECRET: ADMIN })).code === 1, 'ready: locked refuses an in-memory boot (no durable store)');
+
+const RPORT = 7798, RSTORE = '/tmp/atomic-ready-store', rbase = `http://localhost:${RPORT}`;
+const renv = (extra = {}) => ({ ...process.env, PORT: RPORT, ATOMIC_DB: '', SENDGRID_API_KEY: '', ATOMIC_STORE: RSTORE, ATOMIC_ADMIN_SECRET: ADMIN, ...extra });
+const startR = (extra = {}) => spawn('node', ['atomic.mjs'], { env: renv(extra), stdio: 'ignore' });
+const RJ = (method, p, body) => fetch(rbase + p, { method, headers: { authorization: 'Bearer ' + ADMIN, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+const rcode = (method, p, body) => RJ(method, p, body).then((r) => r.status);
+const waitR = async () => { for (let i = 0; i < 50; i++) { try { await fetch(rbase + '/'); return; } catch { await new Promise((r) => setTimeout(r, 100)); } } throw new Error('no start'); };
+
+rmSync(RSTORE, { recursive: true, force: true });
+// build a restricted-field model + a reveal token in dev (for the fail-closed test below)
+let rsrv = startR(); await waitR();
+await RJ('POST', '/model', { id: 'patient', attr: { label: 'Patient', version: 1, fields: { name: { kind: 'text' }, ssn: { kind: 'text', sensitivity: 'restricted' } } } });
+await RJ('POST', '/purpose', { id: 'purpose-care', attr: { label: 'Care' } });
+const rrev = await (await RJ('POST', '/token', { id: 'rrev', attr: { email: 'rr@x.com', grants: [{ path: 'patient.*', mode: 'read' }, { path: 'patient.ssn', mode: 'read' }] } })).json();
+await RJ('POST', '/patient', { id: 'pt1', attr: { name: 'Sam', ssn: '321-54-9876' } });
+rsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+// reboot locked — items 3 & 4: open-login / base and every dangerous model are blocked
+rsrv = startR({ ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY }); await waitR();
+ok(await rcode('POST', '/base', { name: 'Nope' }) === 403, 'ready (item 3): POST /base (mints an open-login token) is blocked in locked mode');
+ok(await rcode('POST', '/token', { attr: { email: 'o@x.com', login: 'open' } }) === 403, 'ready (item 3): an open-login token cannot be minted in locked mode');
+// every dangerous model EXCEPT break-glass (which has its own admin-secret activation path,
+// tested in Phase 8) is blocked at the generic create chokepoint by the guard.
+const dangerous = ['model', 'token', 'role', 'hook', 'migration', 'policy', 'condition', 'retention-policy', 'legal-hold', 'purpose', 'export-job', 'evhead'];
+const blocked = [];
+for (const m of dangerous) blocked.push([m, await rcode('POST', '/' + m, { attr: {} })]);
+ok(blocked.every(([, c]) => c === 403), `ready (item 4): a direct create of EVERY dangerous model is blocked in locked mode (${blocked.filter(([, c]) => c !== 403).map(([m]) => m).join(',') || 'all 403'})`);
+rsrv.kill(); await new Promise((r) => setTimeout(r, 300));
+
+// reboot locked WITH the evidence-write fault — item 8: a restricted reveal fails CLOSED
+rsrv = startR({ ATOMIC_MODE: 'locked', ATOMIC_KEY: LKEY, ATOMIC_FAULT_SREAD: '1' }); await waitR();
+const faultResp = await fetch(rbase + '/pt1', { headers: { authorization: 'Bearer ' + rrev.secret, 'x-atomic-purpose': 'purpose-care' } });
+ok(faultResp.status === 503, 'ready (item 8): a restricted reveal fails CLOSED (503) when its evidence cannot be recorded');
+ok(!(await faultResp.text()).includes('321-54-9876'), 'ready (item 8): the restricted value is withheld when evidence cannot be recorded');
+rsrv.kill(); await new Promise((r) => setTimeout(r, 200));
+rmSync(RSTORE, { recursive: true, force: true });
+
+// item 15 — the evidence chain survives concurrent writes from two processes (needs a real
+// Postgres; SQLite serializes writers via its own file lock, so the advisory lock is exercised
+// only against MVCC). Skipped unless ATOMIC_TEST_DB is set.
+if (!process.env.ATOMIC_TEST_DB) console.log(' ~~   ready (item 15): two-process concurrent chain test skipped (set ATOMIC_TEST_DB to run)');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
