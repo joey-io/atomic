@@ -21,10 +21,10 @@ shape:
 One kernel validates, stores, queries, permissions, and renders all of them. The HTTP API
 and the web UI are both generated from the atoms themselves, so there is no separate ORM,
 query builder, permission system, or UI framework to wire together — and no generated code
-to keep in sync. The whole thing is `atomic.mjs`: about 2,900 lines, zero required
+to keep in sync. The whole thing is `atomic.mjs`: about 3,500 lines, zero required
 dependencies.
 
-[Why](#why) · [Quick start](#quick-start) · [Concepts](#concepts) · [How it works](#how-it-works) · [HTTP API](#http-api) · [Identity & access](#identity--access) · [Lifecycle](#lifecycle) · [The generated UI](#the-generated-ui) · [Persistence](#persistence) · [Configuration](#configuration) · [CLI](#cli) · [Testing & governance](#testing--governance) · [Status](#status) · [License](#license)
+[Why](#why) · [Quick start](#quick-start) · [Concepts](#concepts) · [How it works](#how-it-works) · [HTTP API](#http-api) · [Identity & access](#identity--access) · [Locked mode](#locked-mode) · [Lifecycle](#lifecycle) · [The generated UI](#the-generated-ui) · [Persistence](#persistence) · [Configuration](#configuration) · [CLI](#cli) · [Testing & governance](#testing--governance) · [Status](#status) · [License](#license)
 
 ---
 
@@ -155,14 +155,8 @@ schema queryable.
 `json`, and `embed` (`of`). Common modifiers: `required`, `unique`, `default`, `min`/`max`,
 `minLength`/`maxLength`, `pattern`, `filterable`/`sortable` (index the field — see
 [indexed reads](#how-it-works)), and `sensitivity` (`public` · `internal` · `confidential` ·
-`restricted`; default `internal`). In `locked` mode a `restricted` field is revealed only by an
-**exact** `model.field` read grant — a wildcard (`*`/`**`, even a superuser's `**`) does not
-reveal it, so it redacts out of reads, lists, queries, path traversal, and CSV by default.
-Revealing a `restricted` field in `locked` mode also requires the request to declare a
-**purpose** the grant authorizes (`X-Atomic-Purpose` / `?purpose=`, naming a `purpose` atom);
-an optional `reason` (`X-Atomic-Reason` / `?reason=`) is recorded as evidence but never
-grants access. Outside `locked` mode `sensitivity` is recorded metadata and does not change
-access.
+`restricted`; default `internal`) — which gates disclosure and export in
+[locked mode](#locked-mode) and is inert metadata otherwise.
 
 ### References: `atom://` vs `embed://`
 
@@ -279,32 +273,84 @@ transaction.
   present it as `Authorization: Bearer <secret>`. A session id works as a bearer too
   (`Bearer sess-…`), identical to the cookie.
 - **Grants.** `{ path, mode }`, where `mode` is `read` · `create` · `update` · `delete` ·
-  `write` (the mutation superset — it does **not** imply read) · `all`. Paths are `model`,
-  `model.field`, or wildcards (`*`, `**`).
+  `write` (the mutation superset — it does **not** imply read) · `all` · `export` (CSV export of
+  sensitive fields, a right of its own — see [Locked mode](#locked-mode)). Paths are `model`,
+  `model.field`, or wildcards (`*`, `**`). A grant may also carry a `purpose` (locked mode).
 - **Roles.** A `role` atom bundles reusable grants; a token's effective grants are its own plus
   its roles'. A token can only wear a role within its own grants (attenuation).
 - **Tenancy is structural.** `lifecycle.parent` forms a tenant tree. You may write an atom only
   if you share its tenant ancestor (or you are a tenant-less root). Global atoms are
   world-readable and root-writable.
 - **Per-field redaction.** A read returns only the fields the actor is granted; path reads
-  honor scope, grants, and rules at every hop. Fields can carry a `sensitivity` level; in
-  `locked` mode a `restricted` field is revealed only by an exact `model.field` read grant,
-  never a wildcard, and only when the request declares a `purpose` that grant authorizes.
-  Each such disclosure writes one bounded `sensitive-read` evidence atom (one per model per
-  request, not per row); in `locked` mode the read is fail-closed — if the evidence can't be
-  recorded, the restricted data is withheld.
-- **Export is its own right.** Reading a field and exporting it are separate: in `locked` mode
-  a confidential/restricted field leaves in a CSV only under an explicit `export`-mode grant
-  (never `read`/`write`/`all`), the model's `exports` posture (`disabled` · `grant` ·
-  `approval`) is enforced, and a sensitive export records an `export-job` evidence atom.
-- **Governed change + break-glass.** In `locked` mode governance atoms (models, tokens, hooks,
-  …) can't be edited directly — only through a `change-request` an approval applies (maker ≠
-  approver) — and a `**` grant is inert unless an **active break-glass** restores it.
-  Break-glass is admin-secret-only, reasoned, and expiring: while active it grants full access
-  and records every sensitive read with its reason.
+  honor scope, grants, and rules at every hop. Field `sensitivity`, purpose-bound reads,
+  read/export evidence, maker-checker change control, and break-glass are the
+  **[locked mode](#locked-mode)** hardening layered on top of this — see below.
 - **One-click bases.** `POST /base { name }` (or `node atomic.mjs --new-base "<name>"`)
   provisions a tenant and an open-login token in one transaction and returns a **share URL** —
   open it and you are one-clicked into that base as a full, tenant-confined session.
+
+---
+
+## Locked mode
+
+Everything above is the always-on model. **`ATOMIC_MODE=locked`** hardens the *same* kernel —
+no new services, no second app — into a posture fit to be the system of record for sensitive
+data. It is **off by default** (`dev`); a deployment opts in, and the kernel then refuses to boot
+without a durable store, a real auth path, and `ATOMIC_KEY`.
+
+The threats it answers: an over-broad grant, a compromised insider with a valid token, an
+operator with shell/DB access, silent exfiltration through an export, and tampering with the
+record of what happened. The guarantee is that **who did what, when, and why** is answerable from
+Atomic's own evidence — not from infrastructure logs. Everything below is enforced in the
+*existing* read/write/export paths; nothing is a separate service.
+
+- **Field sensitivity.** A model field may be `confidential` or `restricted`. A `restricted`
+  field is revealed only by an **exact** `model.field` read grant — never a wildcard, not even a
+  superuser's `**` — so it redacts out of reads, lists, queries, path traversal, and CSV by
+  default.
+- **Purpose-bound reads.** Revealing a restricted field *also* requires the request to declare a
+  **purpose** (`X-Atomic-Purpose: <id>` or `?purpose=`) that the grant authorizes. A free-text
+  `X-Atomic-Reason` is recorded as evidence but never grants access.
+- **Bounded, fail-closed evidence.** Each disclosure writes one `sensitive-read` atom (one per
+  model per request, *not* per row), recorded *before* the bytes are flushed — if it can't be
+  written, the read returns `503` and the data is withheld.
+- **Export is a separate right.** Reading a field and exporting it are different: a
+  confidential/restricted field leaves in a CSV only under an explicit `export`-mode grant
+  (never `read`/`write`/`all`); a model's `exports` posture (`disabled` · `grant` · `approval`)
+  is enforced; and a sensitive export records an `export-job`.
+- **Governed change (maker-checker).** Governance atoms (`model`, `token`, `hook`, `migration`,
+  `policy`, `legal-hold`, …) can't be edited directly. A `change-request` proposes the edit and a
+  separate `approval` applies it through the normal write path — and the **maker can't approve
+  their own change**.
+- **Break-glass.** A `**` grant is inert unless an **active break-glass** restores it. Break-glass
+  is admin-secret-only (`POST /break-glass`), requires a reason and a future expiry, is logged,
+  and lapses on its own; while active it grants full access and stamps every sensitive read with
+  its reason. It is also the recovery path — a `**` superuser can do nothing in locked mode until
+  the glass is broken.
+- **Hook & migration allowlists.** `ATOMIC_HOOKS` / `ATOMIC_MIGRATIONS` name the script basenames
+  that may run. An unlisted hook is skipped (and records evidence); an unlisted custom migration
+  fails closed.
+- **Tamper-evident evidence.** Every evidence atom links into a per-tenant **hash chain**
+  (`sha256(prev + event)`, a persisted head, appended under a per-tenant lock so concurrent
+  writers can't fork it). Evidence is **append-only** — no API path edits or deletes it — and
+  `npm run audit` re-walks each chain, so a tampered, deleted, or inserted record is a finding.
+
+Two guarantees hold in **every** mode, not just locked: a **legal hold** (see
+[Lifecycle](#lifecycle)) blocks deletion unconditionally, and evidence atoms are append-only.
+
+### Governance atom types
+
+`purpose` · `sensitive-read` · `export-job` · `change-request` · `approval` · `break-glass` ·
+`legal-hold` · `evhead` (the per-tenant evidence-chain head). They are ordinary models — readable
+and queryable like everything else.
+
+### Turning it on
+
+Set `ATOMIC_MODE=locked`, which then *requires* `ATOMIC_KEY`, a durable store, and
+`ATOMIC_ADMIN_SECRET` or a mailer — the boot fails closed otherwise. The first move on a locked
+deployment is `POST /break-glass` (with the admin secret) to recover `**`, then seed your tokens,
+roles, purposes, and holds. **Deliberately out of scope** (handle at the proxy/infra layer):
+SSO/MFA, KMS and key rotation, and network rate-limiting/DoS.
 
 ---
 
@@ -380,7 +426,7 @@ Read from the environment, with `./.env` as a gitignored fallback.
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `PORT` | HTTP port | `3040` |
-| `ATOMIC_MODE` | `dev` (friendly local), `prod` (durable store + real auth required), or `locked` (prod + `ATOMIC_KEY` required, governance atoms frozen to direct edits, bulk export sealed + evidenced) | `dev` |
+| `ATOMIC_MODE` | `dev` (friendly local), `prod` (durable store + real auth required, boot fails closed otherwise), or `locked` (the full governance posture — see [Locked mode](#locked-mode)) | `dev` |
 | `ATOMIC_HOOKS` | Locked mode: comma-separated `run` basenames a hook may execute; others skip + record evidence | unset → none run |
 | `ATOMIC_MIGRATIONS` | Locked mode: comma-separated `run` basenames a custom migration may execute; others fail closed | unset → none run |
 | `ATOMIC_STORE` | Directory for the durable SQLite store | unset → in-memory |
@@ -444,8 +490,11 @@ package.json scripts; no required dependencies
 
 ## Status
 
-Atomic is pre-launch and experimental. It runs, and it is exercised by 257 HTTP test
-assertions, a self-test suite, and a structural audit — but interfaces may still change.
+Atomic is pre-launch and experimental. It runs and is exercised by 257 HTTP test assertions, a
+self-test suite, and a structural + evidence-chain audit — but interfaces may still change. The
+[locked-mode](#locked-mode) governance layer is implemented and tested; until a deployment
+actually sets `ATOMIC_MODE=locked`, treat Atomic as a kernel prototype, control-plane model, and
+admin-UI generator rather than the direct system of record for high-sensitivity data.
 
 ---
 
