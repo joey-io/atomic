@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Add deterministic identity folding between parsing and canonical persistence.
+- Add immutable observations and field-level assertions with provenance.
+- Add model-defined identity keys, definitive/exclusive identifiers, contextual signals, contradiction penalties, and review thresholds.
+- Add confidence, recency, source-priority, union, and never-overwrite field merge policies.
+- Add merge events, redirects, manual merges, and reversible splits.
+- Add a fold-store contract and in-memory reference implementation.
+- Integrate `resolve()`, `fold()`, `merge()`, and `split()` into the public package runtime.
+
 ## 0.1.0
 
 - Publish Atomic as an importable Node.js package.
