@@ -10,10 +10,7 @@
     "name": { "type": "string", "minLength": 1 },
     "version": { "type": "string" },
     "description": { "type": "string" },
-    "models": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/model" }
-    }
+    "models": { "type": "array", "items": { "$ref": "#/$defs/model" } }
   },
   "$defs": {
     "model": {
@@ -24,19 +21,48 @@
         "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
         "extends": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
         "description": { "type": "string", "minLength": 1 },
-        "attributes": {
-          "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/field" }
-        },
+        "attributes": { "type": "object", "additionalProperties": { "$ref": "#/$defs/field" } },
         "relationships": { "type": "object" },
         "identity": {
           "type": "array",
           "items": {
             "type": "object",
             "required": ["fields"],
+            "additionalProperties": false,
             "properties": {
+              "name": { "type": "string" },
               "fields": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-              "strength": { "enum": ["weak", "medium", "strong"] }
+              "strength": { "enum": ["weak", "medium", "strong", "definitive"] },
+              "exclusive": { "type": "boolean" },
+              "weight": { "type": "number" },
+              "contradictionWeight": { "type": "number", "minimum": 0 }
+            }
+          }
+        },
+        "resolution": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requireStrongForAutoMerge": { "type": "boolean" },
+            "thresholds": {
+              "type": "object",
+              "properties": {
+                "autoMerge": { "type": "number" },
+                "review": { "type": "number" }
+              }
+            },
+            "signals": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["field", "weight"],
+                "properties": {
+                  "field": { "type": "string" },
+                  "compare": { "enum": ["exact", "contains", "token-set"] },
+                  "weight": { "type": "number" },
+                  "contradiction": { "type": "number", "minimum": 0 }
+                }
+              }
             }
           }
         },
@@ -56,14 +82,20 @@
       "required": ["kind"],
       "additionalProperties": true,
       "properties": {
-        "kind": {
-          "enum": ["text", "longtext", "email", "url", "uuid", "integer", "number", "boolean", "datetime", "enum", "ref", "list", "map", "json"]
-        },
+        "kind": { "enum": ["text", "longtext", "email", "url", "uuid", "integer", "number", "boolean", "datetime", "enum", "ref", "list", "map", "json"] },
         "description": { "type": "string" },
         "required": { "type": "boolean" },
+        "normalize": { "type": "string" },
         "to": { "type": "string" },
         "items": { "$ref": "#/$defs/field" },
-        "values": { "type": "array" }
+        "values": { "type": "array" },
+        "merge": {
+          "type": "object",
+          "properties": {
+            "strategy": { "enum": ["highest-confidence", "most-recent", "source-priority", "union", "never-overwrite"] },
+            "sourcePriority": { "type": "object", "additionalProperties": { "type": "number" } }
+          }
+        }
       }
     }
   }
