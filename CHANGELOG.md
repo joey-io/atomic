@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Add the zero-dependency `atomic` executable.
+- Add `observe`, `parse`, `resolve`, `fold`, and `models` commands.
+- Support files and stdin, pretty JSON, JSON Lines, provider instructions, and operation context.
+- Support config modules, repeatable model-pack loading, and project model-directory overrides.
+- Add CLI documentation and black-box command tests.
+
 ## 0.2.0
 
 - Add deterministic identity folding between parsing and canonical persistence.
