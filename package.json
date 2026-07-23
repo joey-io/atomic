@@ -1,54 +1,35 @@
 {
   "name": "atomic",
-  "version": "0.3.0",
-  "description": "An evidence-backed data substrate, parser runtime, deterministic identity-folding engine, and CLI powered by installable model packs.",
+  "version": "0.4.0",
+  "description": "An evidence-backed data substrate with document extraction, model-driven semantic parsing, deterministic identity folding, and a first-party CLI.",
   "type": "module",
   "main": "./src/package.mjs",
-  "bin": {
-    "atomic": "./bin/atomic.mjs"
-  },
+  "bin": { "atomic": "./bin/atomic.mjs" },
   "exports": {
     ".": "./src/package.mjs",
     "./parser": "./src/index.mjs",
+    "./documents": "./src/documents.mjs",
+    "./semantic": "./src/semantic.mjs",
     "./fold": "./src/fold.mjs",
     "./core-models": "./src/models/core.mjs",
     "./kernel": "./atomic.mjs"
   },
-  "files": [
-    "bin/",
-    "src/",
-    "docs/",
-    "atomic.mjs",
-    "README.md",
-    "LICENSE"
-  ],
+  "files": ["bin/", "src/", "docs/", "atomic.mjs", "README.md", "LICENSE"],
   "scripts": {
     "start": "node atomic.mjs",
-    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs && node test-cli.mjs",
+    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs && node test-cli.mjs && node test-semantic.mjs && node test-documents.mjs",
     "test:parser": "node test-parser.mjs",
     "test:fold": "node test-fold.mjs",
     "test:cli": "node test-cli.mjs",
+    "test:semantic": "node test-semantic.mjs",
+    "test:documents": "node test-documents.mjs",
     "check": "node atomic.mjs --check",
     "audit": "node atomic.mjs --audit",
     "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
   },
-  "engines": {
-    "node": ">=22.5"
-  },
-  "keywords": [
-    "knowledge-graph",
-    "semantic-models",
-    "entity-extraction",
-    "entity-resolution",
-    "record-linkage",
-    "deduplication",
-    "parser",
-    "cli",
-    "ontology"
-  ],
+  "engines": { "node": ">=22.5" },
+  "keywords": ["knowledge-graph", "semantic-models", "entity-extraction", "document-extraction", "ocr", "entity-resolution", "record-linkage", "deduplication", "parser", "cli", "ontology"],
   "license": "MIT",
-  "comment": "Zero required dependencies. `pg` is OPTIONAL — loaded only when the kernel uses the Postgres driver.",
-  "optionalDependencies": {
-    "pg": "^8.21.0"
-  }
+  "comment": "Zero required dependencies. pg and external document tools are optional.",
+  "optionalDependencies": { "pg": "^8.21.0" }
 }
