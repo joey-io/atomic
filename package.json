@@ -1,11 +1,28 @@
 {
   "name": "atomic",
-  "version": "0.0.1",
-  "description": "Atomic — a data substrate where schema, data, identity, and the UI surface are all atoms.",
+  "version": "0.2.0",
+  "description": "An evidence-backed data substrate, parser runtime, and deterministic identity-folding engine powered by installable model packs.",
   "type": "module",
+  "main": "./src/package.mjs",
+  "exports": {
+    ".": "./src/package.mjs",
+    "./parser": "./src/index.mjs",
+    "./fold": "./src/fold.mjs",
+    "./core-models": "./src/models/core.mjs",
+    "./kernel": "./atomic.mjs"
+  },
+  "files": [
+    "src/",
+    "docs/",
+    "atomic.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node atomic.mjs",
-    "test": "node test.mjs",
+    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs",
+    "test:parser": "node test-parser.mjs",
+    "test:fold": "node test-fold.mjs",
     "check": "node atomic.mjs --check",
     "audit": "node atomic.mjs --audit",
     "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
@@ -13,8 +30,18 @@
   "engines": {
     "node": ">=22.5"
   },
+  "keywords": [
+    "knowledge-graph",
+    "semantic-models",
+    "entity-extraction",
+    "entity-resolution",
+    "record-linkage",
+    "deduplication",
+    "parser",
+    "ontology"
+  ],
   "license": "MIT",
-  "comment": "Zero required dependencies. `pg` is OPTIONAL — loaded (dynamic import) only when ATOMIC_DB is set to use the Postgres driver; the in-memory and SQLite (node:sqlite) paths need nothing.",
+  "comment": "Zero required dependencies. `pg` is OPTIONAL — loaded only when the kernel uses the Postgres driver.",
   "optionalDependencies": {
     "pg": "^8.21.0"
   }
