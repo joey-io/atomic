@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+- Add first-class document and document-extraction models.
+- Extract text directly from text, JSON, XML, HTML, PDF, and DOCX inputs.
+- Prefer PDF text extraction and fall back to OCR through optional Poppler and Tesseract tools.
+- Add custom extractor hooks for other document and image formats.
+- Compile loaded model definitions into semantic extraction contracts.
+- Add strict evidence, schema, type, confidence, and relationship validation for AI output.
+- Add a generic semantic provider and an OpenAI-compatible HTTP provider.
+- Preserve source hashes, extraction metadata, page locations, and exact evidence excerpts.
+- Wire document ingestion and semantic extraction through the package API and CLI.
+- Add semantic-provider and document-ingestion tests.
+
 ## 0.3.0
 
 - Add the zero-dependency `atomic` executable.
