@@ -1,9 +1,12 @@
 {
   "name": "atomic",
-  "version": "0.2.0",
-  "description": "An evidence-backed data substrate, parser runtime, and deterministic identity-folding engine powered by installable model packs.",
+  "version": "0.3.0",
+  "description": "An evidence-backed data substrate, parser runtime, deterministic identity-folding engine, and CLI powered by installable model packs.",
   "type": "module",
   "main": "./src/package.mjs",
+  "bin": {
+    "atomic": "./bin/atomic.mjs"
+  },
   "exports": {
     ".": "./src/package.mjs",
     "./parser": "./src/index.mjs",
@@ -12,6 +15,7 @@
     "./kernel": "./atomic.mjs"
   },
   "files": [
+    "bin/",
     "src/",
     "docs/",
     "atomic.mjs",
@@ -20,9 +24,10 @@
   ],
   "scripts": {
     "start": "node atomic.mjs",
-    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs",
+    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs && node test-cli.mjs",
     "test:parser": "node test-parser.mjs",
     "test:fold": "node test-fold.mjs",
+    "test:cli": "node test-cli.mjs",
     "check": "node atomic.mjs --check",
     "audit": "node atomic.mjs --audit",
     "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
@@ -38,6 +43,7 @@
     "record-linkage",
     "deduplication",
     "parser",
+    "cli",
     "ontology"
   ],
   "license": "MIT",
