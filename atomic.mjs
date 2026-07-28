@@ -426,6 +426,29 @@ async function buildInverse() {
   }
 }
 
+// An inverse name is a global read path (`/<id>.<name>`), and invReg is keyed by
+// that name alone — so two ref fields claiming the same inverse silently clobber
+// each other, and the loser's traversal resolves against the winner's model or
+// 404s. Reject the collision at write time instead of losing an edge quietly.
+function inverseConflicts(modelId, fields) {
+  const out = [], mine = new Map();
+  for (const [field, def] of Object.entries(fields || {})) {
+    if (!def || typeof def !== 'object' || def.kind !== 'ref' || !def.inverse) continue;
+    if (mine.has(def.inverse))
+      out.push(`inverse "${def.inverse}" is declared on both .${mine.get(def.inverse)} and .${field}`);
+    else mine.set(def.inverse, field);
+    const held = invReg[def.inverse];
+    if (held && held.sourceModel !== modelId)
+      out.push(`inverse "${def.inverse}" is already the inverse of ${held.sourceModel}.${held.field}`);
+  }
+  return out;
+}
+
+function assertInverses(modelId, fields) {
+  const bad = inverseConflicts(modelId, fields);
+  if (bad.length) throw new Err(400, `model ${modelId}: ${bad.join('; ')}`);
+}
+
 async function inverseList(targetId, inv, actor) {
   const out = [];
   for (const a of await store.query({ model: ref(inv.sourceModel) })) {
@@ -1603,6 +1626,7 @@ async function create(modelId, body, actor, viaApproval = false) {
     mintedSecret = 'atk_' + randomBytes(32).toString('hex');
     atom.attr.secret = sha256(mintedSecret);
   }
+  if (modelId === 'model') assertInverses(atom.id, atom.attr.fields);
   // change-request / approval are evidence (Phase 7) — chain them like any other (Phase 10).
   if (EVIDENCE_MODELS.has(atom.model)) await appendEvidence(atom); else await seed(atom);
   if (mintedSecret) Object.defineProperty(atom, '_secret', { value: mintedSecret, enumerable: false });
@@ -1650,8 +1674,31 @@ async function writeAtom(id, body, actor, ifMatch, mode, viaApproval = false) {
   if (!await writable(actor, atom)) throw new Err(403, `cannot ${mode} ${modelId} (tenant scope or write rule)`);
   if (mode === 'update' && body.hooks) atom.lifecycle.hooks = body.hooks; // (re)register lifecycle hooks
   if (body.expiration !== undefined) atom.lifecycle.expiration = await resolveExpiration(body, actor, atom.lifecycle.expiration); // re-point retention policy
+  if (modelId === 'model') assertInverses(atom.id, atom.attr.fields);
   await bump(atom, actor.id);
   await logIt(id, mode, actor.id, changeset(before, atom.attr), actor._session);
+  // Editing a model can add, rename, or drop an inverse edge. Only create rebuilt
+  // the registry, so an edited model's traversals stayed stale until restart.
+  if (modelId === 'model') await buildInverse();
+  return atom;
+}
+
+// The inverse of DELETE. Retire is a soft-delete, but nothing could undo it over
+// HTTP: PATCH merges `attr` and never touches lifecycle, so a retired atom stayed
+// retired forever while still reading back — writes into it silently vanished from
+// every list. Restore requires the same authority deletion does.
+async function restore(id, actor) {
+  const atom = await getAtom(id);
+  if (!await canOp(actor, refId(atom.model), 'read')) throw new Err(404, `no atom ${id}`);
+  if (atom.lifecycle?.status !== 'retired') return atom;          // idempotent
+  guardDangerous(atom.model, 'delete', actor);
+  if (!await canOp(actor, refId(atom.model), 'delete'))
+    throw new Err(403, `${actor.id} cannot restore ${refId(atom.model)}`);
+  if (!await writable(actor, atom)) throw new Err(403, `cannot restore ${refId(atom.model)} (tenant scope or write rule)`);
+  atom.lifecycle.status = 'active';
+  await bump(atom, actor.id);
+  await logIt(atom.id, 'restore', actor.id, [{ path: 'status', from: 'retired', to: 'active' }], actor._session);
+  if (refId(atom.model) === 'model') await buildInverse();
   return atom;
 }
 const update  = (id, body, actor, ifMatch) => writeAtom(id, body, actor, ifMatch, 'update');
@@ -2467,8 +2514,11 @@ async function applyOp(op, actor, i) {
     case 'delete':
       if (!op.id) throw new Err(400, `op ${i}: delete needs an id`);
       return { atom: await retire(bareId(op.id), actor), event: 'delete' };
+    case 'restore':
+      if (!op.id) throw new Err(400, `op ${i}: restore needs an id`);
+      return { atom: await restore(bareId(op.id), actor), event: 'update' };
     default:
-      throw new Err(400, `op ${i}: unknown op "${verb}" — use create | update | replace | delete`);
+      throw new Err(400, `op ${i}: unknown op "${verb}" — use create | update | replace | delete | restore`);
   }
 }
 async function txBatch(ops, actor) {
@@ -3020,7 +3070,15 @@ const server = http.createServer(async (req, res) => {
       return send(201, tokenCreateView(a)); // a token surfaces its clear API secret here, once
     }
     if (req.method === 'PUT') { const a = await replace(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); if (a.model === 'atom://model') await sweepModel(a.id); return send(200, a); }
-    if (req.method === 'PATCH') { const a = await update(head, await readBody(req), actor, req.headers['if-match']); await runHooks(a, 'update'); if (a.model === 'atom://model') await sweepModel(a.id); return send(200, a); }
+    if (req.method === 'PATCH') {
+      const body = await readBody(req);
+      // `PATCH <id> {"restore": true}` is the inverse of DELETE. It rides PATCH
+      // rather than a new verb because the route already resolves an atom by id.
+      const a = body?.restore === true
+        ? await restore(head, actor)
+        : await update(head, body, actor, req.headers['if-match']);
+      await runHooks(a, 'update'); if (a.model === 'atom://model') await sweepModel(a.id); return send(200, a);
+    }
     if (req.method === 'DELETE') { const a = await retire(head, actor); await runHooks(a, 'delete'); return send(200, a); }
     return send(405, { error: 'method not allowed' });
   } catch (e) {

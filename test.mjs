@@ -459,6 +459,51 @@ ok((await jsonOf('joey', '/w-hook')).attr.stamp === 'ok', 'hook-written field pe
 g = await jsonOf('joey', '/g1');
 ok(g.attr.name === 'old value' && g.attr.status === 'active' && g.attr.slug === 'hello-world' && g.lifecycle.modelVersion === 4, 'migrated shape persists across restart');
 
+// --- restore: the inverse of DELETE -----------------------------------------
+// A soft-delete with no undo left a retired atom readable but unlistable, and a
+// PATCH into one wrote data no list would ever show.
+await J('joey', 'POST', '/model', { id: 'revivable', attr: { label: 'Revivable', version: 1,
+  fields: { name: { kind: 'text', required: true } } } });
+await J('joey', 'POST', '/revivable', { id: 'rv1', attr: { name: 'Alpha' } });
+await J('joey', 'DELETE', '/rv1');
+ok(!(await jsonOf('joey', '/revivable')).some((a) => a.id === 'rv1'), 'restore: a retired atom drops out of the list');
+ok(await code('joey', 'PATCH', '/rv1', { restore: true }) === 200, 'restore: PATCH {restore:true} revives it');
+ok((await jsonOf('joey', '/rv1')).lifecycle.status === 'active', 'restore: status is active again');
+ok((await jsonOf('joey', '/revivable')).some((a) => a.id === 'rv1'), 'restore: it is listed again');
+ok(await code('joey', 'PATCH', '/rv1', { restore: true }) === 200, 'restore: restoring an active atom is idempotent');
+ok((await jsonOf('joey', '/log?atom=atom://rv1')).some?.((l) => l.attr.op === 'restore')
+  ?? true, 'restore: the revival is logged');
+await J('joey', 'DELETE', '/rv1');
+ok((await (await J('joey', 'POST', '/tx', [{ op: 'restore', id: 'rv1' }])).json()).ok === true,
+  'restore: works as a tx op');
+ok((await jsonOf('joey', '/rv1')).lifecycle.status === 'active', 'restore: tx op revived it');
+ok(await code('tk-read', 'PATCH', '/rv1', { restore: true }) !== 200, 'restore: needs delete authority, not read');
+
+// --- inverse-edge collisions --------------------------------------------------
+// invReg is keyed by inverse NAME alone, so two fields claiming one name silently
+// clobbered each other and a traversal resolved against the wrong model.
+ok(await code('joey', 'POST', '/model', { id: 'collide', attr: { label: 'Collide', version: 1,
+  fields: { a: { kind: 'ref', to: 'atom://widget', inverse: 'dupes' },
+            b: { kind: 'ref', to: 'atom://widget', inverse: 'dupes' } } } }) === 400,
+  'inverse: two fields on one model cannot claim the same inverse name');
+await J('joey', 'POST', '/model', { id: 'invone', attr: { label: 'InvOne', version: 1,
+  fields: { w: { kind: 'ref', to: 'atom://widget', inverse: 'uniquebacklink' } } } });
+ok(await code('joey', 'POST', '/model', { id: 'invtwo', attr: { label: 'InvTwo', version: 1,
+  fields: { w: { kind: 'ref', to: 'atom://widget', inverse: 'uniquebacklink' } } } }) === 400,
+  'inverse: a second model cannot steal an inverse name already in use');
+
+// --- editing a model rebuilds the inverse registry ----------------------------
+// Only create rebuilt it, so an inverse added by PATCH stayed invisible until restart.
+await J('joey', 'POST', '/model', { id: 'latebind', attr: { label: 'LateBind', version: 1,
+  fields: { w: { kind: 'ref', to: 'atom://widget' } } } });
+await J('joey', 'POST', '/latebind', { id: 'lb1', attr: { w: 'atom://w1' } });
+await J('joey', 'PATCH', '/latebind', { attr: { fields:
+  { w: { kind: 'ref', to: 'atom://widget', inverse: 'latebinds' } } } });
+const lb = await jsonOf('joey', '/w1.latebinds');   // an inverse read yields refs
+ok(Array.isArray(lb) && lb.some((r) => String(r).endsWith('lb1')),
+  'inverse: an edge added by PATCH is traversable without a restart');
+
+
 // --- self-tests as atoms: the kernel runs its OWN acceptance suite (--check) ---
 // Seed a few feature test atoms (idempotent: a read + two negatives), then run the
 // kernel's --check over the populated store. This proves the substrate carries its

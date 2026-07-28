@@ -96,7 +96,17 @@ The kernel derives validation, REST endpoints, CSV import/export, permissions, q
 | `PATCH /<id>` | Merge-update with `If-Match` |
 | `PUT /<id>` | Replace attributes with `If-Match` |
 | `DELETE /<id>` | Soft-delete/retire |
-| `POST /tx` | Apply a batch transaction |
+| `PATCH /<id>` `{"restore":true}` | Restore a retired atom (needs `delete` authority) |
+| `POST /tx` | Apply a batch transaction (`create` · `update` · `replace` · `delete` · `restore`) |
+
+A retired atom still reads back but leaves every list, so a client that re-creates the
+same id would otherwise write into a record nothing displays. `restore` is the inverse
+of `DELETE`.
+
+An `inverse` name on a `ref` field is a global read path (`/<id>.<name>`) and must be
+unique across all models — a name already in use is rejected on write rather than
+silently replacing the existing edge. Editing a model re-registers its inverses
+immediately, with no restart.
 
 ## Model packs
 
