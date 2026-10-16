@@ -159,3 +159,7 @@ MIT
 ## Hybrid ClickHouse analytics
 
 Canonical atoms remain transactional in SQLite/PostgreSQL. An optional append-only ClickHouse projection transport is provided in [docs/hybrid-storage.md](docs/hybrid-storage.md). A durable outbox worker is still required for production delivery; ClickHouse is not an authoritative store.
+
+## Snowflake analytical projections
+
+Snowflake is supported as an optional analytical projection target through `src/snowflake-adapter.mjs`. See [Snowflake analytics](docs/snowflake-analytics.md). ClickHouse and Snowflake are analytical only; transactional outbox integration remains a separate production task.
