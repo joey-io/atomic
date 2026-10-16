@@ -4,7 +4,9 @@
   "description": "An evidence-backed data substrate with document extraction, model-driven semantic parsing, deterministic identity folding, and a first-party CLI.",
   "type": "module",
   "main": "./src/package.mjs",
-  "bin": { "atomic": "./bin/atomic.mjs" },
+  "bin": {
+    "atomic": "./bin/atomic.mjs"
+  },
   "exports": {
     ".": "./src/package.mjs",
     "./parser": "./src/index.mjs",
@@ -14,10 +16,17 @@
     "./core-models": "./src/models/core.mjs",
     "./kernel": "./atomic.mjs"
   },
-  "files": ["bin/", "src/", "docs/", "atomic.mjs", "README.md", "LICENSE"],
+  "files": [
+    "bin/",
+    "src/",
+    "docs/",
+    "atomic.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node atomic.mjs",
-    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs && node test-cli.mjs && node test-semantic.mjs && node test-documents.mjs",
+    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs && node test-cli.mjs && node test-semantic.mjs && node test-documents.mjs && npm run test:hybrid",
     "test:parser": "node test-parser.mjs",
     "test:fold": "node test-fold.mjs",
     "test:cli": "node test-cli.mjs",
@@ -25,11 +34,28 @@
     "test:documents": "node test-documents.mjs",
     "check": "node atomic.mjs --check",
     "audit": "node atomic.mjs --audit",
-    "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs"
+    "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs",
+    "test:hybrid": "node --test src/clickhouse-projection.test.mjs src/snowflake-adapter.test.mjs"
   },
-  "engines": { "node": ">=22.5" },
-  "keywords": ["knowledge-graph", "semantic-models", "entity-extraction", "document-extraction", "ocr", "entity-resolution", "record-linkage", "deduplication", "parser", "cli", "ontology"],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "keywords": [
+    "knowledge-graph",
+    "semantic-models",
+    "entity-extraction",
+    "document-extraction",
+    "ocr",
+    "entity-resolution",
+    "record-linkage",
+    "deduplication",
+    "parser",
+    "cli",
+    "ontology"
+  ],
   "license": "MIT",
   "comment": "Zero required dependencies. pg and external document tools are optional.",
-  "optionalDependencies": { "pg": "^8.21.0" }
+  "optionalDependencies": {
+    "pg": "^8.21.0"
+  }
 }
