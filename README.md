@@ -163,3 +163,7 @@ Canonical atoms remain transactional in SQLite/PostgreSQL. An optional append-on
 ## Snowflake analytical projections
 
 Snowflake is supported as an optional analytical projection target through `src/snowflake-adapter.mjs`. See [Snowflake analytics](docs/snowflake-analytics.md). ClickHouse and Snowflake are analytical only; transactional outbox integration remains a separate production task.
+
+## Identity correctness limits
+
+Automatic identity folding now sends any explicit exclusive-key conflict to review, even when another definitive key matches. This does not solve candidate discovery: exact identity-key lookup can still miss fuzzy matches. Production identity governance and downstream correction propagation remain outstanding.
