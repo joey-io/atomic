@@ -234,6 +234,10 @@ export function evaluateMatch(candidate, atom, model, candidateKeys = identityKe
 export function decide(match, resolution = {}, defaults = {}) {
   if (!match) return { action: 'create', reason: 'no plausible identity match' };
   if (match.definitiveContradiction) return { action: 'review', reason: 'definitive identity contradiction' };
+  // A matching key does not override another explicitly exclusive identifier.
+  // Escalate rather than silently merging identities with contradictory unique keys.
+  if (match.contradictions?.some(c => c.type === 'exclusive-key-conflict'))
+    return { action: 'review', reason: 'exclusive identity key conflict' };
   if (match.definitiveMatch) return { action: 'merge', reason: 'definitive identity key matched' };
   const autoMergeScore = resolution.thresholds?.autoMerge ?? defaults.autoMergeScore ?? 120;
   const reviewScore = resolution.thresholds?.review ?? defaults.reviewScore ?? 45;
