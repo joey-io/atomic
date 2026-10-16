@@ -179,3 +179,7 @@ Automatic identity folding now sends any explicit exclusive-key conflict to revi
 ## Evidence-first intelligence
 
 Atomic is a ledger of gathered evidence, not a universal source of truth. Source fidelity, claim-specific authority, provenance, and independent corroboration are central to its design. See [Evidence-first positioning](docs/EVIDENCE-FIRST.md) for principles, unimplemented guarantees, and scale considerations.
+
+## Dependency invalidation primitive
+
+`createLineageIndex()` records source-to-derived dependencies and computes bounded transitive dependents for targeted invalidation. This is an in-memory primitive, not durable provenance storage or an automatic recomputation scheduler. Cycles are tolerated with visited-set protection; fan-out is bounded by a caller budget.
