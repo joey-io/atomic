@@ -167,3 +167,7 @@ Snowflake is supported as an optional analytical projection target through `src/
 ## Identity correctness limits
 
 Automatic identity folding now sends any explicit exclusive-key conflict to review, even when another definitive key matches. This does not solve candidate discovery: exact identity-key lookup can still miss fuzzy matches. Production identity governance and downstream correction propagation remain outstanding.
+
+## Experimental canonical assertions
+
+`src/models/assertions.mjs` provides an optional assertion model pack for a read-only Atomic Reason bridge. This schema does not itself validate claims or enforce reviewer approval.
