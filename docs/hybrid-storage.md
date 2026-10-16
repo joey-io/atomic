@@ -30,3 +30,5 @@ unless explicitly permitted. Use version and event ID for replay and reconciliat
 This module implements the **projection transport**, not the transactional outbox
 worker, query federation, or a complete production deployment. Those require
 integration with the chosen canonical backend.
+
+Snowflake alternative: use `src/snowflake-adapter.mjs` and `docs/snowflake-analytics.md`. Both analytical backends are projections, never the canonical transaction store.
