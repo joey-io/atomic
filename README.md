@@ -183,3 +183,7 @@ Atomic is a ledger of gathered evidence, not a universal source of truth. Source
 ## Dependency invalidation primitive
 
 `createLineageIndex()` records source-to-derived dependencies and computes bounded transitive dependents for targeted invalidation. This is an in-memory primitive, not durable provenance storage or an automatic recomputation scheduler. Cycles are tolerated with visited-set protection; fan-out is bounded by a caller budget.
+
+## Durable lineage (experimental)
+
+`src/sqlite-lineage.mjs` persists source-to-derived edges in SQLite and finds bounded transitive dependents across restarts. The application must record dependency edges, coordinate them with canonical transactions, and schedule recomputation. This does not yet supply a transactional outbox or automatic invalidation. Node >=22.5 required.
