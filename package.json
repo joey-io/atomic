@@ -35,7 +35,7 @@
     "check": "node atomic.mjs --check",
     "audit": "node atomic.mjs --audit",
     "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs",
-    "test:hybrid": "node --test src/clickhouse-projection.test.mjs"
+    "test:hybrid": "node --test src/clickhouse-projection.test.mjs src/snowflake-adapter.test.mjs"
   },
   "engines": {
     "node": ">=22.5"
