@@ -155,3 +155,7 @@ Atomic is early-stage software. The in-memory fold store is a reference implemen
 ## License
 
 MIT
+
+## Hybrid ClickHouse analytics
+
+Canonical atoms remain transactional in SQLite/PostgreSQL. An optional append-only ClickHouse projection transport is provided in [docs/hybrid-storage.md](docs/hybrid-storage.md). A durable outbox worker is still required for production delivery; ClickHouse is not an authoritative store.
