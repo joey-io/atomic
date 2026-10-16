@@ -171,3 +171,7 @@ Automatic identity folding now sends any explicit exclusive-key conflict to revi
 ## Experimental canonical assertions
 
 `src/models/assertions.mjs` provides an optional assertion model pack for a read-only Atomic Reason bridge. This schema does not itself validate claims or enforce reviewer approval.
+
+## Analytical projection worker
+
+`src/projection-worker.mjs` adds a retryable delivery loop for ClickHouse and Snowflake adapters. The caller must provide a **durable, transactional outbox** whose enqueue is committed with the canonical write. This module is not itself that outbox and does not provide exactly-once delivery. A failed projector causes retries, including possible duplicates on successful targets; deduplicate by event ID.
