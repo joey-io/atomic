@@ -26,7 +26,7 @@
   ],
   "scripts": {
     "start": "node atomic.mjs",
-    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs && node test-cli.mjs && node test-semantic.mjs && node test-documents.mjs && npm run test:hybrid",
+    "test": "node test.mjs && node test-parser.mjs && node test-fold.mjs && node test-cli.mjs && node test-semantic.mjs && node test-documents.mjs && npm run test:hybrid && npm run test:safety",
     "test:parser": "node test-parser.mjs",
     "test:fold": "node test-fold.mjs",
     "test:cli": "node test-cli.mjs",
@@ -35,7 +35,8 @@
     "check": "node atomic.mjs --check",
     "audit": "node atomic.mjs --audit",
     "seed": "node seeds/seed-a.mjs && node seeds/seed-b.mjs && node seeds/seed-c.mjs && node seeds/seed-d.mjs",
-    "test:hybrid": "node --test src/clickhouse-projection.test.mjs src/snowflake-adapter.test.mjs"
+    "test:hybrid": "node --test src/clickhouse-projection.test.mjs src/snowflake-adapter.test.mjs",
+    "test:safety": "node --test src/fold-safety.test.mjs"
   },
   "engines": {
     "node": ">=22.5"
