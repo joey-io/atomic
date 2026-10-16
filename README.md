@@ -175,3 +175,7 @@ Automatic identity folding now sends any explicit exclusive-key conflict to revi
 ## Analytical projection worker
 
 `src/projection-worker.mjs` adds a retryable delivery loop for ClickHouse and Snowflake adapters. The caller must provide a **durable, transactional outbox** whose enqueue is committed with the canonical write. This module is not itself that outbox and does not provide exactly-once delivery. A failed projector causes retries, including possible duplicates on successful targets; deduplicate by event ID.
+
+## Evidence-first intelligence
+
+Atomic is a ledger of gathered evidence, not a universal source of truth. Source fidelity, claim-specific authority, provenance, and independent corroboration are central to its design. See [Evidence-first positioning](docs/EVIDENCE-FIRST.md) for principles, unimplemented guarantees, and scale considerations.
